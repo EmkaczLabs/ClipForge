@@ -1,11 +1,12 @@
 //! Recording Studio view: live GSR status, replay/record controls, capture pipeline, audio, and hotkeys.
 
 use chrono::{DateTime, Utc};
-use clipforge_capture::GlobalHotkeyStatus;
+use clipforge_capture::{AudioTrackTarget, GlobalHotkeyStatus, parse_routed_audio_source};
 use clipforge_common::{
     AudioCodec, CaptureStatus, CaptureTarget, ContainerFormat, EncoderMode, QualityPreset,
     VideoCodec,
 };
+use clipforge_media::{DBFS_FLOOR, MicFeedbackKind, MicTestPhase};
 use rune::{Cursor, El, ScrollSpec, col, row, text};
 
 use crate::components::{
@@ -53,6 +54,7 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                     .min_w(0.0)
                     .gap(space::LG)
                     .child(audio_sources_card(p, s))
+                    .child(mic_test_card(p, s))
                     .child(hotkeys_card(p, s)),
             ),
     )
@@ -1172,20 +1174,24 @@ fn audio_sources_card(p: &Palette, s: &AppState) -> El {
         ));
     }
 
+    if s.audio_config_dirty_while_active && !matches!(s.capture_status, CaptureStatus::Idle) {
+        c = c.child(audio_restart_banner(p, s));
+    }
+
     c = c
         .child(audio_source_row(
             p,
             "audio-default-out",
             "default_output",
             "System Desktop Audio",
-            cfg.audio_sources.iter().any(|src| src == "default_output"),
+            s.audio_source_track("default_output"),
         ))
         .child(audio_source_row(
             p,
             "audio-default-in",
             "default_input",
             "Default Microphone",
-            cfg.audio_sources.iter().any(|src| src == "default_input"),
+            s.audio_source_track("default_input"),
         ));
 
     let has_discovered = !s.available_audio_devices.is_empty() || !s.available_app_audio.is_empty();
@@ -1216,13 +1222,13 @@ fn audio_sources_card(p: &Palette, s: &AppState) -> El {
                     .color(p.text_muted),
             );
             for (idx, dev) in extra_devices {
-                let active = cfg.audio_sources.iter().any(|src| src == &dev.id);
+                let track = s.audio_source_track(&dev.id);
                 list = list.child(audio_source_row(
                     p,
                     &format!("audio-dev-{idx}"),
                     &dev.id,
                     &dev.label,
-                    active,
+                    track,
                 ));
             }
         }
@@ -1234,13 +1240,13 @@ fn audio_sources_card(p: &Palette, s: &AppState) -> El {
                     .color(p.text_muted),
             );
             for (idx, app) in s.available_app_audio.iter().enumerate() {
-                let active = cfg.audio_sources.iter().any(|src| src == &app.id);
+                let track = s.audio_source_track(&app.id);
                 list = list.child(audio_source_row(
                     p,
                     &format!("audio-app-{idx}"),
                     &app.id,
                     &app.label,
-                    active,
+                    track,
                 ));
             }
         }
@@ -1256,26 +1262,74 @@ fn audio_sources_card(p: &Palette, s: &AppState) -> El {
         );
     }
 
-    if !cfg.audio_sources.is_empty() {
-        let mut inspector = col()
-            .key("rec-audio-inspector")
-            .w_full()
-            .min_w(0.0)
-            .gap(space::XS)
-            .px(space::SM)
-            .py(space::XS)
-            .fill(p.bg_lowest)
-            .border(1.0, p.border_subtle)
-            .radius(radius::SM)
-            .clip_rounded(radius::SM)
-            .child(
-                text("ACTIVE ROUTING DETAIL")
-                    .font(typography::MONO_BADGE)
-                    .color(p.text_muted),
-            );
+    c = c.child(track_diagnostics_panel(p, s));
 
-        for (idx, src_id) in cfg.audio_sources.iter().enumerate() {
-            let full_label = resolve_audio_source_label(s, src_id);
+    c
+}
+
+fn audio_restart_banner(p: &Palette, s: &AppState) -> El {
+    let mut box_col = col()
+        .key("rec-audio-restart-banner")
+        .w_full()
+        .min_w(0.0)
+        .px(space::SM)
+        .py(space::SM)
+        .gap(space::SM)
+        .fill(p.warning_soft)
+        .border(1.0, p.warning)
+        .radius(radius::SM)
+        .child(
+            text("Audio config changed while active. Restart replay buffer to apply.")
+                .font(typography::LABEL)
+                .color(p.warning_text)
+                .w_full()
+                .wrap(),
+        );
+    if matches!(s.capture_status, CaptureStatus::ReplayBuffering { .. }) {
+        box_col = box_col.child(btn_primary(
+            p,
+            "rec-audio-restart-btn",
+            "Restart Replay Buffer",
+            |st| st.restart_replay_buffer(),
+        ));
+    }
+    box_col
+}
+
+fn track_diagnostics_panel(p: &Palette, s: &AppState) -> El {
+    let cfg = &s.config.capture;
+    let diag = s.audio_diagnostics();
+
+    let mut inspector = col()
+        .key("rec-audio-inspector")
+        .w_full()
+        .min_w(0.0)
+        .gap(space::XS)
+        .px(space::SM)
+        .py(space::XS)
+        .fill(p.bg_lowest)
+        .border(1.0, p.border_subtle)
+        .radius(radius::SM)
+        .clip_rounded(radius::SM)
+        .child(
+            text("TRACK DIAGNOSTICS")
+                .font(typography::MONO_BADGE)
+                .color(p.text_muted),
+        );
+
+    if cfg.audio_sources.is_empty() {
+        inspector = inspector.child(
+            text("No audio sources selected. Enable at least one source above.")
+                .font(typography::LABEL)
+                .color(p.text_muted)
+                .w_full()
+                .wrap(),
+        );
+    } else {
+        for (idx, raw_src) in cfg.audio_sources.iter().enumerate() {
+            let (target, clean_id) = parse_routed_audio_source(raw_src)
+                .unwrap_or((AudioTrackTarget::Auto, raw_src.clone()));
+            let full_label = resolve_audio_source_label(s, &clean_id);
             inspector = inspector.child(
                 col()
                     .key(format!("rec-audio-active-{idx}"))
@@ -1283,14 +1337,30 @@ fn audio_sources_card(p: &Palette, s: &AppState) -> El {
                     .min_w(0.0)
                     .gap(2.0)
                     .child(
-                        text(full_label)
+                        row()
+                            .key(format!("rec-audio-active-hdr-{idx}"))
                             .w_full()
-                            .font(typography::LABEL)
-                            .color(p.text_primary)
-                            .wrap(),
+                            .min_w(0.0)
+                            .gap(space::XS)
+                            .justify_between()
+                            .center_y()
+                            .child(
+                                text(full_label)
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .font(typography::LABEL)
+                                    .color(p.text_primary)
+                                    .wrap(),
+                            )
+                            .child(badge(
+                                &format!("rec-audio-active-trk-{idx}"),
+                                target.label(),
+                                p.accent_primary,
+                                p.accent_soft,
+                            )),
                     )
                     .child(
-                        text(src_id.clone())
+                        text(clean_id)
                             .w_full()
                             .font(typography::MONO_BADGE)
                             .color(p.text_muted)
@@ -1298,11 +1368,72 @@ fn audio_sources_card(p: &Palette, s: &AppState) -> El {
                     ),
             );
         }
-
-        c = c.child(inspector);
     }
 
-    c
+    let gsr_args_text = if diag.routing_plan.gsr_audio_args.is_empty() {
+        "None".to_string()
+    } else {
+        diag.routing_plan
+            .gsr_audio_args
+            .iter()
+            .map(|a| format!("-a \"{a}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    inspector = inspector.child(kv_row(p, "diag-gsr-args", "GSR Audio Args", gsr_args_text));
+
+    for (idx, trk) in diag.routing_plan.tracks.iter().enumerate() {
+        inspector = inspector.child(kv_row(
+            p,
+            &format!("diag-track-{idx}"),
+            &format!("{} (0:a:{})", trk.track_label, trk.stream_index),
+            trk.gsr_arg.clone(),
+        ));
+    }
+
+    let stream_summary = match &diag.last_saved_clip_title {
+        Some(title) => format!("{} ({})", diag.last_saved_stream_count, title),
+        None => format!(
+            "{} planned (no clip saved yet)",
+            diag.routing_plan.tracks.len()
+        ),
+    };
+    inspector = inspector.child(kv_row(p, "diag-streams", "Encoded Streams", stream_summary));
+
+    let codec_channels = match (&diag.last_saved_codec, diag.last_saved_channels) {
+        (Some(codec), Some(ch)) => format!("{codec} • {ch} ch"),
+        (Some(codec), None) => codec.clone(),
+        _ => format!("{} (configured)", audio_codec_label(cfg.audio_codec)),
+    };
+    inspector = inspector.child(kv_row(
+        p,
+        "diag-codec-ch",
+        "Codec & Channels",
+        codec_channels,
+    ));
+
+    let mic_signal = match diag.mic_signal_detected {
+        Some(true) => "Detected",
+        Some(false) => "Not Detected",
+        None => "Not Tested",
+    };
+    inspector = inspector.child(kv_row(
+        p,
+        "diag-mic-signal",
+        "Mic Signal",
+        mic_signal.to_string(),
+    ));
+
+    inspector
+}
+
+fn audio_codec_label(codec: AudioCodec) -> &'static str {
+    match codec {
+        AudioCodec::Opus => "Opus",
+        AudioCodec::Aac => "AAC",
+        AudioCodec::Flac => "FLAC",
+    }
 }
 
 fn resolve_audio_source_label(s: &AppState, id: &str) -> String {
@@ -1321,16 +1452,22 @@ fn resolve_audio_source_label(s: &AppState, id: &str) -> String {
     id.to_string()
 }
 
-fn audio_source_row(p: &Palette, key: &str, id: &str, label: &str, checked: bool) -> El {
-    let source_id = id.to_string();
-    row()
+fn audio_source_row(
+    p: &Palette,
+    key: &str,
+    id: &str,
+    label: &str,
+    track: Option<AudioTrackTarget>,
+) -> El {
+    let checked = track.is_some();
+    let source_id_toggle = id.to_string();
+    let mut container = col()
         .key(key)
         .w_full()
         .min_w(0.0)
         .px(space::SM)
         .py(space::SM)
-        .gap(space::SM)
-        .center_y()
+        .gap(space::XS)
         .fill(if checked { p.accent_soft } else { p.bg_lowest })
         .border(
             1.0,
@@ -1343,38 +1480,291 @@ fn audio_source_row(p: &Palette, key: &str, id: &str, label: &str, checked: bool
         .radius(radius::SM)
         .clip_rounded(radius::SM)
         .child(
-            checkbox(p, &format!("{key}-chk"), label, checked, move |st| {
-                st.toggle_audio_source(source_id.clone());
-            })
-            .min_w(16.0),
+            row()
+                .key(format!("{key}-top"))
+                .w_full()
+                .min_w(0.0)
+                .gap(space::SM)
+                .center_y()
+                .child(
+                    checkbox(p, &format!("{key}-chk"), label, checked, move |st| {
+                        st.toggle_audio_source(source_id_toggle.clone());
+                    })
+                    .min_w(16.0),
+                )
+                .child(
+                    col()
+                        .key(format!("{key}-info"))
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(2.0)
+                        .child(
+                            text(label.to_string())
+                                .key(format!("{key}-label"))
+                                .w_full()
+                                .font(typography::LABEL)
+                                .color(if checked {
+                                    p.text_primary
+                                } else {
+                                    p.text_secondary
+                                })
+                                .truncate(),
+                        )
+                        .child(
+                            text(id.to_string())
+                                .key(format!("{key}-id"))
+                                .w_full()
+                                .font(typography::MONO_BADGE)
+                                .color(p.text_muted)
+                                .truncate_middle(),
+                        ),
+                ),
+        );
+
+    if let Some(active_track) = track {
+        let mut track_row = row()
+            .key(format!("{key}-tracks"))
+            .w_full()
+            .min_w(0.0)
+            .gap(space::XS)
+            .center_y()
+            .child(
+                text("Track:")
+                    .font(typography::MONO_BADGE)
+                    .color(p.text_muted),
+            );
+        for target in [
+            AudioTrackTarget::Auto,
+            AudioTrackTarget::T1,
+            AudioTrackTarget::T2,
+            AudioTrackTarget::T3,
+            AudioTrackTarget::T4,
+        ] {
+            let src = id.to_string();
+            track_row = track_row.child(pill_option(
+                p,
+                &format!("{key}-trk-{}", target.label()),
+                target.label(),
+                active_track == target,
+                move |st| st.set_audio_source_track(&src, target),
+            ));
+        }
+        container = container.child(track_row);
+    }
+
+    container
+}
+
+fn mic_test_card(p: &Palette, s: &AppState) -> El {
+    let mic = &s.mic_test;
+    let selected_id = mic
+        .selected_source
+        .clone()
+        .or_else(|| s.selected_mic_source());
+    let selected_label = selected_id
+        .as_deref()
+        .map(|id| resolve_audio_source_label(s, id))
+        .unwrap_or_else(|| "No microphone selected".to_string());
+
+    let meter_progress = if mic.rms_dbfs <= DBFS_FLOOR + 0.5 {
+        0.0
+    } else {
+        ((mic.rms_dbfs + 60.0) / 60.0).clamp(0.0, 1.0)
+    };
+    let meter_color = if mic.peak_dbfs >= -3.0 {
+        p.recording
+    } else if mic.rms_dbfs >= -45.0 {
+        p.success
+    } else {
+        p.warning
+    };
+
+    let dbfs_readout = if mic.rms_dbfs <= DBFS_FLOOR + 0.5 && mic.peak_dbfs <= DBFS_FLOOR + 0.5 {
+        "-- dBFS (Idle)".to_string()
+    } else {
+        format!(
+            "RMS {:.1} dBFS  •  Peak {:.1} dBFS",
+            mic.rms_dbfs, mic.peak_dbfs
         )
+    };
+
+    let mut actions = row()
+        .key("rec-mic-test-actions")
+        .w_full()
+        .gap(space::SM)
+        .center_y();
+
+    match mic.phase {
+        MicTestPhase::Recording => {
+            actions = actions
+                .child(btn_danger(p, "rec-mic-stop-btn", "Stop Test", |st| {
+                    st.stop_mic_test();
+                }))
+                .child(
+                    text(format!("{:.1}s / 3.0s", mic.elapsed_ms as f32 / 1000.0))
+                        .font(typography::MONO_BADGE)
+                        .color(p.text_secondary),
+                );
+        }
+        MicTestPhase::Playing => {
+            actions = actions.child(btn_danger(
+                p,
+                "rec-mic-stop-play-btn",
+                "Stop Playback",
+                |st| st.stop_mic_test(),
+            ));
+        }
+        _ => {
+            actions = actions.child(btn_primary(
+                p,
+                "rec-mic-start-btn",
+                "Test Microphone",
+                |st| st.start_mic_test(),
+            ));
+            if mic.diagnostic_summary.is_some() {
+                actions =
+                    actions.child(btn_secondary(p, "rec-mic-play-btn", "Play Sample", |st| {
+                        st.play_mic_test_sample()
+                    }));
+            }
+        }
+    }
+
+    let mut c = card(p, "rec-mic-test-card")
+        .child(section_header(
+            p,
+            "rec-mic-test-hdr",
+            "Microphone Test",
+            "Live PipeWire sample level & playback verification",
+        ))
         .child(
             col()
-                .key(format!("{key}-info"))
-                .grow(1.0)
+                .key("rec-mic-selected")
+                .w_full()
                 .min_w(0.0)
                 .gap(2.0)
                 .child(
-                    text(label.to_string())
-                        .key(format!("{key}-label"))
-                        .w_full()
+                    text(selected_label)
                         .font(typography::LABEL)
-                        .color(if checked {
-                            p.text_primary
-                        } else {
-                            p.text_secondary
-                        })
-                        .truncate(),
+                        .color(p.text_primary)
+                        .w_full()
+                        .wrap(),
                 )
                 .child(
-                    text(id.to_string())
-                        .key(format!("{key}-id"))
-                        .w_full()
-                        .font(typography::MONO_BADGE)
-                        .color(p.text_muted)
-                        .truncate_middle(),
+                    text(
+                        selected_id
+                            .unwrap_or_else(|| "Select a microphone in Audio Sources".to_string()),
+                    )
+                    .font(typography::MONO_BADGE)
+                    .color(p.text_muted)
+                    .w_full()
+                    .wrap_anywhere(),
                 ),
         )
+        .child(
+            col()
+                .key("rec-mic-meter-box")
+                .w_full()
+                .gap(space::XS)
+                .child(progress_bar(
+                    p,
+                    "rec-mic-meter",
+                    meter_progress,
+                    meter_color,
+                ))
+                .child(
+                    text(dbfs_readout)
+                        .font(typography::MONO_BADGE)
+                        .color(p.text_secondary),
+                ),
+        )
+        .child(actions);
+
+    if let Some(feedback) = mic.feedback {
+        let (label, fg, bg) = mic_feedback_badge(p, feedback);
+        c = c.child(
+            row()
+                .key("rec-mic-feedback-row")
+                .w_full()
+                .gap(space::SM)
+                .center_y()
+                .child(badge("rec-mic-feedback-badge", label, fg, bg)),
+        );
+    }
+
+    if let Some(err) = &mic.error {
+        c = c.child(
+            text(err.clone())
+                .key("rec-mic-error-text")
+                .font(typography::LABEL)
+                .color(p.error_text)
+                .w_full()
+                .wrap(),
+        );
+    }
+
+    if let Some(summary) = &mic.diagnostic_summary {
+        c = c.child(
+            col()
+                .key("rec-mic-summary")
+                .w_full()
+                .min_w(0.0)
+                .gap(space::XS)
+                .px(space::SM)
+                .py(space::XS)
+                .fill(p.bg_lowest)
+                .border(1.0, p.border_subtle)
+                .radius(radius::SM)
+                .child(kv_row(
+                    p,
+                    "mic-sum-device",
+                    "Backend Device",
+                    summary
+                        .resolved_backend_device
+                        .clone()
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                ))
+                .child(kv_row(
+                    p,
+                    "mic-sum-fmt",
+                    "Format",
+                    format!(
+                        "{} • {} Hz • {} ch",
+                        summary.backend_kind, summary.sample_rate, summary.channels
+                    ),
+                ))
+                .child(kv_row(
+                    p,
+                    "mic-sum-signal",
+                    "Signal Detected",
+                    if summary.signal_detected { "Yes" } else { "No" }.to_string(),
+                ))
+                .child(
+                    text(summary.message.clone())
+                        .font(typography::LABEL)
+                        .color(p.text_secondary)
+                        .w_full()
+                        .wrap(),
+                ),
+        );
+    }
+
+    c
+}
+
+fn mic_feedback_badge(
+    p: &Palette,
+    kind: MicFeedbackKind,
+) -> (&'static str, rune::Color, rune::Color) {
+    match kind {
+        MicFeedbackKind::Silence => ("Silence", p.warning_text, p.warning_soft),
+        MicFeedbackKind::MutedOrVeryQuiet => ("Muted / Very Quiet", p.warning_text, p.warning_soft),
+        MicFeedbackKind::GoodSignal => ("Good Signal", p.success_text, p.success_soft),
+        MicFeedbackKind::Clipping => ("Clipping", p.error_text, p.recording_soft),
+        MicFeedbackKind::MissingDevice => ("Missing Device", p.error_text, p.recording_soft),
+        MicFeedbackKind::PermissionError => ("Permission Error", p.error_text, p.recording_soft),
+        MicFeedbackKind::Success => ("Playback OK", p.success_text, p.success_soft),
+    }
 }
 
 fn hotkeys_card(p: &Palette, s: &AppState) -> El {
@@ -1694,5 +2084,91 @@ mod tests {
             rt.presented("rec-audio-inspector").is_some(),
             "rec-audio-inspector should render when sources are selected"
         );
+    }
+
+    #[test]
+    fn track_routing_pills_and_restart_banner_work() {
+        use chrono::Utc;
+        use clipforge_capture::AudioTrackTarget;
+        use clipforge_common::CaptureStatus;
+
+        let mut st = long_pipewire_state();
+        st.config.capture.audio_sources =
+            vec!["default_output".to_string(), "default_input".to_string()];
+        st.capture_status = CaptureStatus::ReplayBuffering {
+            started_at: Utc::now(),
+            buffer_secs: 60,
+        };
+        let mut rt = Runtime::new(st, root_view, (1280.0, 1200.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+
+        // Assign default_input to T2 via pill click
+        let (tx, ty) = rt
+            .find("audio-default-in-trk-T2")
+            .expect("audio-default-in-trk-T2 pill should be clickable");
+        rt.pointer_down(tx, ty);
+        rt.pointer_up(tx, ty);
+        rt.frame(0.5);
+
+        assert_eq!(
+            rt.state.audio_source_track("default_input"),
+            Some(AudioTrackTarget::T2)
+        );
+        assert!(rt.state.audio_config_dirty_while_active);
+        assert!(rt.presented("rec-audio-restart-banner").is_some());
+        assert!(rt.presented("diag-gsr-args").is_some());
+
+        let (rx, ry) = rt
+            .find("rec-audio-restart-btn")
+            .expect("rec-audio-restart-btn should be clickable");
+        rt.pointer_down(rx, ry);
+        rt.pointer_up(rx, ry);
+        rt.frame(0.5);
+        assert!(!rt.state.audio_config_dirty_while_active);
+    }
+
+    #[test]
+    fn mic_test_card_renders_level_meter_feedback_and_summary() {
+        use clipforge_media::{MicDiagnosticSummary, MicFeedbackKind, MicTestPhase};
+
+        let mut st = long_pipewire_state();
+        st.mic_test.phase = MicTestPhase::Recorded;
+        st.mic_test.selected_source = Some("default_input".to_string());
+        st.mic_test.rms_dbfs = -18.5;
+        st.mic_test.peak_dbfs = -6.2;
+        st.mic_test.feedback = Some(MicFeedbackKind::GoodSignal);
+        st.mic_test.diagnostic_summary = Some(MicDiagnosticSummary {
+            selected_source_id: "default_input".to_string(),
+            resolved_backend_device: Some("easyeffects_source".to_string()),
+            backend_kind: "pipewire-pulse".to_string(),
+            sample_rate: 48_000,
+            channels: 1,
+            rms_dbfs: -18.5,
+            peak_dbfs: -6.2,
+            signal_detected: true,
+            source_muted: Some(false),
+            recorded_duration_ms: 3000,
+            feedback: MicFeedbackKind::GoodSignal,
+            message: "Good microphone signal detected.".to_string(),
+        });
+
+        let mut rt = Runtime::new(st, root_view, (1280.0, 1400.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+
+        assert!(rt.presented("rec-mic-test-card").is_some());
+        assert!(rt.presented("rec-mic-meter").is_some());
+        assert!(rt.presented("rec-mic-feedback-badge").is_some());
+        assert!(rt.presented("rec-mic-summary").is_some());
+        assert!(rt.find("rec-mic-start-btn").is_some());
+        assert!(rt.find("rec-mic-play-btn").is_some());
+
+        let (sx, sy) = rt
+            .find("rec-mic-start-btn")
+            .expect("rec-mic-start-btn should be clickable");
+        rt.pointer_down(sx, sy);
+        rt.pointer_up(sx, sy);
+        rt.frame(0.0);
+        assert_eq!(rt.state.mic_test.phase, MicTestPhase::Recording);
+        assert!(rt.find("rec-mic-stop-btn").is_some());
     }
 }
