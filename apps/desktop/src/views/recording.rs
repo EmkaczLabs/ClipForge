@@ -1,6 +1,7 @@
 //! Recording Studio view: live GSR status, replay/record controls, capture pipeline, audio, and hotkeys.
 
 use chrono::{DateTime, Utc};
+use clipforge_capture::GlobalHotkeyStatus;
 use clipforge_common::{
     AudioCodec, CaptureStatus, CaptureTarget, ContainerFormat, EncoderMode, QualityPreset,
     VideoCodec,
@@ -1377,14 +1378,60 @@ fn audio_source_row(p: &Palette, key: &str, id: &str, label: &str, checked: bool
 }
 
 fn hotkeys_card(p: &Palette, s: &AppState) -> El {
-    let subtitle = if s.is_wayland {
-        "Wayland: configure GlobalShortcuts in compositor"
-    } else {
-        "X11 global keybindings"
+    let (badge_label, badge_fg, badge_bg, subtitle, detail_notice) = match &s.hotkey_status {
+        GlobalHotkeyStatus::WaylandPortalActive => (
+            "Portal Active".to_string(),
+            p.success_text,
+            p.success_soft,
+            "GlobalShortcuts (Wayland Portal Active)".to_string(),
+            None,
+        ),
+        GlobalHotkeyStatus::X11GlobalActive => (
+            "X11 Global".to_string(),
+            p.success_text,
+            p.success_soft,
+            "X11 global keybindings active".to_string(),
+            None,
+        ),
+        GlobalHotkeyStatus::PermissionPending => (
+            "Pending".to_string(),
+            p.warning_text,
+            p.warning_soft,
+            "Permission Pending — approve in system dialog".to_string(),
+            Some(
+                "Approve the desktop portal GlobalShortcuts prompt to enable background hotkeys."
+                    .to_string(),
+            ),
+        ),
+        GlobalHotkeyStatus::FocusedWindowOnly { reason } => (
+            "Focused Only".to_string(),
+            p.text_secondary,
+            p.bg_elevated,
+            "Focused-Window Only (F9/F10/F11 work when focused)".to_string(),
+            reason
+                .as_ref()
+                .map(|r| format!("Global registration inactive: {r}")),
+        ),
+        GlobalHotkeyStatus::RegistrationError { message } => (
+            "Error".to_string(),
+            p.warning_text,
+            p.warning_soft,
+            "Registration Error (focused shortcuts active)".to_string(),
+            Some(format!("Shortcut registration error: {message}")),
+        ),
     };
 
-    card(p, "rec-hotkey-card")
-        .child(section_header(p, "rec-hk-hdr", "Global Hotkeys", subtitle))
+    let mut out = card(p, "rec-hotkey-card")
+        .child(
+            row()
+                .key("rec-hk-hdr-row")
+                .w_full()
+                .justify_between()
+                .center_y()
+                .gap(space::SM)
+                .child(section_header(p, "rec-hk-hdr", "Global Hotkeys", &subtitle))
+                .child(badge("rec-hk-status", &badge_label, badge_fg, badge_bg)),
+        )
         .child(hotkey_row(
             p,
             "hk-save",
@@ -1402,7 +1449,12 @@ fn hotkeys_card(p: &Palette, s: &AppState) -> El {
             "hk-toggle-rec",
             "Start / Stop Recording",
             &s.hotkeys.toggle_record,
-        ))
+        ));
+
+    if let Some(notice) = detail_notice {
+        out = out.child(fallback_notice(p, "rec-hk-notice", &notice));
+    }
+    out
 }
 
 fn hotkey_row(p: &Palette, key: &str, label: &str, keycap: &str) -> El {
