@@ -274,3 +274,203 @@ async fn gsr_like_mkv_multi_audio_and_past_eof_thumbnail_fallback() {
     let png_bytes = std::fs::read(&thumb_path).expect("read fallback png");
     assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
 }
+
+#[tokio::test]
+async fn video_player_open_seek_play_trim_and_switch_clips() {
+    use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
+    use std::time::Duration;
+
+    let dir = TestDir::new("clipforge_player_it");
+    let clip_a = dir.join("clip_a.mp4");
+    let clip_b = dir.join("clip_b.mp4");
+    generate_synthetic_mp4(&clip_a);
+    generate_synthetic_mp4(&clip_b);
+
+    let (player, mut rx) = VideoPlayerHandle::spawn();
+
+    // Helper to collect events until a predicate matches or timeout expires.
+    async fn wait_for<F>(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
+        mut pred: F,
+    ) -> Vec<PlayerEvent>
+    where
+        F: FnMut(&PlayerEvent) -> bool,
+    {
+        let mut collected = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for player event; collected={collected:?}"
+            );
+            let ev = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect("timeout receiving event")
+                .expect("event channel closed");
+            let done = pred(&ev);
+            collected.push(ev);
+            if done {
+                return collected;
+            }
+        }
+    }
+
+    // 1. Open clip_a with trim range [500, 1200] and max_dim = 160 (320x240 -> 160x120)
+    player.open(&clip_a, Some((500, 1200)), Some(160));
+    let events = wait_for(&mut rx, |e| {
+        matches!(e, PlayerEvent::StateChanged(PlaybackState::Paused))
+    })
+    .await;
+
+    let meta = events
+        .iter()
+        .find_map(|e| match e {
+            PlayerEvent::Metadata(m) => Some(m.clone()),
+            _ => None,
+        })
+        .expect("expected Metadata event");
+    assert_eq!(meta.width, 320);
+    assert_eq!(meta.height, 240);
+    assert!((meta.aspect_ratio - (320.0 / 240.0)).abs() < 0.01);
+    assert!(meta.has_audio);
+
+    let first_frame = events
+        .iter()
+        .find_map(|e| match e {
+            PlayerEvent::Frame(f) => Some(f.clone()),
+            _ => None,
+        })
+        .expect("expected initial Frame event");
+    assert_eq!(first_frame.width, 160);
+    assert_eq!(first_frame.height, 120);
+    assert_eq!(first_frame.data.len(), 160 * 120 * 4);
+    assert_eq!(first_frame.pts_ms, 500);
+
+    // 2. Seek outside trim range clamps to [500, 1200]
+    player.seek(100);
+    let seek_low = wait_for(&mut rx, |e| matches!(e, PlayerEvent::Position(_))).await;
+    assert!(
+        seek_low
+            .iter()
+            .any(|e| matches!(e, PlayerEvent::Position(500)))
+    );
+
+    player.seek(2500);
+    let seek_high = wait_for(&mut rx, |e| matches!(e, PlayerEvent::Position(_))).await;
+    assert!(
+        seek_high
+            .iter()
+            .any(|e| matches!(e, PlayerEvent::Position(1200)))
+    );
+
+    // 3. Play from trim start (since position was at trim end 1200, play() restarts from 500)
+    player.play();
+    let play_events = wait_for(&mut rx, |e| {
+        matches!(e, PlayerEvent::StateChanged(PlaybackState::Ended))
+    })
+    .await;
+    let decoded_frames: Vec<_> = play_events
+        .iter()
+        .filter_map(|e| match e {
+            PlayerEvent::Frame(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        decoded_frames.len() >= 5,
+        "expected multiple decoded frames during playback, got {}",
+        decoded_frames.len()
+    );
+    assert!(
+        decoded_frames
+            .iter()
+            .all(|f| f.pts_ms >= 500 && f.pts_ms <= 1200 && f.data.len() == 160 * 120 * 4)
+    );
+
+    // 4. Restart and pause mid-playback, then switch to clip_b cleanly
+    player.restart();
+    let _ = wait_for(&mut rx, |e| {
+        matches!(e, PlayerEvent::StateChanged(PlaybackState::Playing))
+    })
+    .await;
+    player.open(&clip_b, None, Some(1024));
+    let switch_events = wait_for(&mut rx, |e| {
+        matches!(e, PlayerEvent::StateChanged(PlaybackState::Paused))
+    })
+    .await;
+    let b_frame = switch_events
+        .iter()
+        .find_map(|e| match e {
+            PlayerEvent::Frame(f) => Some(f.clone()),
+            _ => None,
+        })
+        .expect("expected frame from clip_b");
+    assert_eq!(b_frame.width, 320);
+    assert_eq!(b_frame.height, 240);
+
+    // 5. Close releases clip and transitions to Stopped
+    player.close();
+    let _ = wait_for(&mut rx, |e| {
+        matches!(e, PlayerEvent::StateChanged(PlaybackState::Stopped))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn video_player_handles_missing_and_corrupt_files_gracefully() {
+    use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
+    use std::time::Duration;
+
+    let dir = TestDir::new("clipforge_player_err");
+    let missing = dir.join("does_not_exist.mp4");
+    let corrupt = dir.join("corrupt.mp4");
+    std::fs::write(&corrupt, b"not a valid mp4 file at all").unwrap();
+
+    let (player, mut rx) = VideoPlayerHandle::spawn();
+
+    for bad_path in [&missing, &corrupt] {
+        player.open(bad_path, None, Some(1024));
+        let mut saw_error = false;
+        let mut saw_stopped = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !(saw_error && saw_stopped) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for error/stopped");
+            let ev = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect("timeout")
+                .expect("closed");
+            match ev {
+                PlayerEvent::Error(_) => saw_error = true,
+                PlayerEvent::StateChanged(PlaybackState::Stopped) => saw_stopped = true,
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn extract_timeline_thumbnails_returns_scaled_rgba_frames() {
+    use clipforge_media::extract_timeline_thumbnails;
+
+    let dir = TestDir::new("clipforge_thumbs_it");
+    let source = dir.join("synthetic.mp4");
+    generate_synthetic_mp4(&source);
+
+    let thumbs = extract_timeline_thumbnails(&source, 5, 160, 90)
+        .await
+        .expect("extract timeline thumbnails");
+    assert_eq!(thumbs.len(), 5);
+    for thumb in &thumbs {
+        // 320x240 fit within 160x90 -> 120x90
+        assert_eq!(thumb.width, 120);
+        assert_eq!(thumb.height, 90);
+        assert_eq!(thumb.data.len(), 120 * 90 * 4);
+    }
+
+    let missing_err = extract_timeline_thumbnails(&dir.join("missing.mp4"), 3, 160, 90)
+        .await
+        .unwrap_err();
+    assert!(matches!(missing_err, ClipForgeError::NotFound(_)));
+}

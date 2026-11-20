@@ -252,7 +252,7 @@ fn validate_path_chars(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn validate_input_path(path: &Path) -> Result<PathBuf> {
+pub(crate) async fn validate_input_path(path: &Path) -> Result<PathBuf> {
     validate_path_chars(path)?;
     let meta = tokio::fs::metadata(path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
