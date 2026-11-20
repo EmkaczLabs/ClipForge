@@ -133,6 +133,75 @@ impl PlaybackClock {
     }
 }
 
+/// Selects how `ffmpeg` decodes audio streams for playback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AudioTrackMode {
+    /// Mix all available audio tracks (or play `0:a:0` directly if only 1 track exists).
+    AutoMix { track_count: usize },
+    /// Decode a single explicit audio track index (`0:a:{index}`).
+    Single(usize),
+}
+
+/// Builds `ffmpeg` CLI arguments to decode the requested audio track(s) into `f32le` PCM.
+pub(crate) fn build_audio_decode_args(
+    canonical_in: &Path,
+    start_ms: u64,
+    trim_end_ms: u64,
+    track_mode: AudioTrackMode,
+    sample_rate: u32,
+    channels: u16,
+) -> Vec<String> {
+    let start_ts = format_timestamp_ms(start_ms);
+    let dur_ts = format_timestamp_ms(trim_end_ms.saturating_sub(start_ms));
+
+    let mut args = vec![
+        "-v".to_string(),
+        "error".to_string(),
+        "-ss".to_string(),
+        start_ts,
+        "-i".to_string(),
+        canonical_in.to_string_lossy().into_owned(),
+        "-t".to_string(),
+        dur_ts,
+        "-vn".to_string(),
+    ];
+
+    match track_mode {
+        AudioTrackMode::AutoMix { track_count } if track_count > 1 => {
+            let mut inputs = String::new();
+            for idx in 0..track_count {
+                inputs.push_str(&format!("[0:a:{idx}]"));
+            }
+            let filter = format!(
+                "{inputs}amix=inputs={track_count}:duration=longest:dropout_transition=0:normalize=0[aout]"
+            );
+            args.push("-filter_complex".to_string());
+            args.push(filter);
+            args.push("-map".to_string());
+            args.push("[aout]".to_string());
+        }
+        AudioTrackMode::AutoMix { .. } => {
+            args.push("-map".to_string());
+            args.push("0:a:0?".to_string());
+        }
+        AudioTrackMode::Single(idx) => {
+            args.push("-map".to_string());
+            args.push(format!("0:a:{idx}?"));
+        }
+    }
+
+    args.extend([
+        "-f".to_string(),
+        "f32le".to_string(),
+        "-ac".to_string(),
+        channels.to_string(),
+        "-ar".to_string(),
+        sample_rate.to_string(),
+        "pipe:1".to_string(),
+    ]);
+    args
+}
+
 /// Active audio decode + `cpal` output session.
 pub(crate) struct AudioSession {
     stop_flag: Arc<AtomicBool>,
@@ -151,7 +220,7 @@ impl AudioSession {
         canonical_in: &Path,
         start_ms: u64,
         trim_end_ms: u64,
-        track_index: usize,
+        track_mode: AudioTrackMode,
         controls: AudioControlState,
     ) -> std::result::Result<(Self, PlaybackClock), String> {
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -187,39 +256,27 @@ impl AudioSession {
             }
         };
 
-        let start_ts = format_timestamp_ms(start_ms);
-        let dur_ts = format_timestamp_ms(trim_end_ms.saturating_sub(start_ms));
-        let map_spec = format!("0:a:{track_index}?");
+        let ffmpeg_args = build_audio_decode_args(
+            canonical_in,
+            start_ms,
+            trim_end_ms,
+            track_mode,
+            sample_rate,
+            channels,
+        );
 
         debug!(
             video = %canonical_in.display(),
             start_ms,
             trim_end_ms,
-            track_index,
+            ?track_mode,
             sample_rate,
             channels,
             "spawning ffmpeg audio decode stream"
         );
 
         let mut child = Command::new(ffmpeg_bin)
-            .arg("-v")
-            .arg("error")
-            .arg("-ss")
-            .arg(&start_ts)
-            .arg("-i")
-            .arg(canonical_in)
-            .arg("-t")
-            .arg(&dur_ts)
-            .arg("-vn")
-            .arg("-map")
-            .arg(&map_spec)
-            .arg("-f")
-            .arg("f32le")
-            .arg("-ac")
-            .arg(channels.to_string())
-            .arg("-ar")
-            .arg(sample_rate.to_string())
-            .arg("pipe:1")
+            .args(&ffmpeg_args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -494,5 +551,52 @@ fn fill_audio_buffer<T: Copy>(
         if frames > 0 {
             samples_played.fetch_add(frames, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_audio_decode_args_auto_mixes_multiple_tracks() {
+        let args = build_audio_decode_args(
+            Path::new("/tmp/test.mp4"),
+            0,
+            5000,
+            AudioTrackMode::AutoMix { track_count: 2 },
+            48_000,
+            2,
+        );
+        assert!(args.windows(2).any(|w| {
+            w[0] == "-filter_complex"
+                && w[1] == "[0:a:0][0:a:1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]"
+        }));
+        assert!(args.windows(2).any(|w| w == ["-map", "[aout]"]));
+    }
+
+    #[test]
+    fn build_audio_decode_args_single_track_uses_direct_map() {
+        let auto_one = build_audio_decode_args(
+            Path::new("/tmp/test.mp4"),
+            0,
+            5000,
+            AudioTrackMode::AutoMix { track_count: 1 },
+            48_000,
+            2,
+        );
+        assert!(auto_one.windows(2).any(|w| w == ["-map", "0:a:0?"]));
+        assert!(!auto_one.iter().any(|a| a == "-filter_complex"));
+
+        let explicit = build_audio_decode_args(
+            Path::new("/tmp/test.mp4"),
+            0,
+            5000,
+            AudioTrackMode::Single(1),
+            48_000,
+            2,
+        );
+        assert!(explicit.windows(2).any(|w| w == ["-map", "0:a:1?"]));
+        assert!(!explicit.iter().any(|a| a == "-filter_complex"));
     }
 }

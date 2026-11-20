@@ -12,7 +12,7 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, trace, warn};
 
-use crate::audio::{AudioControlState, AudioSession, PlaybackClock};
+use crate::audio::{AudioControlState, AudioSession, AudioTrackMode, PlaybackClock};
 use crate::processor::{FfmpegMediaProcessor, format_timestamp_ms, validate_input_path};
 
 /// Default maximum frame dimension (matches Rune's 1024x1024 image atlas fast path).
@@ -189,7 +189,7 @@ impl VideoPlayerHandle {
         self.audio_controls.is_muted()
     }
 
-    /// Selects the audio track index (`Some(0)` default, or `None` to disable audio output).
+    /// Selects the audio track index (`None` = Auto mix all tracks, `Some(idx)` = specific track).
     pub fn set_audio_track(&self, track_index: Option<usize>) {
         let _ = self.cmd_tx.send(PlayerCommand::SetAudioTrack(track_index));
     }
@@ -335,7 +335,7 @@ impl PlayerWorker {
             processor,
             event_tx,
             audio_controls,
-            audio_track_index: Some(0),
+            audio_track_index: None,
             clip: None,
             status: PlaybackState::Stopped,
             stream: None,
@@ -674,17 +674,25 @@ impl PlayerWorker {
 
         self.stop_stream().await;
 
-        let active_audio_track = self
-            .audio_track_index
-            .filter(|&idx| has_audio && idx < audio_track_count);
+        let track_mode = if !has_audio || audio_track_count == 0 {
+            None
+        } else {
+            match self.audio_track_index {
+                None => Some(AudioTrackMode::AutoMix {
+                    track_count: audio_track_count,
+                }),
+                Some(idx) if idx < audio_track_count => Some(AudioTrackMode::Single(idx)),
+                Some(_) => None,
+            }
+        };
 
-        let (audio, clock, audio_error) = if let Some(track_idx) = active_audio_track {
+        let (audio, clock, audio_error) = if let Some(track_mode) = track_mode {
             match AudioSession::start(
                 &self.ffmpeg_bin,
                 &path,
                 start_ms,
                 trim_end_ms,
-                track_idx,
+                track_mode,
                 self.audio_controls.clone(),
             )
             .await

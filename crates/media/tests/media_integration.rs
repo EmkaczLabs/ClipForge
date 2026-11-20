@@ -711,3 +711,168 @@ async fn trim_with_progress_reports_progress_and_supports_cancellation() {
     assert!(err.to_string().contains("cancelled"));
     assert!(!out_cancel.exists());
 }
+
+#[tokio::test]
+async fn multi_track_auto_mix_and_explicit_track_playback() {
+    use std::time::Duration;
+
+    use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
+
+    if Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping test: ffmpeg not installed");
+        return;
+    }
+
+    let dir = TestDir::new("multi-track-playback");
+    let clip = dir.join("two_tracks.mkv");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=navy:s=320x240:r=24:d=0.6",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo:d=0.6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=0.6",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-map",
+            "2:a:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libopus",
+            clip.to_str().unwrap(),
+        ])
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "synthetic multi-track mkv failed");
+
+    let (player, mut rx) = VideoPlayerHandle::spawn();
+    player.open(&clip, None, Some(160));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut paused = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+            && matches!(ev, PlayerEvent::StateChanged(PlaybackState::Paused))
+        {
+            paused = true;
+            break;
+        }
+    }
+    assert!(paused, "player did not reach Paused after open");
+
+    // Default mode is Auto (None -> amix both tracks)
+    player.play();
+    let mut ended = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            if let PlayerEvent::Error(e) = &ev {
+                panic!("unexpected player error during auto-mix playback: {e}");
+            }
+            if matches!(ev, PlayerEvent::StateChanged(PlaybackState::Ended)) {
+                ended = true;
+                break;
+            }
+        }
+    }
+    assert!(ended, "auto-mix playback did not reach Ended");
+
+    // Explicit track 1 (0:a:1)
+    player.set_audio_track(Some(1));
+    player.restart();
+    let mut ended_t2 = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            if let PlayerEvent::Error(e) = &ev {
+                panic!("unexpected player error during track 2 playback: {e}");
+            }
+            if matches!(ev, PlayerEvent::StateChanged(PlaybackState::Ended)) {
+                ended_t2 = true;
+                break;
+            }
+        }
+    }
+    assert!(ended_t2, "track 2 playback did not reach Ended");
+
+    player.close();
+}
+
+#[tokio::test]
+async fn mic_test_rejects_missing_device_and_tests_real_pipewire_source_if_present() {
+    use std::time::Duration;
+
+    use clipforge_media::{DBFS_FLOOR, MicFeedbackKind, MicTestEvent, MicTestHandle};
+
+    let (mic, mut rx) = MicTestHandle::spawn();
+
+    // 1. Missing device must report MissingDevice, never silently fall back.
+    mic.start_test(
+        "nonexistent_mic_device_xyz_999",
+        Some(Duration::from_millis(200)),
+    );
+    let mut got_missing = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+            && let MicTestEvent::Error { feedback, .. } = ev
+        {
+            assert_eq!(feedback, MicFeedbackKind::MissingDevice);
+            got_missing = true;
+            break;
+        }
+    }
+    assert!(
+        got_missing,
+        "expected MissingDevice error for unknown source"
+    );
+
+    // 2. If PipeWire/PulseAudio is active with a default source, test real capture & cleanup.
+    let pactl_ok = Command::new("pactl")
+        .args(["get-default-source"])
+        .output()
+        .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
+
+    if pactl_ok {
+        mic.start_test("default_input", Some(Duration::from_millis(250)));
+        let mut recorded_summary = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                match ev {
+                    MicTestEvent::Recorded { summary } => {
+                        recorded_summary = Some(summary);
+                        break;
+                    }
+                    MicTestEvent::Error {
+                        feedback, message, ..
+                    } => {
+                        panic!("unexpected error on real default_input: {feedback:?} {message}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let summary = recorded_summary.expect("expected Recorded summary from default_input");
+        assert!(summary.resolved_backend_device.is_some());
+        assert!(summary.sample_rate >= 8_000);
+        assert!(summary.channels >= 1);
+        assert!((DBFS_FLOOR..=0.0).contains(&summary.rms_dbfs));
+        assert!((DBFS_FLOOR..=0.0).contains(&summary.peak_dbfs));
+    }
+
+    mic.shutdown();
+}
