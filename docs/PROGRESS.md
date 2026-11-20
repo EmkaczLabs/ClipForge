@@ -1,7 +1,7 @@
 # ClipForge Progress Checkpoint
 
-**Checkpoint Timestamp:** 2026-11-20T23:16:00+01:00  
-**Latest Verified Commit:** `56099f1` (`main`)  
+**Checkpoint Timestamp:** 2026-11-20T23:51:00+01:00  
+**Latest Verified Commit:** `1592c5a` (`main`)  
 **Host Environment:** CachyOS (KDE Plasma / Wayland), NVIDIA RTX 3070, `gpu-screen-recorder 6.1.7`, `rustc 1.100.0`, `cargo 1.100.0`, `ffmpeg n9.0.2`.
 
 ## Milestone Status Summary
@@ -9,37 +9,41 @@
 | Milestone | Status | Notes |
 |---|---|---|
 | M1 — Foundation & Obsidian Forge UI (`97844c6..7b3da9a`) | Verified & passing | 5-screen `NavSection` (`Library` default, `Editor`, `Recording`, `Uploads`, `Settings`), Obsidian Forge palette (`theme.rs`), SVG icon & primitive catalog (`components.rs`), 48px topbar + 64px rail + 28px status bar (`views/mod.rs`), all 5 `--scene <name> --snap` renders pass. |
-| M2 — Recording Studio & Global Hotkeys (`38e8624`, `3af3d94`, `56099f1`) | Verified (automated + live portal bind) | PipeWire audio device & app-stream list overlap fixed (`views/recording.rs` `38e8624`: stacked label + technical ID with `.truncate()`/`.truncate_middle()`, bounded `rec-audio-list` scroll, `rec-audio-inspector`, tested at `1280x800` & `960x640`). Global hotkeys (`3af3d94`, `56099f1`): XDG Desktop Portal `GlobalShortcuts` via `zbus` (`CreateSession`, `BindShortcuts`, `Activated`, `Session::Close`) + X11 `start_x11` fallback + `AppSpec::on_key` focused `F9`/`F10`/`F11` + truthful `GlobalHotkeyStatus` badge & notice in `views/recording.rs`. Live Wayland portal bind verified (`live_wayland_portal` -> `PermissionPending` awaiting KDE dialog approval); unfocused Wayland `F9`/`F10`/`F11` delivery remains to be manually verified after approving the KDE portal prompt. |
+| M2 — Recording Studio, Audio Routing & Hotkeys (`8ff12e8`, `636fce3`, `1592c5a`) | Verified (live GSR + `ffprobe`) | Deterministic `Auto` vs `T1`–`T4` GSR audio routing (`crates/capture/src/audio.rs`): `Auto`/`T1` mix via `|` (`-a "default_output|default_input"`) into `0:a:0`; `t2:`–`t4:` emit separate `-a` tracks. Live GSR 6.1.7 + `ffprobe` verified all 5 routing cases (`live_audio_routing` 1/1 PASS). `views/recording.rs` adds per-source `Auto`/`T1`–`T4` pills, `track_diagnostics_panel`, `audio_restart_banner`, and `mic_test_card`. Global hotkeys use XDG `GlobalShortcuts` (`zbus`) + X11 fallback + `AppSpec::on_key`. |
 | M3 — Clip Library (`crates/library`, `views/library.rs`) | Verified & passing | SQLite v3 trash/restore (`trashed_at`, `original_path`, `.clipforge_trash`), managed-root boundary validation, `Sample`/`Imported` disk protection, `rename_clip`, game filter, Ctrl/Shift multi-select + bulk actions, inline confirm/rename, floating context menu, and 320px Inspector. |
-| M4 — Video Editor & Playback (`crates/media`, `views/editor.rs`) | Implemented & tested (headless) | `VideoPlayerHandle` (`ffmpeg` RGBA8 pipe, bounded `mpsc` queue, `cpal 0.15` PipeWire/ALSA audio + `samples_played` A/V sync, wall-clock fallback, `set_audio_track`), `ExportCancelToken` + `trim_with_progress`, 16:9 viewport, transport + volume/mute + `audio_track` selector, `1x..8x` zoomable timeline + scrub/trim handles, and Clip & Export inspector. |
+| M4 — Video Editor, Multi-Track Audio & Mic Test (`3674bce`, `636fce3`) | Verified (automated + PipeWire unit/integration) | `crates/media` (`3674bce`) defaults `audio_track_index` to `None` (`Auto`) using `AudioTrackMode::AutoMix` (`amix` when `track_count > 1`) so multi-track recordings play all tracks in `Auto` mode. `MicTestHandle` (`crates/media/src/mic_test.rs`) provides standalone `pactl` + `parec` + `cpal` mic testing with real dBFS metering, 3s sample record/playback, no silent device fallback, and `kill_on_drop(true)` cleanup. |
 | M5 — Shared & Cloud (`apps/server`, `crates/cloud-client`, `views/uploads.rs`) | Implemented & tested (unit/mock + server integration) | Disconnected onboarding/connect/health-check and Connected `remote_shares` + `uploads` management with retry/cancel, `CopyToClipboard`, `OpenUrl`, and remote delete confirmation. |
 | M6 — Settings & Release (`views/settings.rs`, `packaging/`) | Settings verified; packaging pending | 8-tab category rail, search filter, `AppConfig` persistence (`~/.config/clipforge/config.json`), `Reset`/`Save Settings`. `packaging/` (`Dockerfile`, `PKGBUILD`, `deb/`) remains to be built/validated. |
 
-## Targeted Regression Fixes (`aac7e1b..56099f1`)
+## Automatic Audio Routing & Microphone Test (`8ff12e8`..`1592c5a`)
 
-1. **PipeWire Device List Text Overlap (`38e8624` in `apps/desktop/src/views/recording.rs`):**
-   - Stacked human-readable device name and technical source ID inside `col().grow(1.0).min_w(0.0)` with `.truncate()` / `.truncate_middle()` and `.clip_rounded(radius::SM)`.
-   - Bounded `rec-audio-list` (`max_h(260.0)` + scroll) and added `rec-audio-inspector` for full wrapped active routing details.
-   - Added `rune::Runtime` render tests for the 4 long PipeWire names at `1280x800` and `960x640` + checkbox toggle.
-2. **Global & Focused Hotkeys (`aac7e1b`, `3af3d94`, `56099f1`):**
-   - Added `zbus = "5"` (`tokio`) to root `Cargo.toml` (`aac7e1b`).
-   - `crates/capture/src/hotkey.rs`: Added `HotkeyAction::ToggleReplayBuffer`, `GlobalHotkeyStatus` (`WaylandPortalActive`, `PermissionPending`, `X11GlobalActive`, `FocusedWindowOnly`, `RegistrationError`), `select_hotkey_backend()`, `HotkeySpec::to_xdg_trigger()`, and XDG `GlobalShortcuts` portal session via `zbus` with X11 `start_x11` fallback.
-   - `apps/desktop/src/{worker.rs,state.rs,main.rs,views/recording.rs}`: Wired `HotkeyManager::start_auto` on `Initialize` and re-registration on `SaveConfig`; wired `AppSpec::on_key` for focused `F9`/`F10`/`F11` across all views; rendered `s.hotkey_status` badge & detail notice in `hotkeys_card` (`56099f1`).
+1. **Root Cause & Deterministic Audio Routing (`crates/capture/src/audio.rs`, `crates/media/src/{audio,player}.rs`):**
+   - **Capture root cause:** `args.rs` previously emitted separate `-a <src>` flags for every `audio_sources` entry, causing GSR 6.1.7 to write separate streams (`0:a:0` system, `0:a:1` mic).
+   - **Playback root cause:** `player.rs` previously defaulted `audio_track_index` to `Some(0)` (leaving `0:a:1` silent) and skipped `AudioSession::start` when `audio_track` was `None` (`Auto`).
+   - **Fix:** `crates/capture/src/audio.rs` (`8ff12e8`) introduces `AudioTrackTarget::{Auto, T1..T4}`, `AudioRoutingPlan`, `resolve_audio_routing`, `parse_routed_audio_source`, and `format_routed_audio_source` — `Auto`/`T1` mix sources with `|` into `0:a:0`, while `t2:`–`t4:` emit separate `-a` tracks. `crates/media` (`3674bce`) defaults `audio_track_index` to `None` (`Auto`) and adds `AudioTrackMode::AutoMix` (`amix` for multi-track files) and `AudioTrackMode::Single(idx)`.
+2. **Standalone PipeWire Microphone Test (`crates/media/src/mic_test.rs`, `3674bce`):**
+   - `MicTestHandle` (`pactl` + `parec` + `cpal`) captures from the exact selected PipeWire/Pulse source without touching the active GSR replay buffer, streams real-time RMS/peak dBFS (`DBFS_FLOOR = -96.0`), records bounded samples (3s default), cleans up `parec`/`cpal` via `kill_on_drop(true)` + `Drop`, plays back resampled PCM via `cpal`, and emits `MicDiagnosticSummary` (`Silence`, `MutedOrVeryQuiet`, `GoodSignal`, `Clipping`, `MissingDevice`, `PermissionError`, `Success`).
+3. **Desktop Wiring & Recording Studio UI (`636fce3`, `1592c5a`):**
+   - `state.rs` & `worker.rs` (`636fce3`): Wired `MicTestHandle` (`WorkerCommand::{StartMicTest, StartMicMonitor, StopMicTest, PlayMicTestSample, ClearMicTest, RestartReplayBuffer}`), `audio_source_track` / `set_audio_source_track`, `audio_config_dirty_while_active`, `audio_diagnostics()`, and `MicTestState`.
+   - `views/recording.rs` (`1592c5a`): Added per-source `Auto`/`T1`–`T4` pills in `audio_source_row`, `audio_restart_banner`, `track_diagnostics_panel`, and `mic_test_card`.
 
-## Latest Verified Test Results (`56099f1`)
+## Latest Verified Test Results (`1592c5a`)
 
 - `cargo fmt --all -- --check`: **PASS**
 - `cargo clippy --workspace --all-targets -- -D warnings`: **PASS** (0 crate warnings; 3 pre-existing workspace manifest warnings in `Cargo.toml`)
-- `cargo test --workspace`: **PASS** (82 passed, 0 failed, 2 ignored):
-  - `clipforge-capture`: 25 passed, 2 ignored (`live_gsr_replay_save_repeated_and_stop`, `live_wayland_portal`)
+- `cargo test --workspace`: **PASS** (98 passed, 0 failed, 3 ignored):
+  - `clipforge-capture`: 31 passed, 3 ignored (`live_gsr_replay_save_repeated_and_stop`, `live_wayland_portal`, `live_audio_routing`)
   - `clipforge-cloud-client`: 2 passed
   - `clipforge-common`: 3 passed
-  - `clipforge-desktop`: 21 passed
+  - `clipforge-desktop`: 23 passed
   - `clipforge-library`: 7 passed (integration)
-  - `clipforge-media`: 16 passed (7 unit + 9 integration)
+  - `clipforge-media`: 24 passed (13 unit + 11 integration)
   - `clipforge-server`: 8 passed (5 unit + 3 integration)
-- `cargo run -p clipforge-desktop -- --scene recording --snap /tmp/clipforge-recording-fix.png`: **PASS** (zero Rune a11y/layout warnings; visually inspected).
+- `cargo test -p clipforge-capture --test live_audio_routing -- --ignored --nocapture`: **PASS** (1/1 in 9.06s; verified real GSR 6.1.7 + `ffprobe` across all 5 routing cases: system only, mic only, system+mic Auto [1 mixed stream], system+mic T2 [2 streams], system+mic T3/T4 [3 streams]).
+- `cargo run -p clipforge-desktop -- --scene recording --snap /tmp/clipforge-studio-ui.png`: **PASS** (390,383 B, zero Rune a11y/layout warnings; visually inspected).
 
-### Remaining Manual Verification Steps
-- Launch `cargo run -p clipforge-desktop` in KDE Wayland, approve the KDE `GlobalShortcuts` portal permission dialog, and verify unfocused `F9` (Save Replay), `F10` (Toggle Replay Buffer), and `F11` (Start/Stop Recording) triggers alongside PipeWire/ALSA audio auditioning and pointer-drag timeline/trim UX.
-- Run live `cargo test -p clipforge-capture -- --ignored live_gsr_replay_save_repeated_and_stop` and test live desktop-to-server sharing against `clipforge-server`.
+### Remaining Manual Interactive Auditioning
+- Launch `cargo run -p clipforge-desktop` in KDE Wayland to interactively verify:
+  1. `Test Microphone` with live human voice + audible `Play Sample` playback.
+  2. Approving the KDE `GlobalShortcuts` portal dialog and testing unfocused `F9`/`F10`/`F11` delivery.
+  3. Live multi-frame editor playback + pointer-drag timeline/trim/volume UX.
