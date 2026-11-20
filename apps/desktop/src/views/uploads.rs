@@ -96,6 +96,11 @@ fn disconnected_view(p: &Palette, s: &AppState) -> El {
                 ),
         )
     } else if s.server_health_ok == Some(true) {
+        let ver_note = s
+            .server_info
+            .as_ref()
+            .map(|i| format!(" (v{}, {})", i.version, i.storage_backend))
+            .unwrap_or_default();
         Some(
             row()
                 .key("server-health-banner")
@@ -108,11 +113,13 @@ fn disconnected_view(p: &Palette, s: &AppState) -> El {
                 .border(1.0, p.success)
                 .child(icon(&icons::CHECK, 15.0).color(p.success).a11y_hidden())
                 .child(
-                    text("Server /health check passed. Click Connect Server to authenticate and sync.")
-                        .font(typography::LABEL)
-                        .color(p.success_text)
-                        .grow(1.0)
-                        .min_w(0.0),
+                    text(format!(
+                        "Server /health check passed{ver_note}. Click Connect Server to authenticate and sync."
+                    ))
+                    .font(typography::LABEL)
+                    .color(p.success_text)
+                    .grow(1.0)
+                    .min_w(0.0),
                 ),
         )
     } else {
@@ -409,17 +416,25 @@ struct SharedGridItem<'a> {
 
 impl<'a> SharedGridItem<'a> {
     fn share_id(&self) -> Option<&str> {
-        self.remote.map(|r| r.share_id.as_str()).or_else(|| {
-            self.upload
-                .and_then(|u| u.share.as_ref().map(|s| s.share_id.as_str()))
-        })
+        self.remote
+            .map(|r| r.share_id.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.upload
+                    .and_then(|u| u.share.as_ref().map(|s| s.share_id.as_str()))
+                    .filter(|s| !s.is_empty())
+            })
     }
 
     fn share_url(&self) -> Option<&str> {
-        self.remote.map(|r| r.url.as_str()).or_else(|| {
-            self.upload
-                .and_then(|u| u.share.as_ref().map(|s| s.url.as_str()))
-        })
+        self.remote
+            .map(|r| r.url.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.upload
+                    .and_then(|u| u.share.as_ref().map(|s| s.url.as_str()))
+                    .filter(|s| !s.is_empty())
+            })
     }
 
     fn is_public(&self) -> bool {
@@ -484,6 +499,19 @@ fn connected_view(p: &Palette, s: &AppState) -> El {
         .filter(|u| !u.is_empty())
         .unwrap_or("Configured Server");
 
+    let server_sub = match (&s.server_info, &s.current_user) {
+        (Some(info), Some(user)) => format!(
+            "{} v{} ({}) • Signed in as {}",
+            info.name, info.version, info.storage_backend, user.username
+        ),
+        (Some(info), None) => format!(
+            "{} v{} ({}) • Remote Shares & Upload Queue",
+            info.name, info.version, info.storage_backend
+        ),
+        (None, Some(user)) => format!("Self-Hosted Vault • Signed in as {}", user.username),
+        (None, None) => "Self-Hosted Vault • Remote Shares & Upload Queue".to_string(),
+    };
+
     let header = row()
         .key("uploads-connected-hdr")
         .w_full()
@@ -500,7 +528,7 @@ fn connected_view(p: &Palette, s: &AppState) -> El {
                         .color(p.text_primary),
                 )
                 .child(
-                    text("Self-Hosted Vault • Remote Shares & Upload Queue")
+                    text(server_sub)
                         .font(typography::LABEL)
                         .color(p.text_secondary),
                 ),
@@ -627,7 +655,65 @@ fn connected_view(p: &Palette, s: &AppState) -> El {
             } else {
                 p.bg_surface
             },
-        ));
+        ))
+        .children(s.current_user.as_ref().map(|u| {
+            badge(
+                "summary-user",
+                &format!("User: {}", u.username),
+                p.text_primary,
+                p.bg_surface,
+            )
+        }))
+        .children(s.server_info.as_ref().map(|info| {
+            badge(
+                "summary-version",
+                &format!("Server v{}", info.version),
+                p.text_secondary,
+                p.bg_surface,
+            )
+        }));
+
+    let quota_card = s.quota.map(|q| {
+        let ratio = if q.limit_bytes == 0 {
+            0.0
+        } else {
+            (q.used_bytes as f32 / q.limit_bytes as f32).clamp(0.0, 1.0)
+        };
+        let bar_color = if ratio >= 0.9 {
+            p.recording
+        } else if ratio >= 0.75 {
+            p.warning
+        } else {
+            p.accent_primary
+        };
+        card(p, "cloud-quota-card")
+            .w_full()
+            .gap(space::XS)
+            .child(
+                row()
+                    .key("quota-hdr")
+                    .w_full()
+                    .justify_between()
+                    .center_y()
+                    .child(
+                        text("Cloud Storage Quota")
+                            .font(typography::LABEL)
+                            .color(p.text_primary),
+                    )
+                    .child(
+                        text(format!(
+                            "{} / {} ({} clips • {} remaining)",
+                            format_bytes(q.used_bytes),
+                            format_bytes(q.limit_bytes),
+                            q.clip_count,
+                            format_bytes(q.remaining_bytes),
+                        ))
+                        .font(typography::MONO_METRIC)
+                        .color(p.text_secondary),
+                    ),
+            )
+            .child(progress_bar(p, "quota-bar", ratio, bar_color))
+    });
 
     let items = collect_shared_items(s);
 
@@ -692,6 +778,7 @@ fn connected_view(p: &Palette, s: &AppState) -> El {
         .child(header)
         .children(error_banner)
         .child(summary_bar)
+        .children(quota_card)
         .child(split)
 }
 
@@ -727,8 +814,9 @@ fn shared_clip_card(p: &Palette, s: &AppState, item: &SharedGridItem<'_>) -> El 
             Some(UploadStatus::Uploading { progress_pct }) => {
                 (format!("Uploading {progress_pct}%"), p.accent_text)
             }
-            Some(UploadStatus::Queued) => ("Queued for upload".to_string(), p.warning_text),
+            Some(UploadStatus::Queued) => ("Pending upload".to_string(), p.warning_text),
             Some(UploadStatus::Failed(_)) => ("Upload failed".to_string(), p.error_text),
+            Some(UploadStatus::Cancelled) => ("Upload cancelled".to_string(), p.text_muted),
             _ => ("Remote shared clip".to_string(), p.text_muted),
         };
         col()
@@ -787,7 +875,7 @@ fn shared_clip_card(p: &Palette, s: &AppState, item: &SharedGridItem<'_>) -> El 
                 .w_full()
                 .justify_between()
                 .center_y()
-                .child(badge("queued", "QUEUED", p.warning_text, p.warning_soft))
+                .child(badge("queued", "PENDING", p.warning_text, p.warning_soft))
                 .child(btn_ghost(
                     p,
                     &format!("card-cancel-{clip_id}"),
@@ -796,6 +884,36 @@ fn shared_clip_card(p: &Palette, s: &AppState, item: &SharedGridItem<'_>) -> El 
                         st.cancel_upload(clip_id);
                     },
                 )),
+        ),
+        Some(UploadStatus::Cancelled) => Some(
+            row()
+                .key("card-cancelled-row")
+                .w_full()
+                .justify_between()
+                .center_y()
+                .child(badge(
+                    "cancelled",
+                    "CANCELLED",
+                    p.text_secondary,
+                    p.bg_elevated,
+                ))
+                .child(
+                    row()
+                        .key("card-cancelled-actions")
+                        .gap(space::XS)
+                        .child(btn_primary(
+                            p,
+                            &format!("card-retry-{clip_id}"),
+                            "Retry",
+                            move |st| st.retry_upload(clip_id),
+                        ))
+                        .child(btn_ghost(
+                            p,
+                            &format!("card-dismiss-{clip_id}"),
+                            "Dismiss",
+                            move |st| st.cancel_upload(clip_id),
+                        )),
+                ),
         ),
         Some(UploadStatus::Failed(err)) => Some(
             col()
@@ -952,14 +1070,19 @@ fn transfer_queue_card(p: &Palette, s: &AppState) -> El {
         for (idx, entry) in s.uploads.iter().enumerate() {
             let clip_id = entry.clip_id;
             let (status_str, status_fg, status_bg) = match &entry.status {
-                UploadStatus::Queued => ("Queued".to_string(), p.warning_text, p.warning_soft),
+                UploadStatus::Queued => ("Pending".to_string(), p.warning_text, p.warning_soft),
                 UploadStatus::Uploading { progress_pct } => (
                     format!("Uploading {progress_pct}%"),
                     p.accent_text,
                     p.accent_soft,
                 ),
-                UploadStatus::Completed => ("Live".to_string(), p.success_text, p.success_soft),
+                UploadStatus::Completed => {
+                    ("Completed".to_string(), p.success_text, p.success_soft)
+                }
                 UploadStatus::Failed(_) => ("Failed".to_string(), p.error_text, p.recording_soft),
+                UploadStatus::Cancelled => {
+                    ("Cancelled".to_string(), p.text_secondary, p.bg_elevated)
+                }
             };
 
             let progress = match &entry.status {
@@ -982,7 +1105,10 @@ fn transfer_queue_card(p: &Palette, s: &AppState) -> El {
             };
 
             let mut actions = row().key("q-actions").gap(space::XS).center_y();
-            if matches!(entry.status, UploadStatus::Failed(_)) {
+            if matches!(
+                entry.status,
+                UploadStatus::Failed(_) | UploadStatus::Cancelled
+            ) {
                 actions = actions.child(btn_primary(
                     p,
                     &format!("q-retry-{clip_id}"),
@@ -991,10 +1117,18 @@ fn transfer_queue_card(p: &Palette, s: &AppState) -> El {
                 ));
             }
             if !matches!(entry.status, UploadStatus::Completed) {
+                let cancel_label = if matches!(
+                    entry.status,
+                    UploadStatus::Failed(_) | UploadStatus::Cancelled
+                ) {
+                    "Dismiss"
+                } else {
+                    "Cancel"
+                };
                 actions = actions.child(btn_secondary(
                     p,
                     &format!("q-cancel-{clip_id}"),
-                    "Cancel",
+                    cancel_label,
                     move |st| st.cancel_upload(clip_id),
                 ));
             }
@@ -1132,53 +1266,87 @@ fn inspector_sidebar(p: &Palette, s: &AppState, item: &SharedGridItem<'_>) -> El
         .map(|c| c.file_path.display().to_string())
         .unwrap_or_else(|| "Remote only (not on this device)".to_string());
 
-    let link_section = share_url.map(|url| {
+    let is_uploaded = item.remote.is_some()
+        || item
+            .upload
+            .is_some_and(|u| matches!(u.status, UploadStatus::Completed));
+
+    let link_section = if let Some(url) = share_url {
         let url_copy = url.clone();
         let url_open = url.clone();
-        col()
-            .key("insp-link-section")
-            .w_full()
-            .gap(space::XS)
-            .child(
-                text("Share Link")
-                    .font(typography::LABEL)
-                    .color(p.text_secondary),
-            )
-            .child(
-                row()
-                    .key("insp-url-box")
+        let sid_revoke = share_id.clone();
+        Some(
+            col()
+                .key("insp-link-section")
+                .w_full()
+                .gap(space::XS)
+                .child(
+                    text("Share Link")
+                        .font(typography::LABEL)
+                        .color(p.text_secondary),
+                )
+                .child(
+                    row()
+                        .key("insp-url-box")
+                        .w_full()
+                        .padding(space::SM)
+                        .radius(radius::XS)
+                        .fill(p.bg_lowest)
+                        .border(1.0, p.border_subtle)
+                        .child(
+                            text(url)
+                                .font(typography::MONO_METRIC)
+                                .color(p.text_primary)
+                                .grow(1.0)
+                                .min_w(0.0),
+                        ),
+                )
+                .child(
+                    row()
+                        .key("insp-link-actions")
+                        .w_full()
+                        .gap(space::SM)
+                        .child(
+                            btn_primary(p, "insp-copy-link", "Copy Link", move |st| {
+                                st.copy_to_clipboard(url_copy.clone());
+                            })
+                            .grow(1.0),
+                        )
+                        .child(
+                            btn_secondary(p, "insp-open-link", "Open Page", move |st| {
+                                st.open_url(url_open.clone());
+                            })
+                            .grow(1.0),
+                        ),
+                )
+                .children(sid_revoke.map(|sid| {
+                    btn_ghost(p, "insp-revoke-link", "Revoke Share Link", move |st| {
+                        st.revoke_share_link(clip_id, sid.clone());
+                    })
                     .w_full()
-                    .padding(space::SM)
-                    .radius(radius::XS)
-                    .fill(p.bg_lowest)
-                    .border(1.0, p.border_subtle)
-                    .child(
-                        text(url)
-                            .font(typography::MONO_METRIC)
-                            .color(p.text_primary)
-                            .grow(1.0)
-                            .min_w(0.0),
-                    ),
-            )
-            .child(
-                row()
-                    .key("insp-link-actions")
-                    .w_full()
-                    .gap(space::SM)
-                    .child(
-                        btn_primary(p, "insp-copy-link", "Copy Link", move |st| {
-                            st.copy_to_clipboard(url_copy.clone());
-                        })
-                        .grow(1.0),
-                    )
-                    .child(
-                        btn_secondary(p, "insp-open-link", "Open Page", move |st| {
-                            st.open_url(url_open.clone());
-                        })
-                        .grow(1.0),
-                    ),
-            )
-    });
+                })),
+        )
+    } else if is_uploaded {
+        Some(
+            col()
+                .key("insp-link-create-section")
+                .w_full()
+                .gap(space::XS)
+                .child(
+                    text("Share Link")
+                        .font(typography::LABEL)
+                        .color(p.text_secondary),
+                )
+                .child(
+                    btn_primary(p, "insp-create-link", "Create Share Link", move |st| {
+                        st.create_share_link(clip_id, is_public);
+                    })
+                    .w_full(),
+                ),
+        )
+    } else {
+        None
+    };
 
     let visibility_section = share_id.as_ref().map(|sid| {
         let sid_pub = sid.clone();

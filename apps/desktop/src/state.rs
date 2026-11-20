@@ -9,7 +9,9 @@ use clipforge_capture::{
     MonitorInfo, format_routed_audio_source, is_mic_source, parse_routed_audio_source,
     resolve_audio_routing,
 };
-use clipforge_cloud_client::{RemoteClipSummary, ShareVisibility};
+use clipforge_cloud_client::{
+    QuotaDto, RemoteClipSummary, ServerInfoDto, ShareVisibility, UserInfo,
+};
 use clipforge_common::{
     AppConfig, AudioCodec, AudioTrackInfo, CaptureEvent, CaptureStatus, CaptureTarget, ClipId,
     ClipMetadata, CloudShareInfo, ContainerFormat, EncoderMode, GameInfo, HotkeyBindings,
@@ -20,7 +22,7 @@ use clipforge_media::{
     DBFS_FLOOR, MicDiagnosticSummary, MicFeedbackKind, MicTestEvent, MicTestPhase,
 };
 
-use crate::config::load_app_config;
+use crate::config::{delete_api_token, load_api_token, load_app_config, store_api_token};
 use crate::worker::{DependencyStatus, WorkerCommand, WorkerEvent, WorkerHandle};
 
 /// Top-level navigation sections in the left sidebar.
@@ -168,6 +170,7 @@ pub enum UploadStatus {
     Uploading { progress_pct: u8 },
     Completed,
     Failed(String),
+    Cancelled,
 }
 
 /// Represents a clip upload or share entry.
@@ -339,6 +342,9 @@ pub struct AppState {
     pub server_connected: bool,
     pub server_health_ok: Option<bool>,
     pub server_error: Option<String>,
+    pub server_info: Option<ServerInfoDto>,
+    pub current_user: Option<UserInfo>,
+    pub quota: Option<QuotaDto>,
     pub remote_shares: Vec<RemoteClipSummary>,
     #[allow(dead_code)]
     pub selected_upload_id: Option<ClipId>,
@@ -361,7 +367,12 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        let config = load_app_config();
+        let mut config = load_app_config();
+        if config.api_token.is_none()
+            && let Some(url) = config.server_url.as_deref()
+        {
+            config.api_token = load_api_token(url);
+        }
         let clips = seed_initial_clips();
         let first_clip = clips.first().cloned();
         let mut favorite_ids = HashSet::new();
@@ -454,6 +465,9 @@ impl Default for AppState {
             server_connected,
             server_health_ok: None,
             server_error: None,
+            server_info: None,
+            current_user: None,
+            quota: None,
             remote_shares: Vec::new(),
             selected_upload_id: None,
             server_url_edit,
@@ -1424,8 +1438,31 @@ impl AppState {
         let Some(clip) = self.clips.iter().find(|c| c.id == id).cloned() else {
             return;
         };
-        if self.uploads.iter().any(|u| u.clip_id == id) {
-            self.nav = NavSection::Uploads;
+        if let Some(existing) = self.uploads.iter().find(|u| u.clip_id == id) {
+            match &existing.status {
+                UploadStatus::Queued | UploadStatus::Uploading { .. } => {
+                    self.status_banner =
+                        Some(format!("Upload already in progress for \"{}\"", clip.title));
+                    self.nav = NavSection::Uploads;
+                    return;
+                }
+                UploadStatus::Completed => {
+                    self.status_banner = Some(format!("\"{}\" is already uploaded", clip.title));
+                    self.selected_upload_id = Some(id);
+                    self.nav = NavSection::Uploads;
+                    return;
+                }
+                UploadStatus::Failed(_) | UploadStatus::Cancelled => {
+                    self.retry_upload(id);
+                    self.nav = NavSection::Uploads;
+                    return;
+                }
+            }
+        }
+        if is_sample_clip(&clip) || !clip.file_path.is_file() {
+            self.status_banner = Some(
+                "Sample clip cannot be uploaded — record or scan a real clip first".to_string(),
+            );
             return;
         }
         self.uploads.insert(
@@ -1444,12 +1481,6 @@ impl AppState {
             },
         );
         if let Some(worker) = &self.worker {
-            if is_sample_clip(&clip) || !clip.file_path.is_file() {
-                self.status_banner = Some(
-                    "Sample clip cannot be uploaded — record or scan a real clip first".to_string(),
-                );
-                return;
-            }
             worker.send(WorkerCommand::UploadClip {
                 clip: Box::new(clip),
                 visibility: ShareVisibility::Public,
@@ -1671,13 +1702,41 @@ impl AppState {
                         self.editor.timeline_thumbs = thumbs;
                     }
                 }
+                WorkerEvent::UploadProgress {
+                    clip_id,
+                    progress_pct,
+                } => {
+                    if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
+                        && !matches!(
+                            entry.status,
+                            UploadStatus::Cancelled | UploadStatus::Completed
+                        )
+                    {
+                        entry.status = UploadStatus::Uploading { progress_pct };
+                    }
+                }
+                WorkerEvent::UploadCancelled { clip_id } => {
+                    if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
+                        && !matches!(entry.status, UploadStatus::Completed)
+                    {
+                        entry.status = UploadStatus::Cancelled;
+                        self.status_banner = Some("Upload cancelled (local clip kept)".to_string());
+                    }
+                }
                 WorkerEvent::UploadCompleted { clip_id, result } => {
                     if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {
                         match result {
                             Ok(summary) => {
                                 entry.status = UploadStatus::Completed;
                                 entry.is_public = summary.visibility == ShareVisibility::Public;
-                                entry.share = Some(summary.into());
+                                entry.share = Some(summary.clone().into());
+                                if !self
+                                    .remote_shares
+                                    .iter()
+                                    .any(|r| r.clip_id == summary.clip_id)
+                                {
+                                    self.remote_shares.insert(0, summary);
+                                }
                                 self.status_banner = Some("Clip uploaded successfully".to_string());
                             }
                             Err(err) => {
@@ -1693,6 +1752,61 @@ impl AppState {
                             Some(format!("Visibility update failed for {share_id}: {err}"));
                     }
                 }
+                WorkerEvent::ShareCreated { clip_id, result } => match result {
+                    Ok(resp) => {
+                        let info = CloudShareInfo {
+                            share_id: resp.share_id.clone(),
+                            url: resp.url.clone(),
+                            uploaded_at: resp.created_at,
+                            expires_at: resp.expires_at,
+                        };
+                        if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
+                        {
+                            entry.share = Some(info.clone());
+                            entry.is_public = resp.visibility == ShareVisibility::Public;
+                        }
+                        if let Some(remote) =
+                            self.remote_shares.iter_mut().find(|r| r.clip_id == clip_id)
+                        {
+                            remote.share_id = resp.share_id;
+                            remote.url = resp.url;
+                            remote.visibility = resp.visibility;
+                            remote.expires_at = resp.expires_at;
+                        }
+                        self.status_banner = Some("Share link created".to_string());
+                    }
+                    Err(err) => {
+                        self.server_error = Some(err.clone());
+                        self.status_banner = Some(format!("Create share failed: {err}"));
+                    }
+                },
+                WorkerEvent::ShareRevoked {
+                    clip_id,
+                    share_id,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
+                        {
+                            entry.share = None;
+                            entry.is_public = false;
+                        }
+                        if let Some(remote) = self
+                            .remote_shares
+                            .iter_mut()
+                            .find(|r| r.clip_id == clip_id || r.share_id == share_id)
+                        {
+                            remote.share_id.clear();
+                            remote.url.clear();
+                            remote.visibility = ShareVisibility::Private;
+                        }
+                        self.status_banner = Some("Share link revoked".to_string());
+                    }
+                    Err(err) => {
+                        self.server_error = Some(err.clone());
+                        self.status_banner = Some(format!("Revoke share failed: {err}"));
+                    }
+                },
                 WorkerEvent::CaptureSourcesDiscovered {
                     monitors,
                     audio_devices,
@@ -1702,9 +1816,31 @@ impl AppState {
                     self.available_audio_devices = audio_devices;
                     self.available_app_audio = app_audio;
                 }
-                WorkerEvent::ServerHealthChecked { ok, error } => {
+                WorkerEvent::ServerHealthChecked {
+                    ok,
+                    error,
+                    server_info,
+                } => {
                     self.server_health_ok = Some(ok);
                     self.server_error = error;
+                    if let Some(info) = server_info {
+                        self.server_info = Some(info);
+                    }
+                }
+                WorkerEvent::ServerMetadataLoaded {
+                    server_info,
+                    current_user,
+                    quota,
+                } => {
+                    if let Some(info) = server_info {
+                        self.server_info = Some(info);
+                    }
+                    if let Some(user) = current_user {
+                        self.current_user = Some(user);
+                    }
+                    if let Some(q) = quota {
+                        self.quota = Some(q);
+                    }
                 }
                 WorkerEvent::ServerConnected(res) => match res {
                     Ok((url, token)) => {
@@ -1959,8 +2095,14 @@ impl AppState {
         };
         let tok_text = self.api_token_edit.text.trim();
         self.config.api_token = if tok_text.is_empty() {
+            if let Some(url) = self.config.server_url.as_deref() {
+                let _ = delete_api_token(url);
+            }
             None
         } else {
+            if let Some(url) = self.config.server_url.as_deref() {
+                let _ = store_api_token(url, tok_text);
+            }
             Some(tok_text.to_string())
         };
         self.config.hotkeys = HotkeyBindings {
@@ -1973,6 +2115,9 @@ impl AppState {
 
     /// Resets `AppConfig` to defaults (preserving worker) and updates editable fields.
     pub fn reset_settings(&mut self) {
+        if let Some(url) = self.config.server_url.as_deref() {
+            let _ = delete_api_token(url);
+        }
         self.config = AppConfig::default();
         self.hotkeys = HotkeyConfig::default();
         self.clips_dir_edit = rune::TextEdit::new(self.config.clips_dir.display().to_string());
@@ -1981,6 +2126,9 @@ impl AppState {
         self.server_connected = false;
         self.server_health_ok = None;
         self.server_error = None;
+        self.server_info = None;
+        self.current_user = None;
+        self.quota = None;
         self.save_config();
     }
 
@@ -2042,9 +2190,15 @@ impl AppState {
 
     /// Disconnects from the cloud server and clears cached remote state.
     pub fn disconnect_server(&mut self) {
+        if let Some(url) = self.config.server_url.as_deref() {
+            let _ = delete_api_token(url);
+        }
         self.server_connected = false;
         self.server_health_ok = None;
         self.server_error = None;
+        self.server_info = None;
+        self.current_user = None;
+        self.quota = None;
         self.remote_shares.clear();
         self.confirm_remote_delete = None;
         self.config.api_token = None;
@@ -2125,11 +2279,66 @@ impl AppState {
         }
     }
 
-    /// Cancels/removes a queued or failed upload entry from the local queue.
+    /// Cancels an active or queued upload entry (or removes a cancelled/failed entry) without
+    /// deleting the local clip on disk.
     pub fn cancel_upload(&mut self, clip_id: ClipId) {
-        self.uploads.retain(|u| u.clip_id != clip_id);
-        if self.selected_upload_id == Some(clip_id) {
-            self.selected_upload_id = None;
+        let should_dismiss = self
+            .uploads
+            .iter()
+            .find(|u| u.clip_id == clip_id)
+            .is_some_and(|u| matches!(u.status, UploadStatus::Cancelled | UploadStatus::Failed(_)));
+
+        if should_dismiss {
+            self.uploads.retain(|u| u.clip_id != clip_id);
+            if self.selected_upload_id == Some(clip_id) {
+                self.selected_upload_id = None;
+            }
+            return;
+        }
+
+        if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {
+            entry.status = UploadStatus::Cancelled;
+        }
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::CancelUpload(clip_id));
+        }
+    }
+
+    /// Creates a share link for an uploaded remote clip.
+    pub fn create_share_link(&mut self, clip_id: ClipId, is_public: bool) {
+        let Some(url) = self.config.server_url.clone().filter(|u| !u.is_empty()) else {
+            self.server_error = Some("No server URL configured".to_string());
+            return;
+        };
+        let visibility = if is_public {
+            ShareVisibility::Public
+        } else {
+            ShareVisibility::Private
+        };
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::CreateShare {
+                clip_id,
+                visibility,
+                expires_in_hours: None,
+                server_url: url,
+                api_token: self.config.api_token.clone(),
+            });
+        }
+    }
+
+    /// Revokes an existing share link without deleting the remote or local clip.
+    pub fn revoke_share_link(&mut self, clip_id: ClipId, share_id: String) {
+        let Some(url) = self.config.server_url.clone().filter(|u| !u.is_empty()) else {
+            self.server_error = Some("No server URL configured".to_string());
+            return;
+        };
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::RevokeShare {
+                clip_id,
+                share_id,
+                server_url: url,
+                api_token: self.config.api_token.clone(),
+            });
         }
     }
 

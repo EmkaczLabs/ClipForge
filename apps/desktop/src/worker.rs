@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +12,10 @@ use clipforge_capture::{
     HotkeyManager, HotkeySpec, MonitorInfo, detect_gsr, list_application_audio, list_audio_devices,
     list_monitors, parse_hotkey,
 };
-use clipforge_cloud_client::{HttpCloudClient, RemoteClipSummary, ShareVisibility};
+use clipforge_cloud_client::{
+    CreateShareRequest, CreateShareResponse, HttpCloudClient, QuotaDto, RemoteClipSummary,
+    ServerInfoDto, ShareVisibility, UserInfo,
+};
 use clipforge_common::{
     AppConfig, CaptureConfig, CaptureEvent, CaptureStatus, ClipFilter, ClipId, ClipMetadata,
     ClipStore, CloudClient, HotkeyBindings, MediaProcessor, TrimRequest,
@@ -80,10 +84,24 @@ pub enum WorkerCommand {
         server_url: Option<String>,
         api_token: Option<String>,
     },
+    CancelUpload(ClipId),
     SetShareVisibility {
         share_id: String,
         visibility: ShareVisibility,
         server_url: Option<String>,
+        api_token: Option<String>,
+    },
+    CreateShare {
+        clip_id: ClipId,
+        visibility: ShareVisibility,
+        expires_in_hours: Option<u64>,
+        server_url: String,
+        api_token: Option<String>,
+    },
+    RevokeShare {
+        clip_id: ClipId,
+        share_id: String,
+        server_url: String,
         api_token: Option<String>,
     },
     SaveConfig(AppConfig),
@@ -156,13 +174,29 @@ pub enum WorkerEvent {
     HotkeyStatusChanged(GlobalHotkeyStatus),
     TrimProgress(f32),
     TrimCompleted(std::result::Result<PathBuf, String>),
+    UploadProgress {
+        clip_id: ClipId,
+        progress_pct: u8,
+    },
     UploadCompleted {
         clip_id: ClipId,
         result: std::result::Result<RemoteClipSummary, String>,
     },
+    UploadCancelled {
+        clip_id: ClipId,
+    },
     VisibilityUpdated {
         share_id: String,
         result: std::result::Result<RemoteClipSummary, String>,
+    },
+    ShareCreated {
+        clip_id: ClipId,
+        result: std::result::Result<CreateShareResponse, String>,
+    },
+    ShareRevoked {
+        clip_id: ClipId,
+        share_id: String,
+        result: std::result::Result<(), String>,
     },
     ConfigSaved(std::result::Result<PathBuf, String>),
     Banner(String),
@@ -201,8 +235,14 @@ pub enum WorkerEvent {
     ServerHealthChecked {
         ok: bool,
         error: Option<String>,
+        server_info: Option<ServerInfoDto>,
     },
     ServerConnected(std::result::Result<(String, Option<String>), String>),
+    ServerMetadataLoaded {
+        server_info: Option<ServerInfoDto>,
+        current_user: Option<UserInfo>,
+        quota: Option<QuotaDto>,
+    },
     RemoteSharesLoaded(std::result::Result<Vec<RemoteClipSummary>, String>),
     RemoteShareDeleted {
         share_id: String,
@@ -224,6 +264,7 @@ struct WorkerServices {
     player: VideoPlayerHandle,
     active_player_clip: Arc<Mutex<Option<(ClipId, rune::Pixels)>>>,
     active_trim_cancel: Arc<Mutex<Option<ExportCancelToken>>>,
+    active_uploads: Arc<Mutex<HashMap<ClipId, Arc<AtomicBool>>>>,
     config: Arc<Mutex<AppConfig>>,
     hotkey_manager: Arc<Mutex<Option<HotkeyManager>>>,
     hotkey_tx: UnboundedSender<HotkeyAction>,
@@ -270,6 +311,7 @@ impl WorkerHandle {
                         player,
                         active_player_clip: active_player_clip.clone(),
                         active_trim_cancel: Arc::new(Mutex::new(None)),
+                        active_uploads: Arc::new(Mutex::new(HashMap::new())),
                         config: Arc::new(Mutex::new(AppConfig::default())),
                         hotkey_manager: Arc::new(Mutex::new(None)),
                         hotkey_tx,
@@ -678,15 +720,76 @@ async fn handle_command(
                 (waker)();
                 return;
             };
-            let client = HttpCloudClient::new(url, api_token);
-            let res = client
-                .upload_clip_with_visibility(&clip, &clip.file_path, visibility)
-                .await
-                .map_err(|e| e.to_string());
-            let _ = evt_tx.send(WorkerEvent::UploadCompleted {
-                clip_id,
-                result: res,
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            if let Ok(mut guard) = svc.active_uploads.lock() {
+                if let Some(prev) = guard.get(&clip_id) {
+                    prev.store(true, Ordering::SeqCst);
+                }
+                guard.insert(clip_id, cancel_flag.clone());
+            }
+            let active_uploads = svc.active_uploads.clone();
+            let evt_tx_up = evt_tx.clone();
+            let waker_up = waker.clone();
+            tokio::spawn(async move {
+                let client = HttpCloudClient::new(url, api_token);
+                let _ = evt_tx_up.send(WorkerEvent::UploadProgress {
+                    clip_id,
+                    progress_pct: 1,
+                });
+                (waker_up)();
+                let mut last_pct = 1u8;
+                let res = client
+                    .upload_clip_streaming(&clip, &clip.file_path, visibility, |pct| {
+                        if pct != last_pct {
+                            last_pct = pct;
+                            let _ = evt_tx_up.send(WorkerEvent::UploadProgress {
+                                clip_id,
+                                progress_pct: pct,
+                            });
+                            (waker_up)();
+                        }
+                    })
+                    .await
+                    .map_err(|e| e.to_string());
+
+                if let Ok(mut guard) = active_uploads.lock() {
+                    guard.remove(&clip_id);
+                }
+
+                if cancel_flag.load(Ordering::SeqCst) {
+                    if let Ok(summary) = &res {
+                        let _ = client.delete_clip(&summary.clip_id.to_string()).await;
+                    }
+                    let _ = evt_tx_up.send(WorkerEvent::UploadCancelled { clip_id });
+                    (waker_up)();
+                    return;
+                }
+
+                if res.is_ok() {
+                    let quota = client.quota().await.ok();
+                    let current_user = client.current_user().await.ok();
+                    let server_info = client.server_info().await.ok();
+                    let _ = evt_tx_up.send(WorkerEvent::ServerMetadataLoaded {
+                        server_info,
+                        current_user,
+                        quota,
+                    });
+                }
+
+                let _ = evt_tx_up.send(WorkerEvent::UploadCompleted {
+                    clip_id,
+                    result: res,
+                });
+                (waker_up)();
             });
+        }
+        WorkerCommand::CancelUpload(clip_id) => {
+            if let Ok(mut guard) = svc.active_uploads.lock()
+                && let Some(flag) = guard.remove(&clip_id)
+            {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let _ = evt_tx.send(WorkerEvent::UploadCancelled { clip_id });
             (waker)();
         }
         WorkerCommand::SetShareVisibility {
@@ -709,6 +812,46 @@ async fn handle_command(
                 .await
                 .map_err(|e| e.to_string());
             let _ = evt_tx.send(WorkerEvent::VisibilityUpdated {
+                share_id,
+                result: res,
+            });
+            (waker)();
+        }
+        WorkerCommand::CreateShare {
+            clip_id,
+            visibility,
+            expires_in_hours,
+            server_url,
+            api_token,
+        } => {
+            let client = HttpCloudClient::new(server_url, api_token);
+            let req = CreateShareRequest {
+                visibility,
+                expires_in_hours,
+            };
+            let res = client
+                .create_share(&clip_id.to_string(), &req)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = evt_tx.send(WorkerEvent::ShareCreated {
+                clip_id,
+                result: res,
+            });
+            (waker)();
+        }
+        WorkerCommand::RevokeShare {
+            clip_id,
+            share_id,
+            server_url,
+            api_token,
+        } => {
+            let client = HttpCloudClient::new(server_url, api_token);
+            let res = client
+                .revoke_share(&share_id)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = evt_tx.send(WorkerEvent::ShareRevoked {
+                clip_id,
                 share_id,
                 result: res,
             });
@@ -860,9 +1003,15 @@ async fn handle_command(
         WorkerCommand::CheckServerHealth { server_url } => {
             let client = HttpCloudClient::new(server_url, None);
             let res = client.health_check().await;
+            let server_info = if res.is_ok() {
+                client.server_info().await.ok()
+            } else {
+                None
+            };
             let _ = evt_tx.send(WorkerEvent::ServerHealthChecked {
                 ok: res.is_ok(),
                 error: res.err().map(|e| e.to_string()),
+                server_info,
             });
             (waker)();
         }
@@ -878,24 +1027,56 @@ async fn handle_command(
                 if clean_url.is_empty() {
                     return Err("Server URL cannot be empty".to_string());
                 }
-                let client = HttpCloudClient::new(&clean_url, api_token.clone());
+                let mut client = HttpCloudClient::new(&clean_url, api_token.clone());
                 client.health_check().await.map_err(|e| e.to_string())?;
-                if let (Some(u), Some(p)) = (username, password) {
+                let server_info = client.server_info().await.ok();
+                let final_token = if let (Some(u), Some(p)) = (username, password) {
                     let auth = if register {
                         client.register(&u, &p).await.map_err(|e| e.to_string())?
                     } else {
                         client.login(&u, &p).await.map_err(|e| e.to_string())?
                     };
-                    Ok((clean_url, Some(auth.token)))
-                } else {
-                    if api_token.is_some() {
+                    client.set_token(Some(auth.token.clone()));
+                    Some(auth.token)
+                } else if api_token.is_some() {
+                    if client.current_user().await.is_err() {
                         client
                             .list_clips(Some(1), Some(0))
                             .await
                             .map_err(|e| e.to_string())?;
                     }
-                    Ok((clean_url, api_token))
+                    api_token
+                } else {
+                    None
+                };
+
+                if let Some(tok) = final_token.as_deref()
+                    && let Err(err) = crate::config::store_api_token(&clean_url, tok)
+                {
+                    tracing::warn!(%err, "Failed to persist API token to secure storage");
                 }
+
+                let current_user = if final_token.is_some() {
+                    client.current_user().await.ok()
+                } else {
+                    None
+                };
+                let quota = if final_token.is_some() {
+                    current_user
+                        .as_ref()
+                        .and_then(|u| u.quota)
+                        .or(client.quota().await.ok())
+                } else {
+                    None
+                };
+
+                let _ = evt_tx.send(WorkerEvent::ServerMetadataLoaded {
+                    server_info,
+                    current_user,
+                    quota,
+                });
+
+                Ok((clean_url, final_token))
             }
             .await;
             let _ = evt_tx.send(WorkerEvent::ServerConnected(result));
@@ -916,6 +1097,19 @@ async fn handle_command(
                 .list_clips(Some(50), Some(0))
                 .await
                 .map_err(|e| e.to_string());
+            if res.is_ok() {
+                let server_info = client.server_info().await.ok();
+                let current_user = client.current_user().await.ok();
+                let quota = current_user
+                    .as_ref()
+                    .and_then(|u| u.quota)
+                    .or(client.quota().await.ok());
+                let _ = evt_tx.send(WorkerEvent::ServerMetadataLoaded {
+                    server_info,
+                    current_user,
+                    quota,
+                });
+            }
             let _ = evt_tx.send(WorkerEvent::RemoteSharesLoaded(res));
             (waker)();
         }
@@ -925,10 +1119,23 @@ async fn handle_command(
             api_token,
         } => {
             let client = HttpCloudClient::new(server_url, api_token);
-            let res = client
-                .delete_share(&share_id)
-                .await
-                .map_err(|e| e.to_string());
+            let res = match client.delete_clip(&share_id).await {
+                Ok(()) => Ok(()),
+                Err(_) => client
+                    .delete_share(&share_id)
+                    .await
+                    .map_err(|e| e.to_string()),
+            };
+            if res.is_ok() {
+                let quota = client.quota().await.ok();
+                let current_user = client.current_user().await.ok();
+                let server_info = client.server_info().await.ok();
+                let _ = evt_tx.send(WorkerEvent::ServerMetadataLoaded {
+                    server_info,
+                    current_user,
+                    quota,
+                });
+            }
             let _ = evt_tx.send(WorkerEvent::RemoteShareDeleted {
                 share_id,
                 result: res,
