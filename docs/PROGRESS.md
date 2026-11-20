@@ -1,47 +1,47 @@
 # ClipForge Progress Checkpoint
 
-**Checkpoint Timestamp:** 2026-11-20T19:55:00+01:00  
-**Latest Verified Commit:** `ea43ff0` (`main`)  
+**Checkpoint Timestamp:** 2026-11-20T20:14:00+01:00  
+**Latest Verified Commit:** `40311c8` (`main`)  
 **Host Environment:** CachyOS (KDE Plasma / Wayland), NVIDIA RTX 3070, `gpu-screen-recorder 6.1.7`, `rustc 1.100.0`, `cargo 1.100.0`, `ffmpeg n9.0.2`.
 
 ## Milestone Status Summary
 
 | Milestone | Status | Notes |
 |---|---|---|
-| M1 — Foundation (Workspace & Rune UI) | Verified & passing | `clipforge-desktop` links and runs on CachyOS Wayland. Startup timing: `setup_worker` `0.062 ms`, `WorkerCommand::Initialize` `13.99 ms`, headless `--snap` `gpu init 341.8 ms` / `first frame 225.31 ms` (`/tmp/clipforge-m1.png`, 194,513 bytes), windowed Wayland first `wl_surface.attach` ~2.0s. `scan_and_load_library` emits cached SQLite clips immediately before probing new files. |
-| M2 — Recording (`crates/capture`) | Verified with live GSR 6.1.7 | Fixed GSR 6.1.7 CLI args (`-bm auto`, `very_high`), deduplicated `ReplaySaved` via `has_save_hook` (`CLIPFORGE_SAVED:`), captured stderr errors into `CaptureStatus::Error`, and added `Restart Replay Buffer` / `Clear Error` UI recovery. Live `live_gsr_replay_save_repeated_and_stop` test passed (2 distinct MP4s via `SIGUSR1`, clean `SIGINT` stop). Remaining gaps: `FocusedWindow` (`-w focused`) and global hotkeys are X11-only; `Av1` (on RTX 3070) / `Flac` emit GSR fallback warnings. |
-| M3 — Library & Management (`crates/library`, `crates/media`, `apps/desktop`) | Verified & passing | SQLite v3 adds `trashed_at`, `original_path`, `idx_clips_trashed_at`, `.clipforge_trash`, `move_to_trash`, `restore_from_trash`, `permanently_delete`, `rename_clip`, and `trashed_only`/`exclude_trashed` filtering with strict managed-root boundary validation and `Sample`/`Imported` disk protection. `views/library.rs` provides click/double-click selection, Ctrl/Shift multi-selection + bulk actions, inline confirmation (`lib-confirm-bar`), inline rename (`rune::text_input`), Open Containing Folder (`xdg-open`), search/filter/sort, and floating Rune context menu (`on_secondary_press` + `...`). |
-| M4 — Editing & Embedded Playback (`crates/media`, `apps/desktop`) | Implemented & tested (headless) | `crates/media/src/player.rs` (`VideoPlayerHandle`) decodes H.264/video off-UI-thread via `ffmpeg -f rawvideo -pix_fmt rgba pipe:1` (`kill_on_drop(true)`), delivering `DecodedFrame` RGBA8 buffers into `rune::Pixels::set` (`El::pixels_fit(..., SurfaceFit::Fit)`). `views/editor.rs` renders the embedded viewport, timeline thumbnails, clickable/draggable playhead and trim-in/out handles, `MM:SS.cc` timecode, trim-range playback, `Open in Player`, and `exporting` / `export_error` UI. Live interactive windowed Wayland pointer-drag UX and multi-frame window playback remain to be manually verified. |
+| M1 — Foundation (Workspace & Rune UI) | Verified & passing | `clipforge-desktop` links and runs on CachyOS Wayland. Headless `--snap`: `gpu init 323.2 ms` / `first frame 220.00 ms` (`/tmp/clipforge-m1.png`, 163,587 bytes); windowed Wayland first `wl_surface.attach` ~2.0s. |
+| M2 — Recording (`crates/capture`) | Verified with live GSR 6.1.7 | Fixed GSR 6.1.7 CLI args (`-bm auto`, `very_high`), deduplicated `ReplaySaved` (`CLIPFORGE_SAVED:`), stderr capture into `CaptureStatus::Error`, and `Restart Replay Buffer` / `Clear Error` UI. Live `live_gsr_replay_save_repeated_and_stop` passed (`a1529cf`). Remaining gaps: `FocusedWindow` and global hotkeys are X11-only; `Av1` (on RTX 3070) / `Flac` emit GSR fallback warnings. |
+| M3 — Library & Management (`crates/library`, `crates/media`, `apps/desktop`) | Verified & passing | SQLite v3 trash/restore (`trashed_at`, `original_path`, `.clipforge_trash`), managed-root boundary validation, `Sample`/`Imported` disk protection, `rename_clip`, `play_in_editor` vs `open_in_editor`, Ctrl/Shift multi-select + bulk actions, inline confirmation/rename, sort/filter, floating context menu, and automatic `ClipOrigin::Trimmed` indexing on export. |
+| M4 — Native Video Player & Editor (`crates/media`, `apps/desktop`) | Implemented & tested (headless) | `crates/media` (`8abb686`) decodes video via `ffmpeg` rawvideo RGBA8 pipe (benchmarked 609.8 fps `1080p60 -> 1024x576`, 286.0 fps native `1920x1080`) with bounded `mpsc` queue, `cpal 0.15` (`pipewire-alsa`) audio output, `samples_played` master clock A/V sync, monotonic wall-clock fallback, `set_audio_track(Option<usize>)`, and `ExportCancelToken` + `trim_with_progress`. `apps/desktop` (`5e3f3eb`, `40311c8`) adds `play_in_editor`, mute/volume slider, timeline zoom (`1x..8x`) + `scroll_x`, keyboard shortcuts (`Space`, `Left`/`Right`), and export progress bar + `Cancel Export`. Manual windowed Wayland auditioning/drag UX remains to be verified interactively. |
 | M5 — Self-Hosted Sharing (`apps/server`, `crates/cloud-client`, `apps/web`) | Implemented & tested | 10 tests pass (auth, API keys, streaming multipart upload, HTTP `Range` seeking, public/private shares, `413` limit). End-to-end desktop-to-server live test pending. |
 | M6 — Public Release (`packaging/`) | Scaffolding added | `Dockerfile`, `docker-compose.yml`, `PKGBUILD`, `deb/` templates created. Not yet built/validated end-to-end. |
 
-## Clip Library Management (`6bd4908`, `ea43ff0`)
+## Native Video Player & Editor Architecture (`8abb686`, `5e3f3eb`, `40311c8`)
 
-1. **SQLite v3 & Safe Filesystem Operations (`crates/library`, `6bd4908`):**
-   - Migration v3 adds `trashed_at TEXT`, `original_path TEXT`, and `idx_clips_trashed_at` on `clips`; `TRASH_DIR_NAME = ".clipforge_trash"` (skipped by `DirectoryScanner`).
-   - `move_to_trash(id, managed_roots)`: refuses `ClipOrigin::Sample` and `ClipOrigin::Imported`, canonicalizes paths (and nearest existing ancestor for missing files) to enforce strict containment within `managed_roots`, moves to `<managed_root>/.clipforge_trash/<id>-<filename>` with cross-device fallback, and handles missing disk files gracefully (`file_moved: false`).
-   - `restore_from_trash(id)`: moves file back to `original_path` (or unique `stem (restored N).ext` on collision), clears `trashed_at`/`original_path`, and returns `NotFound` if the trash file is missing.
-   - `permanently_delete(id, managed_roots)`: deletes only the SQLite row for `Sample`/`Imported` (never touches disk files); validates `managed_roots` and removes disk file (graceful on `NotFound`) + DB row for `Recorded`/`Trimmed`.
-   - `rename_clip(id, new_title)` trims and rejects empty titles; `ClipListOptions` supports `trashed_only` and `exclude_trashed` (default `true`).
-2. **Desktop Library Management UI (`apps/desktop`, `ea43ff0`):**
-   - Inline confirmation bar (`lib-confirm-bar`) for Move to Trash, Restore from Trash, and Permanent Delete; closes `VideoPlayerHandle` if the active clip is trashed/deleted.
-   - Multi-selection via Ctrl-click and Shift-click (`on_press_tx` / `tx.mods()`) plus selection checkboxes (`select-check-{id}`), Select All / Clear, Bulk Favorite, Bulk Move to Trash, Bulk Restore, and Bulk Permanent Delete.
-   - Inline rename via `rune::text_input` + `TextEdit`, Open Containing Folder (`xdg-open` after `parent.is_dir()` check), search, filters (`All`, `Recorded`, `Trimmed`, `Favorites`, `Shared`, `Trash`), sorting (`Newest`, `Oldest`, `Longest`, `Largest`, `Title`), and floating Rune context menu (`on_secondary_press` + `...`).
+1. **Decoder, Audio & A/V Sync (`crates/media/src/{player,audio,processor}.rs`, `8abb686`):**
+   - **Throughput & Bounded Buffering:** `ffmpeg` rawvideo RGBA8 pipe benchmarked on this host at **609.8 fps** (`1080p60 -> 1024x576`) and **286.0 fps** (native `1920x1080`). `VideoPlayerHandle::spawn()` uses a bounded `mpsc::Receiver<PlayerEvent>` (capacity 16, reserving 4 slots for control events and dropping `Frame` events under backpressure) plus A/V drift frame-dropping when video lags `>2` frames behind the master clock.
+   - **Audio Output (`cpal 0.15` via `pipewire-alsa`):** `ffmpeg` `f32le` decode pipe into a bounded 1s PCM ring buffer (`MAX_BUFFER_SECONDS = 1`) with sample-accurate `samples_played` master clock, `set_volume(f32)` / `set_muted(bool)` / `set_audio_track(Option<usize>)`, `PlayerEvent::AudioStatus { has_audio, error }`, and monotonic wall-clock fallback for no-audio clips or headless/device failure.
+   - **Export Progress & Cancellation:** `ExportCancelToken` + `FfmpegMediaProcessor::trim_with_progress` parses `-progress pipe:1` (`out_time_us`/`out_time_ms`), kills the child process and cleans temp files on cancel, and validates output via non-empty check + `ffprobe`.
+2. **Desktop State, Worker & Editor UI (`apps/desktop`, `5e3f3eb`, `40311c8`):**
+   - `state.rs` / `worker.rs` / `views/library.rs` / `main.rs` (`5e3f3eb`): Added `play_in_editor(id)` (opens Editor and auto-plays) alongside `open_in_editor(id)`, `set_volume`, `toggle_mute`, `set_timeline_zoom`, `seek_relative_ms`, `cancel_export`, `AppSpec::on_key` (`Space`, `Left`/`Right`), safe player stop on trash/delete, and automatic SQLite indexing of exported clips as `ClipOrigin::Trimmed`.
+   - `views/editor.rs` (`40311c8`): Added `audio-controls` (`mute-toggle` + `El::on_drag` `volume-slider` + `Audio Off`/`No Audio` badges), `timeline-zoom-controls` (`-`, `1x`, `+` scaling `track_w = 640.0 * zoom` in `1.0..=8.0` inside `El::scroll_x()`), `El::focusable(true)` + `El::on_key` shortcuts, and `export-progress-box` + `Cancel Export` button.
 
-## Latest Verified Test Results (`ea43ff0`)
+## Latest Verified Test Results (`40311c8`)
 
 - `cargo fmt --all -- --check`: **PASS**
 - `cargo clippy --workspace --all-targets -- -D warnings`: **PASS** (0 crate warnings; 3 pre-existing workspace manifest warnings in `Cargo.toml`)
-- `cargo test --workspace --exclude clipforge-desktop`: **PASS** (51 passed, 0 failed, 1 ignored):
+- `cargo test --workspace`: **PASS** (71 passed, 0 failed, 1 ignored):
   - `clipforge-capture`: 20 passed, 1 ignored (`live_gsr_replay_save_repeated_and_stop`, previously verified **PASS** with `-- --ignored` at `a1529cf`)
   - `clipforge-cloud-client`: 2 passed
   - `clipforge-common`: 3 passed
+  - `clipforge-desktop`: 15 passed
   - `clipforge-library`: 7 passed (integration)
-  - `clipforge-media`: 13 passed (7 unit + 6 integration)
+  - `clipforge-media`: 16 passed (7 unit + 9 integration, including real-MP4 A/V sync, no-audio fallback, volume/mute, clip switching, and export progress/cancel)
   - `clipforge-server`: 8 passed (5 unit + 3 integration)
-- `cargo test -p clipforge-desktop`: **PASS** (14 passed, 0 failed)
-- `cargo run -p clipforge-desktop -- --snap /tmp/clipforge-m1.png`: **PASS** (`gpu init 341.8 ms, first frame 225.31 ms`; `/tmp/clipforge-m1.png` 194,513 bytes)
+- `cargo run -p clipforge-desktop -- --snap /tmp/clipforge-m1.png`: **PASS** (`gpu init 323.2 ms, first frame 220.00 ms`; `/tmp/clipforge-m1.png` 163,587 bytes)
 
-### Unverified in Headless QA
-- Interactive windowed Wayland pointer-drag timeline/trim-handle UX, context menu/multi-select mouse interaction, and live multi-frame playback in a Wayland window (`cargo run -p clipforge-desktop`).
-- `live_gsr_replay_save_repeated_and_stop` remains `#[ignore]`d in default `cargo test`.
+### Manual GUI Acceptance Steps Remaining
+- Launch `cargo run -p clipforge-desktop` in the KDE Wayland session and verify:
+  1. PipeWire/ALSA audio playback auditioning, mute toggle, and `volume-slider` drag.
+  2. Live pointer-drag timeline scrubbing, trim-in/trim-out handle dragging, and `1x..8x` timeline zoom scrolling.
+  3. Library click/double-click/`Play`, context menu, multi-select, trash/restore/delete, and live FFmpeg export progress/cancellation.
+  4. Optional live GSR capture test: `cargo test -p clipforge-capture -- --ignored live_gsr_replay_save_repeated_and_stop`.

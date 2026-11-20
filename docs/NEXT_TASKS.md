@@ -1,9 +1,9 @@
 # ClipForge Next Tasks
 
-Ordered tasks remaining after verified commit `ea43ff0` on CachyOS (KDE Plasma / Wayland):
+Ordered tasks remaining after verified commit `40311c8` on CachyOS (KDE Plasma / Wayland):
 
 1. **Manual Interactive Windowed Verification (Wayland):**
-   - Run `cargo run -p clipforge-desktop` interactively on KDE Wayland and verify live multi-frame embedded video playback, pointer-drag timeline scrubbing, draggable trim-in/trim-out handles, and Library multi-select/trash/restore/rename/context-menu UX.
+   - Run `cargo run -p clipforge-desktop` interactively on KDE Wayland and verify PipeWire/ALSA audio auditioning, mute/volume slider drag, live multi-frame playback + A/V sync, pointer-drag timeline/trim handles, `1x..8x` zoom scroll, keyboard shortcuts (`Space`, `Left`/`Right`), export progress/cancel, and Library management UX.
 2. **Migrate `apps/desktop` Sample Tracking to `ClipOrigin::Sample`:**
    - Switch `apps/desktop` (`state.rs`, `worker.rs`) from the `"sample"` tag convention to `crates/library`'s v2 `ClipOrigin::Sample` / `list_clips_filtered` APIs.
 3. **Wayland `FocusedWindow` Guard & Codec UX:**
@@ -14,4 +14,4 @@ Ordered tasks remaining after verified commit `ea43ff0` on CachyOS (KDE Plasma /
 5. **End-to-End Self-Hosted Sharing Verification (Milestone 5):**
    - Start `cargo run -p clipforge-server` (or `packaging/docker/docker-compose.yml`), upload a real GSR-recorded clip from `apps/desktop`, and verify playback/seeking in `apps/web/index.html`.
 6. **Packaging & CI Validation (Milestone 6):**
-   - Validate `packaging/arch/PKGBUILD` (`makepkg`), `packaging/docker/docker-compose.yml`, and `.github/workflows/ci.yml` (ensure `libxkbcommon-dev` is installed on Ubuntu CI runners for `clipforge-desktop`).
+   - Validate `packaging/arch/PKGBUILD` (`makepkg`), `packaging/docker/docker-compose.yml`, and `.github/workflows/ci.yml` (ensure `libxkbcommon-dev` and `libasound2-dev` are installed on Ubuntu CI runners for `clipforge-desktop` and `cpal`).
