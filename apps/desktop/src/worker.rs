@@ -18,8 +18,8 @@ use clipforge_common::{
 };
 use clipforge_library::{ClipListOptions, ClipOrigin, DirectoryScanner, SqliteClipStore};
 use clipforge_media::{
-    DEFAULT_MAX_DECODE_DIM, ExportCancelToken, FfmpegMediaProcessor, PlaybackState, PlayerEvent,
-    VideoPlayerHandle, extract_timeline_thumbnails,
+    DEFAULT_MAX_DECODE_DIM, ExportCancelToken, FfmpegMediaProcessor, MicTestEvent, MicTestHandle,
+    PlaybackState, PlayerEvent, VideoPlayerHandle, extract_timeline_thumbnails,
 };
 use rune::Waker;
 use tokio::process::Command;
@@ -132,6 +132,12 @@ pub enum WorkerCommand {
     },
     CopyToClipboard(String),
     OpenUrl(String),
+    StartMicTest(String),
+    StartMicMonitor(String),
+    StopMicTest,
+    PlayMicTestSample,
+    ClearMicTest,
+    RestartReplayBuffer(CaptureConfig),
 }
 
 /// Events emitted by the background Tokio worker back to the Rune UI thread.
@@ -202,6 +208,7 @@ pub enum WorkerEvent {
         share_id: String,
         result: std::result::Result<(), String>,
     },
+    MicTest(MicTestEvent),
 }
 
 /// Handle held by [`crate::state::AppState`] to communicate with the background worker.
@@ -221,6 +228,7 @@ struct WorkerServices {
     hotkey_manager: Arc<Mutex<Option<HotkeyManager>>>,
     hotkey_tx: UnboundedSender<HotkeyAction>,
     hotkey_status_tx: UnboundedSender<GlobalHotkeyStatus>,
+    mic_test: MicTestHandle,
 }
 
 impl WorkerHandle {
@@ -248,6 +256,7 @@ impl WorkerHandle {
                     let capture = Arc::new(GsrCaptureBackend::new());
                     let media = Arc::new(FfmpegMediaProcessor::new());
                     let (player, mut player_rx) = VideoPlayerHandle::spawn();
+                    let (mic_test, mut mic_rx) = MicTestHandle::spawn();
                     let active_player_clip: Arc<Mutex<Option<(ClipId, rune::Pixels)>>> =
                         Arc::new(Mutex::new(None));
                     let (hotkey_tx, mut hotkey_rx) =
@@ -265,6 +274,17 @@ impl WorkerHandle {
                         hotkey_manager: Arc::new(Mutex::new(None)),
                         hotkey_tx,
                         hotkey_status_tx,
+                        mic_test,
+                    });
+
+                    // Forward MicTestEvents from MicTestHandle to the UI.
+                    let mic_evt_tx = evt_tx.clone();
+                    let mic_waker = waker.clone();
+                    tokio::spawn(async move {
+                        while let Some(ev) = mic_rx.recv().await {
+                            let _ = mic_evt_tx.send(WorkerEvent::MicTest(ev));
+                            (mic_waker)();
+                        }
                     });
 
                     // Forward GlobalHotkeyStatus updates to the UI.
@@ -939,6 +959,41 @@ async fn handle_command(
                 }
                 Err(err) => {
                     let _ = evt_tx.send(WorkerEvent::Banner(format!("Failed to open URL: {err}")));
+                }
+            }
+            (waker)();
+        }
+        WorkerCommand::StartMicTest(source_id) => {
+            svc.mic_test.start_test(source_id, None);
+        }
+        WorkerCommand::StartMicMonitor(source_id) => {
+            svc.mic_test.start_monitor(source_id);
+        }
+        WorkerCommand::StopMicTest => {
+            svc.mic_test.stop();
+        }
+        WorkerCommand::PlayMicTestSample => {
+            svc.mic_test.play_sample(None);
+        }
+        WorkerCommand::ClearMicTest => {
+            svc.mic_test.clear();
+        }
+        WorkerCommand::RestartReplayBuffer(cfg) => {
+            let _ = svc.capture.stop().await;
+            match svc.capture.start_replay_buffer(&cfg).await {
+                Ok(()) => {
+                    let st = svc.capture.status().await;
+                    let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(st));
+                    let _ = evt_tx.send(WorkerEvent::Banner(
+                        "Replay buffer restarted with updated capture settings".to_string(),
+                    ));
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(CaptureStatus::Error {
+                        message: msg.clone(),
+                    }));
+                    let _ = evt_tx.send(WorkerEvent::Banner(msg));
                 }
             }
             (waker)();

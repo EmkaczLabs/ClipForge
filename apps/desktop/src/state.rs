@@ -4,7 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Utc};
-use clipforge_capture::{AudioDeviceInfo, GlobalHotkeyStatus, HotkeyAction, MonitorInfo};
+use clipforge_capture::{
+    AudioDeviceInfo, AudioRoutingPlan, AudioTrackTarget, GlobalHotkeyStatus, HotkeyAction,
+    MonitorInfo, format_routed_audio_source, is_mic_source, parse_routed_audio_source,
+    resolve_audio_routing,
+};
 use clipforge_cloud_client::{RemoteClipSummary, ShareVisibility};
 use clipforge_common::{
     AppConfig, AudioCodec, AudioTrackInfo, CaptureEvent, CaptureStatus, CaptureTarget, ClipId,
@@ -12,6 +16,9 @@ use clipforge_common::{
     QualityPreset, TrimRequest, VideoCodec,
 };
 use clipforge_library::{ClipOrigin, ClipSort};
+use clipforge_media::{
+    DBFS_FLOOR, MicDiagnosticSummary, MicFeedbackKind, MicTestEvent, MicTestPhase,
+};
 
 use crate::config::load_app_config;
 use crate::worker::{DependencyStatus, WorkerCommand, WorkerEvent, WorkerHandle};
@@ -249,6 +256,47 @@ impl Default for HotkeyConfig {
     }
 }
 
+/// Live state for the standalone PipeWire Microphone Test service.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct MicTestState {
+    pub phase: MicTestPhase,
+    pub selected_source: Option<String>,
+    pub rms_dbfs: f32,
+    pub peak_dbfs: f32,
+    pub elapsed_ms: u64,
+    pub feedback: Option<MicFeedbackKind>,
+    pub diagnostic_summary: Option<MicDiagnosticSummary>,
+    pub error: Option<String>,
+}
+
+impl Default for MicTestState {
+    fn default() -> Self {
+        Self {
+            phase: MicTestPhase::Idle,
+            selected_source: None,
+            rms_dbfs: DBFS_FLOOR,
+            peak_dbfs: DBFS_FLOOR,
+            elapsed_ms: 0,
+            feedback: None,
+            diagnostic_summary: None,
+            error: None,
+        }
+    }
+}
+
+/// Snapshot of audio track routing and encoded stream diagnostics for Recording Studio.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct AudioDiagnosticsSnapshot {
+    pub routing_plan: AudioRoutingPlan,
+    pub last_saved_clip_title: Option<String>,
+    pub last_saved_stream_count: usize,
+    pub last_saved_codec: Option<String>,
+    pub last_saved_channels: Option<u32>,
+    pub mic_signal_detected: Option<bool>,
+}
+
 /// Complete UI state for ClipForge Desktop.
 pub struct AppState {
     pub nav: NavSection,
@@ -303,6 +351,10 @@ pub struct AppState {
     pub confirm_remote_delete: Option<String>,
     pub hotkeys: HotkeyConfig,
     pub hotkey_status: GlobalHotkeyStatus,
+    #[allow(dead_code)]
+    pub audio_config_dirty_while_active: bool,
+    #[allow(dead_code)]
+    pub mic_test: MicTestState,
     pub status_banner: Option<String>,
     pub worker: Option<WorkerHandle>,
 }
@@ -411,6 +463,8 @@ impl Default for AppState {
             confirm_remote_delete: None,
             hotkeys,
             hotkey_status: GlobalHotkeyStatus::FocusedWindowOnly { reason: None },
+            audio_config_dirty_while_active: false,
+            mic_test: MicTestState::default(),
             status_banner: None,
             worker: None,
         }
@@ -1518,6 +1572,12 @@ impl AppState {
                     }
                 }
                 WorkerEvent::CaptureStatusChanged(status) => {
+                    if matches!(
+                        status,
+                        CaptureStatus::Idle | CaptureStatus::ReplayBuffering { .. }
+                    ) {
+                        self.audio_config_dirty_while_active = false;
+                    }
                     self.capture_status = status;
                 }
                 WorkerEvent::HotkeyStatusChanged(status) => {
@@ -1693,6 +1753,45 @@ impl AppState {
                         }
                     }
                 }
+                WorkerEvent::MicTest(ev) => match ev {
+                    MicTestEvent::PhaseChanged(phase) => {
+                        self.mic_test.phase = phase;
+                        if matches!(phase, MicTestPhase::Recording) {
+                            self.mic_test.error = None;
+                        }
+                    }
+                    MicTestEvent::Level {
+                        rms_dbfs,
+                        peak_dbfs,
+                        elapsed_ms,
+                    } => {
+                        self.mic_test.rms_dbfs = rms_dbfs;
+                        self.mic_test.peak_dbfs = peak_dbfs;
+                        self.mic_test.elapsed_ms = elapsed_ms;
+                    }
+                    MicTestEvent::Recorded { summary } => {
+                        self.mic_test.rms_dbfs = summary.rms_dbfs;
+                        self.mic_test.peak_dbfs = summary.peak_dbfs;
+                        self.mic_test.feedback = Some(summary.feedback);
+                        self.mic_test.error = None;
+                        self.mic_test.diagnostic_summary = Some(summary);
+                    }
+                    MicTestEvent::PlaybackFinished => {
+                        self.mic_test.phase = MicTestPhase::Completed;
+                    }
+                    MicTestEvent::Error {
+                        feedback,
+                        message,
+                        summary,
+                    } => {
+                        self.mic_test.phase = MicTestPhase::Error;
+                        self.mic_test.feedback = Some(feedback);
+                        self.mic_test.error = Some(message);
+                        if summary.is_some() {
+                            self.mic_test.diagnostic_summary = summary;
+                        }
+                    }
+                },
                 WorkerEvent::Banner(msg) => {
                     self.status_banner = Some(msg);
                 }
@@ -1808,18 +1907,22 @@ impl AppState {
         self.config.capture.replay_buffer_secs = secs.clamp(5, 600);
     }
 
-    /// Toggles an audio source entry in `config.capture.audio_sources`.
+    /// Toggles an audio source entry in `config.capture.audio_sources` (matching by raw ID).
     pub fn toggle_audio_source(&mut self, source: String) {
-        if let Some(pos) = self
-            .config
-            .capture
-            .audio_sources
-            .iter()
-            .position(|s| s == &source)
-        {
+        let target_id = parse_routed_audio_source(&source)
+            .map(|(_, id)| id)
+            .unwrap_or(source.clone());
+        if let Some(pos) = self.config.capture.audio_sources.iter().position(|raw| {
+            parse_routed_audio_source(raw)
+                .map(|(_, id)| id == target_id)
+                .unwrap_or_else(|_| raw == &target_id)
+        }) {
             self.config.capture.audio_sources.remove(pos);
         } else {
             self.config.capture.audio_sources.push(source);
+        }
+        if !matches!(self.capture_status, CaptureStatus::Idle) {
+            self.audio_config_dirty_while_active = true;
         }
     }
 
@@ -2045,6 +2148,148 @@ impl AppState {
             worker.send(WorkerCommand::OpenUrl(url));
         } else {
             self.status_banner = Some(format!("Open URL: {url}"));
+        }
+    }
+
+    /// Returns the assigned [`AudioTrackTarget`] if `source_id` is enabled in `capture.audio_sources`.
+    pub fn audio_source_track(&self, source_id: &str) -> Option<AudioTrackTarget> {
+        let clean = parse_routed_audio_source(source_id)
+            .map(|(_, id)| id)
+            .unwrap_or_else(|_| source_id.to_string());
+        self.config.capture.audio_sources.iter().find_map(|raw| {
+            let (target, id) = parse_routed_audio_source(raw).ok()?;
+            if id == clean { Some(target) } else { None }
+        })
+    }
+
+    /// Assigns `target` (`Auto`, `T1`..`T4`) to `source_id`, enabling it if not already present.
+    pub fn set_audio_source_track(&mut self, source_id: &str, target: AudioTrackTarget) {
+        let clean = parse_routed_audio_source(source_id)
+            .map(|(_, id)| id)
+            .unwrap_or_else(|_| source_id.to_string());
+        let Ok(formatted) = format_routed_audio_source(target, &clean) else {
+            return;
+        };
+        if let Some(slot) = self.config.capture.audio_sources.iter_mut().find(|raw| {
+            parse_routed_audio_source(raw)
+                .map(|(_, id)| id == clean)
+                .unwrap_or_else(|_| *raw == &clean)
+        }) {
+            *slot = formatted;
+        } else {
+            self.config.capture.audio_sources.push(formatted);
+        }
+        if !matches!(self.capture_status, CaptureStatus::Idle) {
+            self.audio_config_dirty_while_active = true;
+        }
+    }
+
+    /// Restarts the replay buffer with the current `CaptureConfig` so audio/capture edits take effect.
+    pub fn restart_replay_buffer(&mut self) {
+        self.audio_config_dirty_while_active = false;
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::RestartReplayBuffer(
+                self.config.capture.clone(),
+            ));
+        } else {
+            self.capture_status = CaptureStatus::ReplayBuffering {
+                started_at: Utc::now(),
+                buffer_secs: self.config.capture.replay_buffer_secs,
+            };
+        }
+    }
+
+    /// Computes live audio routing and last-clip stream diagnostics for the Recording Studio UI.
+    pub fn audio_diagnostics(&self) -> AudioDiagnosticsSnapshot {
+        let routing_plan =
+            resolve_audio_routing(&self.config.capture.audio_sources).unwrap_or_default();
+        let last_real = self
+            .clips
+            .iter()
+            .filter(|c| !is_sample_clip(c))
+            .max_by_key(|c| c.created_at);
+        let (last_saved_clip_title, last_saved_stream_count, last_saved_codec, last_saved_channels) =
+            if let Some(clip) = last_real {
+                let first = clip.audio_tracks.first();
+                (
+                    Some(clip.title.clone()),
+                    clip.audio_tracks.len(),
+                    first.map(|t| t.codec.clone()),
+                    first.map(|t| u32::from(t.channels)),
+                )
+            } else {
+                (None, 0, None, None)
+            };
+        let mic_signal_detected = self
+            .mic_test
+            .diagnostic_summary
+            .as_ref()
+            .map(|s| s.signal_detected);
+        AudioDiagnosticsSnapshot {
+            routing_plan,
+            last_saved_clip_title,
+            last_saved_stream_count,
+            last_saved_codec,
+            last_saved_channels,
+            mic_signal_detected,
+        }
+    }
+
+    /// Returns the currently selected microphone source ID, if any.
+    pub fn selected_mic_source(&self) -> Option<String> {
+        for raw in &self.config.capture.audio_sources {
+            if let Ok((_, id)) = parse_routed_audio_source(raw)
+                && is_mic_source(&id)
+            {
+                return Some(id);
+            }
+        }
+        self.available_audio_devices
+            .iter()
+            .find(|d| is_mic_source(&d.id))
+            .map(|d| d.id.clone())
+    }
+
+    /// Starts the standalone PipeWire microphone test on `selected_mic_source()`.
+    pub fn start_mic_test(&mut self) {
+        let Some(source_id) = self.selected_mic_source() else {
+            self.mic_test.phase = MicTestPhase::Error;
+            self.mic_test.feedback = Some(MicFeedbackKind::MissingDevice);
+            self.mic_test.error =
+                Some("No microphone source selected in Audio Sources.".to_string());
+            return;
+        };
+        self.mic_test.selected_source = Some(source_id.clone());
+        self.mic_test.phase = MicTestPhase::Recording;
+        self.mic_test.rms_dbfs = DBFS_FLOOR;
+        self.mic_test.peak_dbfs = DBFS_FLOOR;
+        self.mic_test.elapsed_ms = 0;
+        self.mic_test.feedback = None;
+        self.mic_test.error = None;
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::StartMicTest(source_id));
+        }
+    }
+
+    /// Stops any active microphone test recording or playback immediately.
+    pub fn stop_mic_test(&mut self) {
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::StopMicTest);
+        }
+        if matches!(
+            self.mic_test.phase,
+            MicTestPhase::Recording | MicTestPhase::Playing
+        ) {
+            self.mic_test.phase = MicTestPhase::Idle;
+        }
+    }
+
+    /// Plays back the most recently recorded microphone test sample via `cpal`.
+    pub fn play_mic_test_sample(&mut self) {
+        self.mic_test.phase = MicTestPhase::Playing;
+        self.mic_test.error = None;
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::PlayMicTestSample);
         }
     }
 }
