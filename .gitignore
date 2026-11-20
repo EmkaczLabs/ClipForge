@@ -1,0 +1,27 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Node / Web
+node_modules/
+apps/web/dist/
+apps/web/.vite/
+
+# Local data & media
+*.db
+*.db-shm
+*.db-wal
+*.mp4
+*.mkv
+*.webm
+*.png
+!apps/web/public/*.png
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+.env

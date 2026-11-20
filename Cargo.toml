@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/desktop",
+    "apps/server",
+    "crates/common",
+    "crates/capture",
+    "crates/media",
+    "crates/library",
+    "crates/cloud-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ClipForge/ClipForge"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+rune = { git = "https://github.com/anomalyco/rune.git", rev = "dc8f7f7213cbe43af45212de6998d530d0945187" }
+
+clipforge-common = { path = "crates/common" }
+clipforge-capture = { path = "crates/capture" }
+clipforge-media = { path = "crates/media" }
+clipforge-library = { path = "crates/library" }
+clipforge-cloud-client = { path = "crates/cloud-client" }
+
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune.git", rev = "dc8f7f7213cbe43af45212de6998d530d0945187" }
+winit = { git = "https://github.com/anomalyco/rune.git", rev = "dc8f7f7213cbe43af45212de6998d530d0945187" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune.git", rev = "dc8f7f7213cbe43af45212de6998d530d0945187" }
+parley_engine = { git = "https://github.com/anomalyco/rune.git", rev = "dc8f7f7213cbe43af45212de6998d530d0945187" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune.git", rev = "dc8f7f7213cbe43af45212de6998d530d0945187" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune.git", rev = "dc8f7f7213cbe43af45212de6998d530d0945187" }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

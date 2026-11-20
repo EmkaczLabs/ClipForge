@@ -1,0 +1,15 @@
+[package]
+name = "clipforge-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+clipforge-common.workspace = true
+libc = "0.2"
+tempfile = "3"
+tokio.workspace = true
+tracing.workspace = true
+x11rb = "0.13"

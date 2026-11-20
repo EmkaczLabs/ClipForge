@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ClipForge — Shared Clip</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0a0c10;
+      --surface: #12161f;
+      --surface-elevated: #191f2c;
+      --border: #262e40;
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --accent: #6366f1;
+      --accent-hover: #818cf8;
+      --danger: #ef4444;
+      --success: #22c55e;
+      --radius: 12px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: radial-gradient(circle at top, #131826 0%, var(--bg) 60%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      border-bottom: 1px solid var(--border);
+      background: rgba(10, 12, 16, 0.85);
+      backdrop-filter: blur(12px);
+      padding: 0.9rem 1.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-weight: 700;
+      font-size: 1.05rem;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+
+    main {
+      flex: 1;
+      width: 100%;
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+
+    .player-shell {
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      aspect-ratio: 16 / 9;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      display: block;
+      outline: none;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .title-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    h1 {
+      font-size: 1.35rem;
+      font-weight: 650;
+      line-height: 1.3;
+      letter-spacing: -0.01em;
+    }
+
+    .subtitle {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-top: 0.25rem;
+    }
+
+    .actions {
+      display: flex;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+    }
+
+    button, .btn {
+      background: var(--surface-elevated);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.5rem 0.9rem;
+      font-size: 0.85rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    button:hover, .btn:hover {
+      border-color: var(--accent);
+      background: #1f2637;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    button.primary:hover {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+
+    .meta-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+    }
+
+    .badge {
+      background: var(--surface-elevated);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 0.3rem 0.65rem;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+
+    .badge strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .notes {
+      color: var(--text-muted);
+      font-size: 0.92rem;
+      line-height: 1.5;
+      border-top: 1px solid var(--border);
+      padding-top: 0.85rem;
+      white-space: pre-wrap;
+    }
+
+    .state-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 2.5rem 1.5rem;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.9rem;
+    }
+
+    .state-box p {
+      color: var(--text-muted);
+      max-width: 440px;
+      line-height: 1.5;
+    }
+
+    .auth-form {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin-top: 0.5rem;
+    }
+
+    input[type="password"], input[type="text"] {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.55rem 0.8rem;
+      font-size: 0.9rem;
+      min-width: 240px;
+      outline: none;
+    }
+
+    input:focus {
+      border-color: var(--accent);
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    footer {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      padding: 1.25rem;
+    }
+
+    @media (max-width: 640px) {
+      main {
+        padding: 1rem;
+      }
+      .card {
+        padding: 1rem;
+      }
+      h1 {
+        font-size: 1.15rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span>ClipForge</span>
+    </div>
+    <span id="visibility-pill" class="badge hidden"></span>
+  </header>
+
+  <main>
+    <div id="loading-state" class="state-box">
+      <p>Loading clip…</p>
+    </div>
+
+    <div id="error-state" class="state-box hidden">
+      <h2 id="error-title">Clip unavailable</h2>
+      <p id="error-message"></p>
+      <form id="unlock-form" class="auth-form hidden">
+        <input id="token-input" type="password" placeholder="Bearer token or API key" autocomplete="off" />
+        <button type="submit" class="primary">Unlock</button>
+      </form>
+    </div>
+
+    <div id="player-view" class="hidden">
+      <div class="player-shell">
+        <video id="video-player" controls playsinline preload="metadata"></video>
+      </div>
+
+      <section class="card" style="margin-top: 1.25rem;">
+        <div class="title-row">
+          <div>
+            <h1 id="clip-title">Untitled Clip</h1>
+            <div id="clip-subtitle" class="subtitle"></div>
+          </div>
+          <div class="actions">
+            <button id="copy-link-btn" type="button">Copy Link</button>
+            <a id="download-btn" class="btn" download>Download</a>
+          </div>
+        </div>
+
+        <div id="meta-grid" class="meta-grid"></div>
+        <div id="clip-notes" class="notes hidden"></div>
+      </section>
+    </div>
+  </main>
+
+  <footer>ClipForge Cloud Player</footer>
+
+  <script>
+    (function () {
+      const pathParts = window.location.pathname.split('/').filter(Boolean);
+      const token = pathParts[pathParts.length - 1] || '';
+      const urlParams = new URLSearchParams(window.location.search);
+      let authToken = urlParams.get('token') || '';
+
+      const loadingEl = document.getElementById('loading-state');
+      const errorEl = document.getElementById('error-state');
+      const errorTitleEl = document.getElementById('error-title');
+      const errorMsgEl = document.getElementById('error-message');
+      const unlockForm = document.getElementById('unlock-form');
+      const tokenInput = document.getElementById('token-input');
+      const playerView = document.getElementById('player-view');
+      const videoEl = document.getElementById('video-player');
+      const titleEl = document.getElementById('clip-title');
+      const subtitleEl = document.getElementById('clip-subtitle');
+      const metaGridEl = document.getElementById('meta-grid');
+      const notesEl = document.getElementById('clip-notes');
+      const visPill = document.getElementById('visibility-pill');
+      const copyBtn = document.getElementById('copy-link-btn');
+      const downloadBtn = document.getElementById('download-btn');
+
+      function formatDuration(ms) {
+        if (!ms || ms <= 0) return '0:00';
+        const totalSecs = Math.round(ms / 1000);
+        const mins = Math.floor(totalSecs / 60);
+        const secs = totalSecs % 60;
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+      }
+
+      function formatBytes(bytes) {
+        if (!bytes || bytes <= 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB'];
+        let i = 0;
+        let val = bytes;
+        while (val >= 1024 && i < units.length - 1) {
+          val /= 1024;
+          i++;
+        }
+        return `${val.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+      }
+
+      function addBadge(label, value) {
+        const span = document.createElement('span');
+        span.className = 'badge';
+        span.innerHTML = `${label}: <strong></strong>`;
+        span.querySelector('strong').textContent = value;
+        metaGridEl.appendChild(span);
+      }
+
+      async function loadShare() {
+        loadingEl.classList.remove('hidden');
+        errorEl.classList.add('hidden');
+        playerView.classList.add('hidden');
+        unlockForm.classList.add('hidden');
+
+        if (!token || token === 's') {
+          loadingEl.classList.add('hidden');
+          errorTitleEl.textContent = 'No clip specified';
+          errorMsgEl.textContent = 'Open a valid /s/<share-id> link to watch a clip.';
+          errorEl.classList.remove('hidden');
+          return;
+        }
+
+        const headers = {};
+        if (authToken) {
+          headers['Authorization'] = `Bearer ${authToken}`;
+        }
+
+        try {
+          const resp = await fetch(`/api/v1/shares/${encodeURIComponent(token)}/meta`, { headers });
+          if (resp.status === 401 || resp.status === 403) {
+            loadingEl.classList.add('hidden');
+            errorTitleEl.textContent = 'Private Clip';
+            errorMsgEl.textContent = 'This clip is private. Enter an authorized bearer token or API key to view it.';
+            unlockForm.classList.remove('hidden');
+            errorEl.classList.remove('hidden');
+            return;
+          }
+          if (!resp.ok) {
+            loadingEl.classList.add('hidden');
+            errorTitleEl.textContent = resp.status === 404 ? 'Clip Not Found' : 'Error Loading Clip';
+            errorMsgEl.textContent = 'The requested clip may have been deleted or expired.';
+            errorEl.classList.remove('hidden');
+            return;
+          }
+
+          const meta = await resp.json();
+          document.title = `${meta.title || 'Clip'} — ClipForge`;
+          titleEl.textContent = meta.title || 'Untitled Clip';
+
+          const subParts = [];
+          if (meta.game && meta.game.name) subParts.push(meta.game.name);
+          if (meta.created_at) subParts.push(new Date(meta.created_at).toLocaleString());
+          subtitleEl.textContent = subParts.join(' • ');
+
+          visPill.textContent = meta.visibility === 'private' ? 'Private' : 'Public';
+          visPill.classList.remove('hidden');
+
+          metaGridEl.innerHTML = '';
+          addBadge('Duration', formatDuration(meta.duration_ms));
+          if (meta.width && meta.height) {
+            addBadge('Resolution', `${meta.width}×${meta.height}`);
+          }
+          if (meta.fps) {
+            addBadge('FPS', `${Math.round(meta.fps)}`);
+          }
+          if (meta.codec) {
+            addBadge('Codec', meta.codec.toUpperCase());
+          }
+          if (meta.size_bytes) {
+            addBadge('Size', formatBytes(meta.size_bytes));
+          }
+          if (Array.isArray(meta.tags)) {
+            meta.tags.forEach((tag) => {
+              const b = document.createElement('span');
+              b.className = 'badge';
+              b.textContent = `#${tag}`;
+              metaGridEl.appendChild(b);
+            });
+          }
+
+          if (meta.notes) {
+            notesEl.textContent = meta.notes;
+            notesEl.classList.remove('hidden');
+          } else {
+            notesEl.classList.add('hidden');
+          }
+
+          const videoUrl = authToken
+            ? `/api/v1/shares/${encodeURIComponent(token)}/video?token=${encodeURIComponent(authToken)}`
+            : `/api/v1/shares/${encodeURIComponent(token)}/video`;
+          videoEl.src = videoUrl;
+          downloadBtn.href = videoUrl;
+
+          loadingEl.classList.add('hidden');
+          playerView.classList.remove('hidden');
+        } catch (err) {
+          loadingEl.classList.add('hidden');
+          errorTitleEl.textContent = 'Connection Error';
+          errorMsgEl.textContent = 'Could not reach the ClipForge server.';
+          errorEl.classList.remove('hidden');
+        }
+      }
+
+      unlockForm.addEventListener('submit', function (e) {
+        e.preventDefault();
+        authToken = tokenInput.value.trim();
+        loadShare();
+      });
+
+      copyBtn.addEventListener('click', async function () {
+        try {
+          await navigator.clipboard.writeText(window.location.href);
+          copyBtn.textContent = 'Copied!';
+          setTimeout(() => {
+            copyBtn.textContent = 'Copy Link';
+          }, 1600);
+        } catch {
+          copyBtn.textContent = 'Copy failed';
+        }
+      });
+
+      loadShare();
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+Package: clipforge-desktop
+Version: 0.1.0
+Section: video
+Priority: optional
+Architecture: amd64
+Depends: ffmpeg, libxkbcommon0, libvulkan1, libdbus-1-3
+Recommends: gpu-screen-recorder
+Maintainer: ClipForge Contributors <maintainers@clipforge.invalid>
+Description: Open-source Linux game clipping and replay-buffer application
+ ClipForge captures gameplay via GPU Screen Recorder, manages a local SQLite
+ clip library, trims clips with FFmpeg, and optionally shares clips via
+ clipforge-server.

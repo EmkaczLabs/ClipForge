@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ClipForge
+GenericName=Game Clip Recorder
+Comment=Capture, trim, and share Linux gameplay clips
+Exec=clipforge-desktop
+Icon=clipforge
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=game;clip;replay;screen;recorder;
+StartupNotify=true

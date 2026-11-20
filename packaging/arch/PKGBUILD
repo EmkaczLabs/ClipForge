@@ -1,0 +1,33 @@
+# Maintainer: ClipForge Contributors
+pkgname=clipforge-desktop
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Open-source Linux game clipping, replay-buffer, and sharing app"
+arch=('x86_64')
+url="https://github.com/ClipForge/ClipForge"
+license=('MIT')
+depends=(
+  'dbus'
+  'ffmpeg'
+  'libxkbcommon'
+  'vulkan-icd-loader'
+)
+optdepends=(
+  'gpu-screen-recorder: native GPU-accelerated game & screen replay capture'
+)
+makedepends=('cargo' 'git')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "ClipForge-$pkgver"
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked -p clipforge-desktop
+}
+
+package() {
+  cd "ClipForge-$pkgver"
+  install -Dm755 "target/release/clipforge-desktop" "$pkgdir/usr/bin/clipforge-desktop"
+  install -Dm644 "packaging/deb/clipforge.desktop" "$pkgdir/usr/share/applications/clipforge.desktop"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
