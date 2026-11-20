@@ -1341,7 +1341,9 @@ fn fallback_notice(p: &Palette, key: &str, message: &str) -> El {
         .child(
             text(message.to_string())
                 .font(typography::LABEL)
-                .color(p.warning_text),
+                .color(p.warning_text)
+                .w_full()
+                .wrap(),
         )
 }
 

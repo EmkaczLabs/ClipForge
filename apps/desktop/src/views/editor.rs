@@ -783,10 +783,12 @@ fn build_inspector(
                 text(if s.editor.reencode {
                     "Re-encodes video for exact frame-accurate cuts."
                 } else {
-                    "Fast lossless stream copy (cuts align to nearest keyframe)."
+                    "Fast lossless stream copy (aligns to keyframe)."
                 })
                 .font(typography::LABEL)
-                .color(p.text_muted),
+                .color(p.text_muted)
+                .w_full()
+                .wrap(),
             ),
     );
 

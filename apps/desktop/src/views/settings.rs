@@ -30,6 +30,17 @@ impl SettingRowSpec {
     }
 }
 
+fn compact_config_path() -> String {
+    let path = config_file_path();
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+        && let Ok(rel) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", rel.display());
+    }
+    path.display().to_string()
+}
+
 pub fn view(p: &Palette, s: &AppState) -> El {
     let query = s.settings_search.text.trim().to_lowercase();
 
@@ -129,9 +140,11 @@ fn category_rail(p: &Palette, s: &AppState) -> El {
                         .fill(p.bg_lowest)
                         .border(1.0, p.border_subtle)
                         .child(
-                            text(config_file_path().display().to_string())
+                            text(compact_config_path())
                                 .font(typography::MONO_BADGE)
-                                .color(p.text_secondary),
+                                .color(p.text_secondary)
+                                .w_full()
+                                .wrap(),
                         ),
                 )
                 .child(
