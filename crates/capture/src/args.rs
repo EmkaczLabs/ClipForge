@@ -159,7 +159,7 @@ pub fn build_replay_args(
             "no"
         },
     );
-    push_pair(&mut args, "-bm", "cbr");
+    push_pair(&mut args, "-bm", "auto");
 
     if let Some(script) = save_script_path {
         push_pair(&mut args, "-sc", script.as_os_str());
@@ -220,7 +220,7 @@ pub fn quality_flag(q: QualityPreset) -> &'static str {
     match q {
         QualityPreset::Medium => "medium",
         QualityPreset::High => "high",
-        QualityPreset::VeryHigh => "veryhigh",
+        QualityPreset::VeryHigh => "very_high",
         QualityPreset::Ultra => "ultra",
     }
 }
@@ -256,8 +256,17 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-encoder", "gpu"]));
         assert!(args.windows(2).any(|w| w == ["-f", "60"]));
         assert!(args.windows(2).any(|w| w == ["-r", "60"]));
+        assert!(args.windows(2).any(|w| w == ["-bm", "auto"]));
         assert!(args.windows(2).any(|w| w == ["-a", "default_output"]));
         assert!(args.windows(2).any(|w| w == ["-o", "clips"]));
+    }
+
+    #[test]
+    fn quality_flag_matches_gsr_cli_values() {
+        assert_eq!(quality_flag(QualityPreset::Medium), "medium");
+        assert_eq!(quality_flag(QualityPreset::High), "high");
+        assert_eq!(quality_flag(QualityPreset::VeryHigh), "very_high");
+        assert_eq!(quality_flag(QualityPreset::Ultra), "ultra");
     }
 
     #[test]

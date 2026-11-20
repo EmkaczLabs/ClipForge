@@ -177,6 +177,7 @@ impl CaptureBackend for GsrCaptureBackend {
 
         spawn_stream_monitors(
             pid,
+            true,
             stdout,
             stderr,
             Arc::clone(&self.process),
@@ -219,7 +220,21 @@ impl CaptureBackend for GsrCaptureBackend {
 
         match tokio::time::timeout(SAVE_REPLAY_TIMEOUT, rx).await {
             Ok(Ok(path)) => Ok(path),
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(_)) => {
+                if let Some(found) = find_new_file(&output_dir, &snapshot_before).await {
+                    let _ = self.events.send(CaptureEvent::ReplaySaved {
+                        path: found.clone(),
+                        saved_at: Utc::now(),
+                    });
+                    return Ok(found);
+                }
+                let err_msg = match self.status.lock().await.clone() {
+                    CaptureStatus::Error { message } => message,
+                    _ => "gpu-screen-recorder exited before saving replay".to_string(),
+                };
+                Err(ClipForgeError::CaptureFailed(err_msg))
+            }
+            Err(_) => {
                 // Fallback: check if a new file appeared in `output_dir`.
                 if let Some(found) = find_new_file(&output_dir, &snapshot_before).await {
                     let _ = self.events.send(CaptureEvent::ReplaySaved {
@@ -276,6 +291,7 @@ impl CaptureBackend for GsrCaptureBackend {
 
         spawn_stream_monitors(
             pid,
+            false,
             stdout,
             stderr,
             Arc::clone(&self.process),
@@ -371,7 +387,12 @@ fn create_save_hook_script() -> Result<(tempfile::TempDir, PathBuf)> {
 }
 
 /// Parses a stdout line from GSR or our `-sc` hook into a saved clip [`PathBuf`].
+#[cfg(test)]
 pub(crate) fn parse_saved_path_line(line: &str) -> Option<PathBuf> {
+    parse_saved_path_line_with_hook(line, false)
+}
+
+fn parse_saved_path_line_with_hook(line: &str, hook_only: bool) -> Option<PathBuf> {
     let trimmed = line.trim();
     if let Some(rest) = trimmed.strip_prefix("CLIPFORGE_SAVED:") {
         let p = rest.trim();
@@ -379,7 +400,8 @@ pub(crate) fn parse_saved_path_line(line: &str) -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
-    if trimmed.starts_with('/')
+    if !hook_only
+        && trimmed.starts_with('/')
         && (trimmed.ends_with(".mp4")
             || trimmed.ends_with(".mkv")
             || trimmed.ends_with(".webm")
@@ -392,12 +414,15 @@ pub(crate) fn parse_saved_path_line(line: &str) -> Option<PathBuf> {
 
 fn spawn_stream_monitors(
     pid: u32,
+    has_save_hook: bool,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     process: Arc<Mutex<Option<ActiveProcess>>>,
     status: Arc<Mutex<CaptureStatus>>,
     events: broadcast::Sender<CaptureEvent>,
 ) {
+    let last_stderr_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
     if let Some(out) = stdout {
         let proc_clone = Arc::clone(&process);
         let events_clone = events.clone();
@@ -405,7 +430,9 @@ fn spawn_stream_monitors(
             let mut lines = BufReader::new(out).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 debug!(pid, line = %line, "gsr stdout");
-                if let Some(path) = parse_saved_path_line(&line) {
+                // When `-sc` is active, GSR prints both the raw path and the hook's
+                // `CLIPFORGE_SAVED:` line; match only the hook line to avoid duplicate events.
+                if let Some(path) = parse_saved_path_line_with_hook(&line, has_save_hook) {
                     let _ = events_clone.send(CaptureEvent::ReplaySaved {
                         path: path.clone(),
                         saved_at: Utc::now(),
@@ -425,6 +452,7 @@ fn spawn_stream_monitors(
 
     if let Some(err_stream) = stderr {
         let events_clone = events.clone();
+        let err_clone = Arc::clone(&last_stderr_error);
         tokio::spawn(async move {
             let mut lines = BufReader::new(err_stream).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -432,6 +460,7 @@ fn spawn_stream_monitors(
                 if !trimmed.is_empty() {
                     warn!(pid, line = %trimmed, "gsr stderr");
                     if trimmed.to_ascii_lowercase().contains("error") {
+                        *err_clone.lock().await = Some(trimmed.to_string());
                         let _ = events_clone.send(CaptureEvent::Warning(trimmed.to_string()));
                     }
                 }
@@ -454,7 +483,15 @@ fn spawn_stream_monitors(
                 Ok(Some(exit_status)) => {
                     *guard = None;
                     drop(guard);
-                    let msg = format!("gpu-screen-recorder exited unexpectedly ({exit_status})");
+                    // Yield briefly so the stderr reader can flush any final error line.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let detail = last_stderr_error.lock().await.clone();
+                    let msg = match detail {
+                        Some(err_line) => format!(
+                            "gpu-screen-recorder exited unexpectedly ({exit_status}): {err_line}"
+                        ),
+                        None => format!("gpu-screen-recorder exited unexpectedly ({exit_status})"),
+                    };
                     error!(pid, %msg);
                     let err_status = CaptureStatus::Error {
                         message: msg.clone(),
@@ -488,7 +525,12 @@ async fn find_new_file(dir: &Path, before: &[PathBuf]) -> Option<PathBuf> {
     let mut rd = tokio::fs::read_dir(dir).await.ok()?;
     while let Ok(Some(entry)) = rd.next_entry().await {
         let path = entry.path();
-        if !before.contains(&path) && path.is_file() {
+        if !before.contains(&path)
+            && tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+        {
             return Some(path);
         }
     }
@@ -609,5 +651,188 @@ done
 
         backend.stop().await.expect("clean stop via SIGINT");
         assert_eq!(backend.status().await, CaptureStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn mock_gsr_deduplicates_raw_and_hook_paths_and_supports_repeated_saves() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("clips");
+        let mock_bin = dir.path().join("mock-gsr-dup.sh");
+
+        // Simulates real GSR behavior: prints raw path AND runs `-sc` hook (`CLIPFORGE_SAVED:`).
+        let script = r#"#!/bin/sh
+OUT_DIR=""
+SC_PATH=""
+COUNT=0
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then OUT_DIR="$arg"; fi
+  if [ "$prev" = "-sc" ]; then SC_PATH="$arg"; fi
+  prev="$arg"
+done
+on_usr1() {
+  COUNT=$((COUNT + 1))
+  FILE="$OUT_DIR/replay_$COUNT.mp4"
+  printf 'dummy' > "$FILE"
+  printf '%s\n' "$FILE"
+  if [ -n "$SC_PATH" ]; then
+    "$SC_PATH" "$FILE" "replay"
+  fi
+}
+trap 'on_usr1' USR1
+trap 'exit 0' INT
+while true; do
+  sleep 1 &
+  wait $!
+done
+"#;
+        std::fs::write(&mock_bin, script).unwrap();
+        let mut perms = std::fs::metadata(&mock_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&mock_bin, perms).unwrap();
+
+        let backend = GsrCaptureBackend::with_installation(GsrInstallation::Native(mock_bin));
+        let mut rx = backend.subscribe();
+
+        let cfg = CaptureConfig {
+            output_dir: out_dir.clone(),
+            ..CaptureConfig::default()
+        };
+        backend.start_replay_buffer(&cfg).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let first = backend.save_replay().await.expect("first save");
+        let second = backend.save_replay().await.expect("second save");
+        assert_eq!(first, out_dir.join("replay_1.mp4"));
+        assert_eq!(second, out_dir.join("replay_2.mp4"));
+
+        let mut saved_events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CaptureEvent::ReplaySaved { path, .. } = ev {
+                saved_events.push(path);
+            }
+        }
+        assert_eq!(
+            saved_events,
+            vec![out_dir.join("replay_1.mp4"), out_dir.join("replay_2.mp4")],
+            "expected exactly one ReplaySaved event per save"
+        );
+
+        backend.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_gsr_unexpected_exit_reports_stderr_and_allows_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("clips");
+        let mock_bin = dir.path().join("mock-gsr-fail.sh");
+
+        let script = r#"#!/bin/sh
+echo "gsr error: simulated encoder failure" >&2
+exit 2
+"#;
+        std::fs::write(&mock_bin, script).unwrap();
+        let mut perms = std::fs::metadata(&mock_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&mock_bin, perms).unwrap();
+
+        let backend = GsrCaptureBackend::with_installation(GsrInstallation::Native(mock_bin));
+        let mut rx = backend.subscribe();
+
+        let cfg = CaptureConfig {
+            output_dir: out_dir.clone(),
+            ..CaptureConfig::default()
+        };
+        backend.start_replay_buffer(&cfg).await.unwrap();
+
+        // Wait for the crash monitor (250ms poll) to detect the unexpected exit.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let status = backend.status().await;
+        match status {
+            CaptureStatus::Error { ref message } => {
+                assert!(
+                    message.contains("simulated encoder failure"),
+                    "expected stderr detail in error message, got: {message}"
+                );
+            }
+            other => panic!("expected CaptureStatus::Error, got {other:?}"),
+        }
+
+        let mut saw_error_event = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let CaptureEvent::Error(msg) = ev
+                && msg.contains("simulated encoder failure")
+            {
+                saw_error_event = true;
+            }
+        }
+        assert!(saw_error_event, "expected CaptureEvent::Error with stderr");
+
+        // Recovery: stop resets to Idle and a new session can be started.
+        backend.stop().await.unwrap();
+        assert_eq!(backend.status().await, CaptureStatus::Idle);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live gpu-screen-recorder and display session"]
+    async fn live_gsr_replay_save_repeated_and_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("clips");
+        let backend = GsrCaptureBackend::new();
+        assert!(
+            backend.is_available().await,
+            "gpu-screen-recorder must be available"
+        );
+
+        let mut rx = backend.subscribe();
+        let cfg = CaptureConfig {
+            output_dir: out_dir.clone(),
+            replay_buffer_secs: 5,
+            ..CaptureConfig::default()
+        };
+
+        backend
+            .start_replay_buffer(&cfg)
+            .await
+            .expect("start live replay buffer");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let first = backend.save_replay().await.expect("first live replay save");
+        assert!(first.exists(), "first replay file should exist");
+        assert!(
+            std::fs::metadata(&first).unwrap().len() > 0,
+            "first replay file should be non-empty"
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let second = backend
+            .save_replay()
+            .await
+            .expect("second live replay save");
+        assert!(second.exists(), "second replay file should exist");
+        assert_ne!(
+            first, second,
+            "repeated saves should produce distinct files"
+        );
+        assert!(
+            std::fs::metadata(&second).unwrap().len() > 0,
+            "second replay file should be non-empty"
+        );
+
+        backend.stop().await.expect("clean stop via SIGINT");
+        assert_eq!(backend.status().await, CaptureStatus::Idle);
+
+        let mut saved_events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CaptureEvent::ReplaySaved { path, .. } = ev {
+                saved_events.push(path);
+            }
+        }
+        assert_eq!(saved_events, vec![first, second]);
     }
 }
