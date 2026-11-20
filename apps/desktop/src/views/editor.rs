@@ -89,7 +89,7 @@ pub fn view(p: &Palette, s: &AppState) -> El {
             .h_full()
             .cursor(Cursor::Pointer)
             .pixels_fit(&s.editor.video_pixels, SurfaceFit::Fit)
-            .on_press(|st| st.toggle_play())
+            .on_press(|st: &mut AppState| st.toggle_play())
     } else {
         col()
             .key("video-loading")
@@ -163,7 +163,7 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                 .radius(radius::MD)
                 .fill(p.bg_base)
                 .border(1.0, p.border_subtle)
-                .clip()
+                .clip_rounded(radius::MD)
                 .child(viewport_content),
         )
         .child(
@@ -294,7 +294,7 @@ pub fn view(p: &Palette, s: &AppState) -> El {
         .fill(p.bg_base)
         .border(1.0, p.border_subtle)
         .cursor(Cursor::Pointer)
-        .clip()
+        .clip_rounded(radius::SM)
         .on_drag(move |st: &mut AppState, d: &mut Drag, _tx: &mut Tx| {
             if d.cancelled() {
                 return;
