@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -11,6 +12,62 @@ use clipforge_common::{
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 
 use crate::migrations::{apply_migrations, current_schema_version};
+
+/// Origin classification for a clip stored in [`SqliteClipStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ClipOrigin {
+    /// Captured via screen/replay recording.
+    #[default]
+    Recorded,
+    /// Imported from an external file on disk.
+    Imported,
+    /// Created by trimming an existing clip.
+    Trimmed,
+    /// Built-in sample/demo clip (not a user recording).
+    Sample,
+}
+
+impl ClipOrigin {
+    /// Returns the canonical database representation for this origin.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Imported => "imported",
+            Self::Trimmed => "trimmed",
+            Self::Sample => "sample",
+        }
+    }
+
+    /// Returns `true` if this clip is a sample/demo entry rather than a user recording.
+    pub fn is_sample(self) -> bool {
+        matches!(self, Self::Sample)
+    }
+}
+
+impl FromStr for ClipOrigin {
+    type Err = ClipForgeError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "recorded" => Ok(Self::Recorded),
+            "imported" => Ok(Self::Imported),
+            "trimmed" => Ok(Self::Trimmed),
+            "sample" => Ok(Self::Sample),
+            other => Err(ClipForgeError::InvalidInput(format!(
+                "unknown clip origin: {other}"
+            ))),
+        }
+    }
+}
+
+/// Options for listing clips from [`SqliteClipStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClipListOptions {
+    pub sort: ClipSort,
+    pub favorites_only: bool,
+    pub origin: Option<ClipOrigin>,
+    pub exclude_samples: bool,
+}
 
 /// Sort order for listing clips from [`SqliteClipStore`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,9 +139,98 @@ impl SqliteClipStore {
         sort: ClipSort,
         favorites_only: bool,
     ) -> Result<Vec<ClipMetadata>> {
+        self.list_clips_filtered(
+            filter,
+            ClipListOptions {
+                sort,
+                favorites_only,
+                origin: None,
+                exclude_samples: false,
+            },
+        )
+        .await
+    }
+
+    /// Lists clips with [`ClipListOptions`] (sort, favorites, origin, sample exclusion).
+    pub async fn list_clips_filtered(
+        &self,
+        filter: &ClipFilter,
+        options: ClipListOptions,
+    ) -> Result<Vec<ClipMetadata>> {
         let filter = filter.clone();
-        self.with_conn(move |conn| list_clips_sync(conn, &filter, sort, favorites_only))
+        self.with_conn(move |conn| list_clips_sync(conn, &filter, options))
             .await
+    }
+
+    /// Inserts or updates a clip and explicitly sets its [`ClipOrigin`].
+    pub async fn upsert_clip_with_origin(
+        &self,
+        clip: &ClipMetadata,
+        origin: ClipOrigin,
+    ) -> Result<()> {
+        let clip = clip.clone();
+        self.with_conn(move |conn| upsert_clip_sync(conn, &clip, Some(origin)))
+            .await
+    }
+
+    /// Updates the [`ClipOrigin`] of an existing clip. Returns `true` if the clip exists.
+    pub async fn set_origin(&self, id: ClipId, origin: ClipOrigin) -> Result<bool> {
+        let id_str = id.to_string();
+        let origin_str = origin.as_str();
+        self.with_conn(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE clips SET origin = ?1 WHERE id = ?2",
+                    params![origin_str, id_str],
+                )
+                .map_err(db_err)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    /// Returns the [`ClipOrigin`] for the given clip.
+    pub async fn get_origin(&self, id: ClipId) -> Result<ClipOrigin> {
+        let id_str = id.to_string();
+        self.with_conn(move |conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT origin FROM clips WHERE id = ?1",
+                    params![id_str],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+
+            match raw {
+                Some(s) => s.parse(),
+                None => Err(ClipForgeError::NotFound(format!("clip not found: {id}"))),
+            }
+        })
+        .await
+    }
+
+    /// Returns a map of all clip IDs to their [`ClipOrigin`].
+    pub async fn list_origins(&self) -> Result<HashMap<ClipId, ClipOrigin>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT id, origin FROM clips")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(db_err)?;
+            let mut map = HashMap::new();
+            for row in rows {
+                let (id_str, origin_str) = row.map_err(db_err)?;
+                if let (Ok(id), Ok(origin)) = (id_str.parse::<ClipId>(), origin_str.parse()) {
+                    map.insert(id, origin);
+                }
+            }
+            Ok(map)
+        })
+        .await
     }
 
     /// Marks or unmarks a clip as a favorite. Returns `true` if the clip exists.
@@ -151,17 +297,29 @@ impl SqliteClipStore {
         .await
     }
 
-    /// Looks up a clip by its file path.
+    /// Looks up a clip by its file path (falling back to canonicalized path if the file exists).
     pub async fn get_by_file_path(&self, path: &Path) -> Result<Option<ClipMetadata>> {
         let path_str = path.to_string_lossy().into_owned();
+        let canon_str = std::fs::canonicalize(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|c| c != &path_str);
         self.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(&format!("{SELECT_CLIP_COLUMNS} WHERE c.file_path = ?1"))
                 .map_err(db_err)?;
-            let clip = stmt
+            let mut clip = stmt
                 .query_row(params![path_str], row_to_clip_base)
                 .optional()
                 .map_err(db_err)?;
+            if clip.is_none()
+                && let Some(canon) = canon_str
+            {
+                clip = stmt
+                    .query_row(params![canon], row_to_clip_base)
+                    .optional()
+                    .map_err(db_err)?;
+            }
             match clip {
                 Some(mut c) => {
                     c.tags = load_tags_for_clip(conn, &c.id.to_string())?;
@@ -213,7 +371,7 @@ impl SqliteClipStore {
 impl ClipStore for SqliteClipStore {
     async fn upsert_clip(&self, clip: &ClipMetadata) -> Result<()> {
         let clip = clip.clone();
-        self.with_conn(move |conn| upsert_clip_sync(conn, &clip))
+        self.with_conn(move |conn| upsert_clip_sync(conn, &clip, None))
             .await
     }
 
@@ -315,7 +473,11 @@ fn configure_connection(conn: &Connection, enable_wal: bool) -> Result<()> {
     Ok(())
 }
 
-fn upsert_clip_sync(conn: &mut Connection, clip: &ClipMetadata) -> Result<()> {
+fn upsert_clip_sync(
+    conn: &mut Connection,
+    clip: &ClipMetadata,
+    origin: Option<ClipOrigin>,
+) -> Result<()> {
     let id_str = clip.id.to_string();
     let file_path_str = clip.file_path.to_string_lossy().into_owned();
     let thumb_path_str = clip
@@ -342,16 +504,17 @@ fn upsert_clip_sync(conn: &mut Connection, clip: &ClipMetadata) -> Result<()> {
         None => (None, None, None, None),
     };
 
+    let insert_origin = origin.unwrap_or_default().as_str();
     let tx = conn.transaction().map_err(db_err)?;
     tx.execute(
         "INSERT INTO clips (
             id, title, game_id, game_name, game_executable, game_process_name,
             file_path, thumbnail_path, created_at, duration_ms, width, height,
-            fps, size_bytes, codec, audio_tracks_json, cloud_share_json, notes
+            fps, size_bytes, codec, audio_tracks_json, cloud_share_json, notes, origin
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6,
             ?7, ?8, ?9, ?10, ?11, ?12,
-            ?13, ?14, ?15, ?16, ?17, ?18
+            ?13, ?14, ?15, ?16, ?17, ?18, ?19
         )
         ON CONFLICT(id) DO UPDATE SET
             title = excluded.title,
@@ -370,7 +533,8 @@ fn upsert_clip_sync(conn: &mut Connection, clip: &ClipMetadata) -> Result<()> {
             codec = excluded.codec,
             audio_tracks_json = excluded.audio_tracks_json,
             cloud_share_json = excluded.cloud_share_json,
-            notes = excluded.notes",
+            notes = excluded.notes,
+            origin = CASE WHEN ?20 THEN excluded.origin ELSE clips.origin END",
         params![
             id_str,
             clip.title,
@@ -390,6 +554,8 @@ fn upsert_clip_sync(conn: &mut Connection, clip: &ClipMetadata) -> Result<()> {
             audio_json,
             cloud_json,
             clip.notes,
+            insert_origin,
+            origin.is_some(),
         ],
     )
     .map_err(db_err)?;
@@ -434,8 +600,7 @@ fn get_clip_sync(conn: &Connection, id_str: &str) -> Result<Option<ClipMetadata>
 fn list_clips_sync(
     conn: &Connection,
     filter: &ClipFilter,
-    sort: ClipSort,
-    favorites_only: bool,
+    options: ClipListOptions,
 ) -> Result<Vec<ClipMetadata>> {
     let mut sql = String::from(SELECT_CLIP_COLUMNS);
     let mut conditions: Vec<String> = Vec::new();
@@ -457,8 +622,16 @@ fn list_clips_sync(
         values.push(Value::Text(game_id.to_string()));
     }
 
-    if favorites_only {
+    if options.favorites_only {
         conditions.push("c.is_favorite = 1".into());
+    }
+
+    if let Some(origin) = options.origin {
+        conditions.push("c.origin = ?".into());
+        values.push(Value::Text(origin.as_str().to_string()));
+    } else if options.exclude_samples {
+        conditions.push("c.origin != ?".into());
+        values.push(Value::Text(ClipOrigin::Sample.as_str().to_string()));
     }
 
     if let Some(query) = filter
@@ -483,7 +656,7 @@ fn list_clips_sync(
     }
 
     sql.push_str(" ORDER BY ");
-    sql.push_str(sort.order_by_clause());
+    sql.push_str(options.sort.order_by_clause());
 
     if let Some(limit) = filter.limit {
         sql.push_str(" LIMIT ?");

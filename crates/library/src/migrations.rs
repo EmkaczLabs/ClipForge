@@ -1,7 +1,7 @@
 use clipforge_common::{ClipForgeError, Result};
 use rusqlite::Connection;
 
-const LATEST_VERSION: u32 = 1;
+const LATEST_VERSION: u32 = 2;
 
 fn db_err(e: rusqlite::Error) -> ClipForgeError {
     ClipForgeError::Database(e.to_string())
@@ -20,6 +20,9 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     let current = current_schema_version(conn)?;
     if current < 1 {
         apply_v1(conn)?;
+    }
+    if current < 2 {
+        apply_v2(conn)?;
     }
 
     let _ = LATEST_VERSION;
@@ -73,6 +76,19 @@ fn apply_v1(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_clip_tags_tag ON clip_tags(tag);
 
         INSERT INTO schema_migrations (version) VALUES (1);
+        COMMIT;",
+    )
+    .map_err(db_err)?;
+
+    Ok(())
+}
+
+fn apply_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+        ALTER TABLE clips ADD COLUMN origin TEXT NOT NULL DEFAULT 'recorded';
+        CREATE INDEX IF NOT EXISTS idx_clips_origin ON clips(origin);
+        INSERT INTO schema_migrations (version) VALUES (2);
         COMMIT;",
     )
     .map_err(db_err)?;

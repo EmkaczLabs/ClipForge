@@ -204,3 +204,73 @@ async fn validation_rejects_bad_paths_and_ranges() {
         .unwrap_err();
     assert!(matches!(err, ClipForgeError::InvalidInput(_)));
 }
+
+#[tokio::test]
+async fn gsr_like_mkv_multi_audio_and_past_eof_thumbnail_fallback() {
+    let dir = TestDir::new("clipforge_media_mkv");
+    let mkv_path = dir.join("gsr_replay.mkv");
+
+    // Generate a GSR-like MKV: H.264 60fps + 2 Opus audio tracks (Game + Mic)
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=2:size=640x360:rate=60",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:duration=2",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-map",
+            "2:a:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libopus",
+            "-metadata:s:a:0",
+            "title=Desktop Audio",
+            "-metadata:s:a:1",
+            "title=Microphone",
+        ])
+        .arg(&mkv_path)
+        .status()
+        .expect("run ffmpeg to generate gsr-like mkv");
+    assert!(status.success(), "ffmpeg mkv generation failed");
+
+    let processor = FfmpegMediaProcessor::new();
+    let probe = processor.probe(&mkv_path).await.expect("probe mkv");
+    assert_eq!(probe.width, 640);
+    assert_eq!(probe.height, 360);
+    assert!((probe.fps - 60.0).abs() < 1.0);
+    assert!((1800..=2200).contains(&probe.duration_ms));
+    assert_eq!(probe.video_codec, "h264");
+    assert_eq!(probe.audio_tracks.len(), 2);
+    assert_eq!(probe.audio_tracks[0].codec, "opus");
+    assert_eq!(
+        probe.audio_tracks[0].label.as_deref(),
+        Some("Desktop Audio")
+    );
+    assert_eq!(probe.audio_tracks[1].label.as_deref(), Some("Microphone"));
+
+    // Past-EOF timestamp (60s on a 2s clip) should fall back to 0ms and produce a valid PNG
+    let thumb_path = dir.join("thumbs/past_eof.png");
+    processor
+        .generate_thumbnail(&mkv_path, 60_000, &thumb_path)
+        .await
+        .expect("thumbnail with past-eof fallback");
+    let png_bytes = std::fs::read(&thumb_path).expect("read fallback png");
+    assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+}

@@ -121,41 +121,32 @@ impl MediaProcessor for FfmpegMediaProcessor {
             "generating thumbnail"
         );
 
-        let result = Command::new(&self.ffmpeg_bin)
-            .arg("-y")
-            .arg("-v")
-            .arg("error")
-            .arg("-ss")
-            .arg(&ts)
-            .arg("-i")
-            .arg(&canonical_in)
-            .arg("-frames:v")
-            .arg("1")
-            .arg("-q:v")
-            .arg("2")
-            .arg(&temp_out)
-            .kill_on_drop(true)
-            .output()
-            .await;
+        run_thumbnail_ffmpeg(&self.ffmpeg_bin, &canonical_in, &ts, &temp_out).await?;
 
-        let output = match result {
-            Ok(out) => out,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&temp_out).await;
-                return Err(ClipForgeError::MediaFailed(format!(
-                    "failed to spawn ffmpeg ({}): {e}",
-                    self.ffmpeg_bin.display()
-                )));
-            }
-        };
+        let produced = tokio::fs::metadata(&temp_out)
+            .await
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
 
-        if !output.status.success() {
+        if !produced && at_ms > 0 {
             let _ = tokio::fs::remove_file(&temp_out).await;
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            debug!(
+                video = %canonical_in.display(),
+                at_ms,
+                "thumbnail timestamp produced no frame, retrying at 0ms"
+            );
+            run_thumbnail_ffmpeg(&self.ffmpeg_bin, &canonical_in, "0.000", &temp_out).await?;
+        }
+
+        let produced = tokio::fs::metadata(&temp_out)
+            .await
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        if !produced {
+            let _ = tokio::fs::remove_file(&temp_out).await;
             return Err(ClipForgeError::MediaFailed(format!(
-                "ffmpeg thumbnail failed with status {}: {}",
-                output.status,
-                stderr.trim()
+                "ffmpeg produced no thumbnail frame for {}",
+                canonical_in.display()
             )));
         }
 
@@ -351,6 +342,53 @@ fn validate_video_extension(path: &Path) -> Result<String> {
 fn make_temp_sibling(target: &Path, ext: &str) -> PathBuf {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(".clipforge_tmp_{}.{}", Uuid::new_v4(), ext))
+}
+
+async fn run_thumbnail_ffmpeg(
+    ffmpeg_bin: &Path,
+    canonical_in: &Path,
+    ts: &str,
+    temp_out: &Path,
+) -> Result<()> {
+    let result = Command::new(ffmpeg_bin)
+        .arg("-y")
+        .arg("-v")
+        .arg("error")
+        .arg("-ss")
+        .arg(ts)
+        .arg("-i")
+        .arg(canonical_in)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-q:v")
+        .arg("2")
+        .arg(temp_out)
+        .kill_on_drop(true)
+        .output()
+        .await;
+
+    let output = match result {
+        Ok(out) => out,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(temp_out).await;
+            return Err(ClipForgeError::MediaFailed(format!(
+                "failed to spawn ffmpeg ({}): {e}",
+                ffmpeg_bin.display()
+            )));
+        }
+    };
+
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(temp_out).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ClipForgeError::MediaFailed(format!(
+            "ffmpeg thumbnail failed with status {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+
+    Ok(())
 }
 
 /// Formats milliseconds as `seconds.millis` (e.g. `1500` -> `"1.500"`).

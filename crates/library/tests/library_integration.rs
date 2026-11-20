@@ -4,7 +4,7 @@ use chrono::{Duration, Utc};
 use clipforge_common::{
     AudioTrackInfo, ClipFilter, ClipForgeError, ClipId, ClipMetadata, ClipStore, GameInfo,
 };
-use clipforge_library::{ClipSort, DirectoryScanner, SqliteClipStore};
+use clipforge_library::{ClipListOptions, ClipOrigin, ClipSort, DirectoryScanner, SqliteClipStore};
 use uuid::Uuid;
 
 struct TestDir {
@@ -67,7 +67,7 @@ fn make_clip(
 #[tokio::test]
 async fn crud_tags_favorites_and_game_association() {
     let store = SqliteClipStore::open_in_memory().expect("open in-memory db");
-    assert_eq!(store.schema_version().await.unwrap(), 1);
+    assert_eq!(store.schema_version().await.unwrap(), 2);
 
     let game = GameInfo {
         id: "cs2".into(),
@@ -338,7 +338,7 @@ async fn file_backed_db_and_directory_scanner() {
     }
 
     let store = SqliteClipStore::open(&db_path).expect("reopen file db");
-    assert_eq!(store.schema_version().await.unwrap(), 1);
+    assert_eq!(store.schema_version().await.unwrap(), 2);
 
     let scanner = DirectoryScanner::new();
     let discovered = scanner
@@ -354,4 +354,127 @@ async fn file_backed_db_and_directory_scanner() {
         .await
         .expect("scan shallow");
     assert_eq!(shallow, vec![new_mp4]);
+}
+
+#[tokio::test]
+async fn clip_origin_distinguishes_samples_from_recordings_and_canonical_lookup() {
+    let dir = TestDir::new("clipforge_lib_origin");
+    let rec_file = dir.join("rec.mp4");
+    std::fs::write(&rec_file, b"mp4").unwrap();
+    let canon_rec = std::fs::canonicalize(&rec_file).unwrap();
+
+    let store = SqliteClipStore::open_in_memory().unwrap();
+
+    let recorded = make_clip(
+        "Real Recording",
+        canon_rec.clone(),
+        None,
+        10_000,
+        1_000_000,
+        10,
+        vec![],
+    );
+    let sample = make_clip(
+        "Sample Demo Clip",
+        PathBuf::from("clips/sample-demo.mp4"),
+        None,
+        42_000,
+        46_200_000,
+        20,
+        vec![],
+    );
+    let trimmed = make_clip(
+        "Trimmed Export",
+        dir.join("trimmed.mp4"),
+        None,
+        5_000,
+        500_000,
+        30,
+        vec![],
+    );
+
+    // Default upsert_clip assigns Recorded origin
+    store.upsert_clip(&recorded).await.unwrap();
+    assert_eq!(
+        store.get_origin(recorded.id).await.unwrap(),
+        ClipOrigin::Recorded
+    );
+
+    store
+        .upsert_clip_with_origin(&sample, ClipOrigin::Sample)
+        .await
+        .unwrap();
+    store
+        .upsert_clip_with_origin(&trimmed, ClipOrigin::Trimmed)
+        .await
+        .unwrap();
+
+    assert!(store.get_origin(sample.id).await.unwrap().is_sample());
+    assert!(!store.get_origin(trimmed.id).await.unwrap().is_sample());
+
+    // Plain upsert_clip preserves existing origin
+    let mut updated_sample = sample.clone();
+    updated_sample.title = "Sample Demo Clip (Renamed)".into();
+    store.upsert_clip(&updated_sample).await.unwrap();
+    assert_eq!(
+        store.get_origin(sample.id).await.unwrap(),
+        ClipOrigin::Sample
+    );
+
+    // Filter excluding samples
+    let non_samples = store
+        .list_clips_filtered(
+            &ClipFilter::default(),
+            ClipListOptions {
+                exclude_samples: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        non_samples.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![trimmed.id, recorded.id]
+    );
+
+    // Filter by exact origin
+    let only_samples = store
+        .list_clips_filtered(
+            &ClipFilter::default(),
+            ClipListOptions {
+                origin: Some(ClipOrigin::Sample),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(only_samples.len(), 1);
+    assert_eq!(only_samples[0].id, sample.id);
+
+    // list_origins returns all 3
+    let origins = store.list_origins().await.unwrap();
+    assert_eq!(origins.get(&recorded.id), Some(&ClipOrigin::Recorded));
+    assert_eq!(origins.get(&sample.id), Some(&ClipOrigin::Sample));
+    assert_eq!(origins.get(&trimmed.id), Some(&ClipOrigin::Trimmed));
+
+    // set_origin updates origin
+    assert!(
+        store
+            .set_origin(recorded.id, ClipOrigin::Imported)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.get_origin(recorded.id).await.unwrap(),
+        ClipOrigin::Imported
+    );
+
+    // get_by_file_path resolves non-canonical path with `.` segment
+    let non_canon = dir.path.join(".").join("rec.mp4");
+    let found = store
+        .get_by_file_path(&non_canon)
+        .await
+        .unwrap()
+        .expect("canonical fallback finds clip");
+    assert_eq!(found.id, recorded.id);
 }
