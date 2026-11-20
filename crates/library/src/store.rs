@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -60,13 +61,62 @@ impl FromStr for ClipOrigin {
     }
 }
 
+/// Directory name under each managed root where trashed clip files are stored.
+pub const TRASH_DIR_NAME: &str = ".clipforge_trash";
+
+/// Metadata describing when and from where a clip was moved to trash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashInfo {
+    pub trashed_at: DateTime<Utc>,
+    pub original_path: PathBuf,
+}
+
+/// Outcome of moving a clip to the application-managed trash directory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrashMoveResult {
+    pub clip: ClipMetadata,
+    pub trashed_at: DateTime<Utc>,
+    pub original_path: PathBuf,
+    pub file_moved: bool,
+}
+
+/// Outcome of restoring a trashed clip back to its original location.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreResult {
+    pub clip: ClipMetadata,
+    pub restored_path: PathBuf,
+    pub file_restored: bool,
+}
+
+/// Outcome of permanently deleting a clip from the library and (when managed) disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermanentDeleteResult {
+    pub deleted_from_db: bool,
+    pub file_deleted: bool,
+}
+
 /// Options for listing clips from [`SqliteClipStore`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipListOptions {
     pub sort: ClipSort,
     pub favorites_only: bool,
     pub origin: Option<ClipOrigin>,
     pub exclude_samples: bool,
+    pub trashed_only: bool,
+    pub exclude_trashed: bool,
+}
+
+impl Default for ClipListOptions {
+    fn default() -> Self {
+        Self {
+            sort: ClipSort::default(),
+            favorites_only: false,
+            origin: None,
+            exclude_samples: false,
+            trashed_only: false,
+            exclude_trashed: true,
+        }
+    }
 }
 
 /// Sort order for listing clips from [`SqliteClipStore`].
@@ -144,8 +194,7 @@ impl SqliteClipStore {
             ClipListOptions {
                 sort,
                 favorites_only,
-                origin: None,
-                exclude_samples: false,
+                ..Default::default()
             },
         )
         .await
@@ -231,6 +280,259 @@ impl SqliteClipStore {
             Ok(map)
         })
         .await
+    }
+
+    /// Renames an existing clip's title. Returns `true` if the clip exists.
+    pub async fn rename_clip(&self, id: ClipId, new_title: &str) -> Result<bool> {
+        let trimmed = new_title.trim();
+        if trimmed.is_empty() {
+            return Err(ClipForgeError::InvalidInput(
+                "clip title cannot be empty".into(),
+            ));
+        }
+        let id_str = id.to_string();
+        let title_owned = trimmed.to_string();
+        self.with_conn(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE clips SET title = ?1 WHERE id = ?2",
+                    params![title_owned, id_str],
+                )
+                .map_err(db_err)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    /// Returns trash metadata for `id` if the clip exists and is currently in trash.
+    pub async fn get_trash_info(&self, id: ClipId) -> Result<Option<TrashInfo>> {
+        let id_str = id.to_string();
+        self.with_conn(move |conn| {
+            let row: Option<(Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT trashed_at, original_path FROM clips WHERE id = ?1",
+                    params![id_str],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(db_err)?;
+
+            let Some((trashed_at_raw, original_path_raw)) = row else {
+                return Err(ClipForgeError::NotFound(format!("clip not found: {id}")));
+            };
+
+            match (trashed_at_raw, original_path_raw) {
+                (Some(ts), Some(orig)) => {
+                    let trashed_at = DateTime::parse_from_rfc3339(&ts)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(|e| {
+                            ClipForgeError::Database(format!("invalid trashed_at timestamp: {e}"))
+                        })?;
+                    Ok(Some(TrashInfo {
+                        trashed_at,
+                        original_path: PathBuf::from(orig),
+                    }))
+                }
+                _ => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// Moves a managed clip's file into `<managed_root>/.clipforge_trash` and marks it trashed in SQLite.
+    ///
+    /// Refuses `ClipOrigin::Sample` and `ClipOrigin::Imported` clips, as well as any path outside
+    /// `managed_roots`. If the source file is already missing on disk, marks the clip trashed in
+    /// SQLite with `file_moved = false`.
+    pub async fn move_to_trash(
+        &self,
+        id: ClipId,
+        managed_roots: &[PathBuf],
+    ) -> Result<TrashMoveResult> {
+        let id_str = id.to_string();
+        let (mut clip, origin, trashed_at_existing) = self
+            .with_conn(move |conn| get_clip_with_trash_state_sync(conn, &id_str))
+            .await?
+            .ok_or_else(|| ClipForgeError::NotFound(format!("clip not found: {id}")))?;
+
+        if trashed_at_existing.is_some() {
+            return Err(ClipForgeError::InvalidInput(format!(
+                "clip is already in trash: {id}"
+            )));
+        }
+
+        if matches!(origin, ClipOrigin::Sample | ClipOrigin::Imported) {
+            return Err(ClipForgeError::InvalidInput(format!(
+                "cannot move {} clip to trash: {id}",
+                origin.as_str()
+            )));
+        }
+
+        let roots_owned = managed_roots.to_vec();
+        let original_path = clip.file_path.clone();
+        let clip_id_str = clip.id.to_string();
+
+        let (new_file_path, file_moved) = tokio::task::spawn_blocking(move || {
+            let matched_root = resolve_managed_root(&original_path, &roots_owned)?;
+            let trash_dir = matched_root.join(TRASH_DIR_NAME);
+
+            match std::fs::symlink_metadata(&original_path) {
+                Ok(_) => {
+                    std::fs::create_dir_all(&trash_dir)?;
+                    let dest = unique_trash_dest(&trash_dir, &clip_id_str, &original_path);
+                    move_file_with_fallback(&original_path, &dest)?;
+                    Ok((dest, true))
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok((original_path, false)),
+                Err(e) => Err(ClipForgeError::Io(e)),
+            }
+        })
+        .await
+        .map_err(|e| ClipForgeError::Other(format!("trash move task panicked: {e}")))??;
+
+        let trashed_at = Utc::now();
+        let trashed_at_str = trashed_at.to_rfc3339();
+        let original_path = clip.file_path.clone();
+        let original_path_str = original_path.to_string_lossy().into_owned();
+        let new_file_path_str = new_file_path.to_string_lossy().into_owned();
+        let id_str = id.to_string();
+
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE clips SET file_path = ?1, original_path = ?2, trashed_at = ?3 WHERE id = ?4",
+                params![new_file_path_str, original_path_str, trashed_at_str, id_str],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await?;
+
+        clip.file_path = new_file_path;
+        Ok(TrashMoveResult {
+            clip,
+            trashed_at,
+            original_path,
+            file_moved,
+        })
+    }
+
+    /// Restores a trashed clip from the trash directory back to its `original_path` (or a unique
+    /// non-colliding path if `original_path` already exists).
+    pub async fn restore_from_trash(&self, id: ClipId) -> Result<RestoreResult> {
+        let id_str = id.to_string();
+        let (mut clip, _origin, trashed_info) = self
+            .with_conn(move |conn| get_clip_with_trash_state_sync(conn, &id_str))
+            .await?
+            .ok_or_else(|| ClipForgeError::NotFound(format!("clip not found: {id}")))?;
+
+        let Some((_trashed_at, original_path)) = trashed_info else {
+            return Err(ClipForgeError::InvalidInput(format!(
+                "clip is not in trash: {id}"
+            )));
+        };
+
+        let trash_path = clip.file_path.clone();
+        let target_base = original_path.clone();
+
+        let restored_path = tokio::task::spawn_blocking(move || {
+            match std::fs::symlink_metadata(&trash_path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    return Err(ClipForgeError::NotFound(format!(
+                        "trashed file missing on disk: {}",
+                        trash_path.display()
+                    )));
+                }
+                Err(e) => return Err(ClipForgeError::Io(e)),
+            }
+
+            if let Some(parent) = target_base.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let dest = unique_restore_dest(&target_base);
+            move_file_with_fallback(&trash_path, &dest)?;
+            Ok(dest)
+        })
+        .await
+        .map_err(|e| ClipForgeError::Other(format!("restore task panicked: {e}")))??;
+
+        let restored_path_str = restored_path.to_string_lossy().into_owned();
+        let id_str = id.to_string();
+
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE clips SET file_path = ?1, original_path = NULL, trashed_at = NULL WHERE id = ?2",
+                params![restored_path_str, id_str],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await?;
+
+        clip.file_path = restored_path.clone();
+        Ok(RestoreResult {
+            clip,
+            restored_path,
+            file_restored: true,
+        })
+    }
+
+    /// Permanently deletes a clip from SQLite and (only for `Recorded`/`Trimmed` clips inside
+    /// `managed_roots` or `.clipforge_trash`) removes its file from disk.
+    ///
+    /// For `Sample` and `Imported` clips, only the SQLite row is removed; the file on disk is
+    /// never deleted.
+    pub async fn permanently_delete(
+        &self,
+        id: ClipId,
+        managed_roots: &[PathBuf],
+    ) -> Result<PermanentDeleteResult> {
+        let id_str = id.to_string();
+        let state = self
+            .with_conn(move |conn| get_clip_with_trash_state_sync(conn, &id_str))
+            .await?;
+
+        let Some((clip, origin, _trashed_info)) = state else {
+            return Ok(PermanentDeleteResult {
+                deleted_from_db: false,
+                file_deleted: false,
+            });
+        };
+
+        let file_deleted = if matches!(origin, ClipOrigin::Sample | ClipOrigin::Imported) {
+            false
+        } else {
+            let roots_owned = managed_roots.to_vec();
+            let file_path = clip.file_path.clone();
+            tokio::task::spawn_blocking(move || {
+                resolve_managed_root(&file_path, &roots_owned)?;
+                match std::fs::remove_file(&file_path) {
+                    Ok(()) => Ok(true),
+                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+                    Err(e) => Err(ClipForgeError::Io(e)),
+                }
+            })
+            .await
+            .map_err(|e| ClipForgeError::Other(format!("delete task panicked: {e}")))??
+        };
+
+        let id_str = id.to_string();
+        let deleted_from_db = self
+            .with_conn(move |conn| {
+                let changed = conn
+                    .execute("DELETE FROM clips WHERE id = ?1", params![id_str])
+                    .map_err(db_err)?;
+                Ok(changed > 0)
+            })
+            .await?;
+
+        Ok(PermanentDeleteResult {
+            deleted_from_db,
+            file_deleted,
+        })
     }
 
     /// Marks or unmarks a clip as a favorite. Returns `true` if the clip exists.
@@ -622,6 +924,12 @@ fn list_clips_sync(
         values.push(Value::Text(game_id.to_string()));
     }
 
+    if options.trashed_only {
+        conditions.push("c.trashed_at IS NOT NULL".into());
+    } else if options.exclude_trashed {
+        conditions.push("c.trashed_at IS NULL".into());
+    }
+
     if options.favorites_only {
         conditions.push("c.is_favorite = 1".into());
     }
@@ -788,4 +1096,223 @@ fn escape_like(input: &str) -> String {
 
 fn db_err(e: rusqlite::Error) -> ClipForgeError {
     ClipForgeError::Database(e.to_string())
+}
+
+type ClipWithTrashState = (ClipMetadata, ClipOrigin, Option<(DateTime<Utc>, PathBuf)>);
+
+fn get_clip_with_trash_state_sync(
+    conn: &Connection,
+    id_str: &str,
+) -> Result<Option<ClipWithTrashState>> {
+    let sql = "
+        SELECT
+            c.id,
+            c.title,
+            c.game_id,
+            c.game_name,
+            c.game_executable,
+            c.game_process_name,
+            c.file_path,
+            c.thumbnail_path,
+            c.created_at,
+            c.duration_ms,
+            c.width,
+            c.height,
+            c.fps,
+            c.size_bytes,
+            c.codec,
+            c.audio_tracks_json,
+            c.cloud_share_json,
+            c.notes,
+            c.origin,
+            c.trashed_at,
+            c.original_path
+        FROM clips c
+        WHERE c.id = ?1";
+
+    let row_opt = conn
+        .query_row(sql, params![id_str], |row| {
+            let clip = row_to_clip_base(row)?;
+            let origin_str: String = row.get(18)?;
+            let trashed_at_str: Option<String> = row.get(19)?;
+            let original_path_str: Option<String> = row.get(20)?;
+            Ok((clip, origin_str, trashed_at_str, original_path_str))
+        })
+        .optional()
+        .map_err(db_err)?;
+
+    let Some((mut clip, origin_str, trashed_at_str, original_path_str)) = row_opt else {
+        return Ok(None);
+    };
+
+    clip.tags = load_tags_for_clip(conn, id_str)?;
+    let origin = origin_str.parse::<ClipOrigin>()?;
+    let trash_state = match (trashed_at_str, original_path_str) {
+        (Some(ts), Some(orig)) => {
+            let dt = DateTime::parse_from_rfc3339(&ts)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| {
+                    ClipForgeError::Database(format!("invalid trashed_at timestamp: {e}"))
+                })?;
+            Some((dt, PathBuf::from(orig)))
+        }
+        _ => None,
+    };
+
+    Ok(Some((clip, origin, trash_state)))
+}
+
+fn resolve_managed_root(path: &Path, managed_roots: &[PathBuf]) -> Result<PathBuf> {
+    if managed_roots.is_empty() {
+        return Err(ClipForgeError::InvalidInput(
+            "no managed roots configured".into(),
+        ));
+    }
+
+    let resolved_path = resolve_path_for_boundary_check(path)?;
+    for root in managed_roots {
+        let Ok(canon_root) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        if !canon_root.is_dir() {
+            continue;
+        }
+        if resolved_path != canon_root && resolved_path.starts_with(&canon_root) {
+            return Ok(canon_root);
+        }
+    }
+
+    Err(ClipForgeError::InvalidInput(format!(
+        "clip path is outside managed roots: {}",
+        path.display()
+    )))
+}
+
+fn resolve_path_for_boundary_check(path: &Path) -> Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => std::fs::canonicalize(path).map_err(ClipForgeError::Io),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let mut trailing: Vec<std::ffi::OsString> = Vec::new();
+            let mut cursor = Some(path);
+            while let Some(cur) = cursor {
+                match std::fs::symlink_metadata(cur) {
+                    Ok(_) => {
+                        let mut base = std::fs::canonicalize(cur)?;
+                        for seg in trailing.into_iter().rev() {
+                            base.push(seg);
+                        }
+                        return Ok(base);
+                    }
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        let Some(name) = cur.file_name() else {
+                            break;
+                        };
+                        if name == ".." || name == "." {
+                            return Err(ClipForgeError::InvalidInput(format!(
+                                "invalid path traversal in clip path: {}",
+                                path.display()
+                            )));
+                        }
+                        trailing.push(name.to_os_string());
+                        cursor = cur.parent();
+                    }
+                    Err(err) => return Err(ClipForgeError::Io(err)),
+                }
+            }
+
+            // Fallback: reject any `..` components even if no ancestor existed.
+            for comp in path.components() {
+                if matches!(comp, Component::ParentDir) {
+                    return Err(ClipForgeError::InvalidInput(format!(
+                        "invalid path traversal in clip path: {}",
+                        path.display()
+                    )));
+                }
+            }
+            Err(ClipForgeError::InvalidInput(format!(
+                "clip path has no existing managed ancestor: {}",
+                path.display()
+            )))
+        }
+        Err(e) => Err(ClipForgeError::Io(e)),
+    }
+}
+
+fn unique_trash_dest(trash_dir: &Path, clip_id: &str, original_path: &Path) -> PathBuf {
+    let file_name = original_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("clip");
+
+    let candidate = trash_dir.join(format!("{clip_id}-{file_name}"));
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("clip");
+    let ext = Path::new(file_name).extension().and_then(|e| e.to_str());
+
+    let mut counter = 1u32;
+    loop {
+        let name = match ext {
+            Some(ext) => format!("{clip_id}-{stem}-{counter}.{ext}"),
+            None => format!("{clip_id}-{stem}-{counter}"),
+        };
+        let next = trash_dir.join(name);
+        if !next.exists() {
+            return next;
+        }
+        counter += 1;
+    }
+}
+
+fn unique_restore_dest(target: &Path) -> PathBuf {
+    if !target.exists() {
+        return target.to_path_buf();
+    }
+
+    let parent = target.parent().unwrap_or_else(|| Path::new(""));
+    let stem = target
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("clip");
+    let ext = target.extension().and_then(|e| e.to_str());
+
+    let mut counter = 1u32;
+    loop {
+        let name = match ext {
+            Some(ext) => format!("{stem} (restored {counter}).{ext}"),
+            None => format!("{stem} (restored {counter})"),
+        };
+        let next = parent.join(name);
+        if !next.exists() {
+            return next;
+        }
+        counter += 1;
+    }
+}
+
+fn move_file_with_fallback(src: &Path, dest: &Path) -> Result<()> {
+    match std::fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if is_cross_device_error(&e) => {
+            std::fs::copy(src, dest)?;
+            if let Err(remove_err) = std::fs::remove_file(src) {
+                let _ = std::fs::remove_file(dest);
+                return Err(ClipForgeError::Io(remove_err));
+            }
+            Ok(())
+        }
+        Err(e) => Err(ClipForgeError::Io(e)),
+    }
+}
+
+fn is_cross_device_error(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::CrossesDevices || err.raw_os_error() == Some(18)
 }
