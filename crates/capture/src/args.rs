@@ -6,6 +6,8 @@ use clipforge_common::{
     QualityPreset, Result, VideoCodec,
 };
 
+use crate::audio::{AudioRoutingPlan, resolve_audio_routing, validate_safe_audio_token};
+
 /// Minimum replay buffer duration supported by `gpu-screen-recorder` (seconds).
 pub const MIN_REPLAY_SECS: u32 = 2;
 /// Maximum replay buffer duration supported by `gpu-screen-recorder` (seconds).
@@ -52,25 +54,13 @@ pub fn validate_config(config: &CaptureConfig) -> Result<()> {
         ));
     }
 
-    for src in &config.audio_sources {
-        validate_safe_token(src, "audio source")?;
-    }
+    resolve_audio_routing(&config.audio_sources)?;
 
     Ok(())
 }
 
 fn validate_safe_token(value: &str, label: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        return Err(ClipForgeError::InvalidInput(format!(
-            "{label} must not be empty"
-        )));
-    }
-    if value.contains('\0') || value.contains('\n') || value.contains('\r') {
-        return Err(ClipForgeError::InvalidInput(format!(
-            "{label} contains invalid control characters"
-        )));
-    }
-    Ok(())
+    validate_safe_audio_token(value, label)
 }
 
 fn push_pair(args: &mut Vec<OsString>, flag: &str, value: impl Into<OsString>) {
@@ -78,7 +68,11 @@ fn push_pair(args: &mut Vec<OsString>, flag: &str, value: impl Into<OsString>) {
     args.push(value.into());
 }
 
-fn append_common_args(args: &mut Vec<OsString>, config: &CaptureConfig) {
+fn append_common_args(
+    args: &mut Vec<OsString>,
+    config: &CaptureConfig,
+    routing: &AudioRoutingPlan,
+) {
     match &config.capture_target {
         CaptureTarget::PrimaryScreen => push_pair(args, "-w", "screen"),
         CaptureTarget::Monitor(name) => push_pair(args, "-w", name),
@@ -126,8 +120,8 @@ fn append_common_args(args: &mut Vec<OsString>, config: &CaptureConfig) {
     push_pair(args, "-encoder", encoder_flag(config.encoder));
     push_pair(args, "-f", config.fps.to_string());
 
-    for src in &config.audio_sources {
-        push_pair(args, "-a", src);
+    for gsr_arg in &routing.gsr_audio_args {
+        push_pair(args, "-a", gsr_arg);
     }
 }
 
@@ -138,6 +132,7 @@ pub fn build_replay_args(
     ipc_socket: Option<&Path>,
 ) -> Result<Vec<OsString>> {
     validate_config(config)?;
+    let routing = resolve_audio_routing(&config.audio_sources)?;
 
     if !(MIN_REPLAY_SECS..=MAX_REPLAY_SECS).contains(&config.replay_buffer_secs) {
         return Err(ClipForgeError::InvalidInput(format!(
@@ -147,7 +142,7 @@ pub fn build_replay_args(
     }
 
     let mut args = Vec::new();
-    append_common_args(&mut args, config);
+    append_common_args(&mut args, config, &routing);
 
     push_pair(&mut args, "-r", config.replay_buffer_secs.to_string());
     push_pair(
@@ -175,6 +170,7 @@ pub fn build_replay_args(
 /// Builds validated CLI arguments for `gpu-screen-recorder` in standard recording mode.
 pub fn build_recording_args(config: &CaptureConfig, output_file: &Path) -> Result<Vec<OsString>> {
     validate_config(config)?;
+    let routing = resolve_audio_routing(&config.audio_sources)?;
 
     if output_file.as_os_str().is_empty() {
         return Err(ClipForgeError::InvalidInput(
@@ -183,7 +179,7 @@ pub fn build_recording_args(config: &CaptureConfig, output_file: &Path) -> Resul
     }
 
     let mut args = Vec::new();
-    append_common_args(&mut args, config);
+    append_common_args(&mut args, config, &routing);
     push_pair(&mut args, "-o", output_file.as_os_str());
     Ok(args)
 }
@@ -290,8 +286,33 @@ mod tests {
                 .any(|w| w == ["-restart-replay-on-save", "yes"])
         );
         assert!(args.windows(2).any(|w| w == ["-sc", "/tmp/on_save.sh"]));
-        assert!(args.windows(2).any(|w| w == ["-a", "default_output"]));
-        assert!(args.windows(2).any(|w| w == ["-a", "default_input"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-a", "default_output|default_input"])
+        );
+    }
+
+    #[test]
+    fn recording_args_explicit_tracks_preserve_separate_streams() {
+        let cfg = CaptureConfig {
+            audio_sources: vec![
+                "t1:default_output".to_string(),
+                "t2:default_input".to_string(),
+                "t3:easyeffects_source".to_string(),
+            ],
+            ..CaptureConfig::default()
+        };
+        let args =
+            to_strings(&build_recording_args(&cfg, Path::new("/tmp/out.mp4")).expect("valid"));
+        let a_flags: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-a")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(
+            a_flags,
+            vec!["default_output", "default_input", "easyeffects_source"]
+        );
     }
 
     #[test]

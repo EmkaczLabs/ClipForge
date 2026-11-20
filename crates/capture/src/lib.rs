@@ -1,11 +1,16 @@
 //! Capture backend crate (GPU Screen Recorder integration & global hotkeys).
 
 pub mod args;
+pub mod audio;
 pub mod backend;
 pub mod discovery;
 pub mod hotkey;
 
 pub use args::{build_recording_args, build_replay_args, validate_config};
+pub use audio::{
+    AudioRoutingPlan, AudioTrackTarget, ResolvedAudioTrack, format_routed_audio_source,
+    is_mic_source, is_system_source, parse_routed_audio_source, resolve_audio_routing,
+};
 pub use backend::GsrCaptureBackend;
 pub use discovery::{
     AudioDeviceInfo, GSR_FLATPAK_ID, GSR_INSTALL_HELP, GsrCapabilities, GsrInstallation,

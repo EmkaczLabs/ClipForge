@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::args::{build_recording_args, build_replay_args, container_flag};
+use crate::audio::resolve_audio_routing;
 use crate::discovery::{GsrInstallation, detect_gsr};
 
 const SAVE_REPLAY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -190,9 +191,13 @@ impl CaptureBackend for GsrCaptureBackend {
             buffer_secs: config.replay_buffer_secs,
         };
         self.set_status(new_status).await;
+        let routing = resolve_audio_routing(&config.audio_sources)?;
         info!(
             pid,
             buffer_secs = config.replay_buffer_secs,
+            audio_args = ?routing.gsr_audio_args,
+            includes_system = routing.includes_system,
+            includes_mic = routing.includes_mic,
             "GSR replay buffer started"
         );
         Ok(())
@@ -305,7 +310,15 @@ impl CaptureBackend for GsrCaptureBackend {
             paused: false,
         };
         self.set_status(new_status).await;
-        info!(pid, path = %output_file.display(), "GSR recording started");
+        let routing = resolve_audio_routing(&config.audio_sources)?;
+        info!(
+            pid,
+            path = %output_file.display(),
+            audio_args = ?routing.gsr_audio_args,
+            includes_system = routing.includes_system,
+            includes_mic = routing.includes_mic,
+            "GSR recording started"
+        );
         Ok(())
     }
 
