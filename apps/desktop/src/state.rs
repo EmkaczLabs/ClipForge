@@ -3,12 +3,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use clipforge_cloud_client::ShareVisibility;
 use clipforge_common::{
     AppConfig, AudioTrackInfo, CaptureEvent, CaptureStatus, CaptureTarget, ClipId, ClipMetadata,
     CloudShareInfo, ContainerFormat, EncoderMode, GameInfo, QualityPreset, TrimRequest, VideoCodec,
 };
+use clipforge_library::{ClipOrigin, ClipSort};
 
 use crate::config::load_app_config;
 use crate::worker::{DependencyStatus, WorkerCommand, WorkerEvent, WorkerHandle};
@@ -71,8 +72,28 @@ pub enum LibraryViewMode {
 pub enum LibraryFilter {
     #[default]
     All,
+    Recorded,
+    Trimmed,
     Favorites,
     Shared,
+    Trash,
+}
+
+/// Pending destructive/trash confirmation action in the Clip Library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmAction {
+    MoveToTrash(Vec<ClipId>),
+    RestoreFromTrash(Vec<ClipId>),
+    PermanentlyDelete(Vec<ClipId>),
+}
+
+/// Floating context menu state for a clip card or row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryContextMenu {
+    pub clip_id: ClipId,
+    pub x: f32,
+    pub y: f32,
+    pub is_trashed: bool,
 }
 
 /// Upload item state in the Uploads view.
@@ -163,12 +184,23 @@ pub struct AppState {
     pub capture_status: CaptureStatus,
     pub deps: DependencyStatus,
     pub clips: Vec<ClipMetadata>,
+    pub trashed_clips: Vec<ClipMetadata>,
     pub using_sample_clips: bool,
     pub favorite_ids: HashSet<ClipId>,
+    pub clip_origins: HashMap<ClipId, ClipOrigin>,
+    pub trashed_at: HashMap<ClipId, DateTime<Utc>>,
     pub library_mode: LibraryViewMode,
     pub library_filter: LibraryFilter,
+    pub library_sort: ClipSort,
+    pub library_search: rune::TextEdit,
     pub library_game_filter: Option<String>,
     pub library_thumbs: HashMap<ClipId, rune::Pixels>,
+    pub selected_clip_ids: HashSet<ClipId>,
+    pub selection_anchor: Option<ClipId>,
+    pub pending_confirm: Option<ConfirmAction>,
+    pub renaming_clip_id: Option<ClipId>,
+    pub rename_edit: rune::TextEdit,
+    pub context_menu: Option<LibraryContextMenu>,
     pub editor: EditorState,
     pub uploads: Vec<UploadEntry>,
     pub hotkeys: HotkeyConfig,
@@ -225,12 +257,23 @@ impl Default for AppState {
             capture_status: CaptureStatus::Idle,
             deps: DependencyStatus::default(),
             clips,
+            trashed_clips: Vec::new(),
             using_sample_clips: true,
             favorite_ids,
+            clip_origins: HashMap::new(),
+            trashed_at: HashMap::new(),
             library_mode: LibraryViewMode::Grid,
             library_filter: LibraryFilter::All,
+            library_sort: ClipSort::CreatedDesc,
+            library_search: rune::TextEdit::default(),
             library_game_filter: None,
             library_thumbs: HashMap::new(),
+            selected_clip_ids: first_clip.iter().map(|c| c.id).collect(),
+            selection_anchor: first_clip.map(|c| c.id),
+            pending_confirm: None,
+            renaming_clip_id: None,
+            rename_edit: rune::TextEdit::default(),
+            context_menu: None,
             editor,
             uploads,
             hotkeys: HotkeyConfig::default(),
@@ -245,6 +288,141 @@ impl AppState {
     pub fn selected_clip(&self) -> Option<&ClipMetadata> {
         let id = self.editor.selected_clip_id?;
         self.clips.iter().find(|c| c.id == id)
+    }
+
+    /// Finds a clip by ID across active and trashed clips.
+    pub fn find_clip(&self, id: ClipId) -> Option<&ClipMetadata> {
+        self.clips
+            .iter()
+            .chain(self.trashed_clips.iter())
+            .find(|c| c.id == id)
+    }
+
+    /// Returns the currently selected clip for the Library detail panel (including Trash view).
+    pub fn selected_library_clip(&self) -> Option<&ClipMetadata> {
+        let id = self.editor.selected_clip_id?;
+        if self.library_filter == LibraryFilter::Trash {
+            self.trashed_clips.iter().find(|c| c.id == id)
+        } else {
+            self.clips.iter().find(|c| c.id == id)
+        }
+    }
+
+    /// Returns the origin of a clip (using SQLite origin map with metadata fallback).
+    pub fn clip_origin(&self, clip: &ClipMetadata) -> ClipOrigin {
+        if let Some(origin) = self.clip_origins.get(&clip.id) {
+            return *origin;
+        }
+        if is_sample_clip(clip) {
+            ClipOrigin::Sample
+        } else if clip.tags.iter().any(|t| t == "trimmed")
+            || clip
+                .file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.ends_with("-trim"))
+        {
+            ClipOrigin::Trimmed
+        } else {
+            ClipOrigin::Recorded
+        }
+    }
+
+    /// Handles a clip card/row click with optional Ctrl/Shift modifiers for multi-selection.
+    pub fn select_clip_with_mods(&mut self, id: ClipId, mods: rune::Mods) {
+        self.context_menu = None;
+        if mods.shift {
+            let order: Vec<ClipId> = self.filtered_clips().into_iter().map(|c| c.id).collect();
+            let anchor = self
+                .selection_anchor
+                .or(self.editor.selected_clip_id)
+                .unwrap_or(id);
+            if let (Some(a_idx), Some(b_idx)) = (
+                order.iter().position(|cid| *cid == anchor),
+                order.iter().position(|cid| *cid == id),
+            ) {
+                if !(mods.ctrl || mods.cmd) {
+                    self.selected_clip_ids.clear();
+                }
+                let (lo, hi) = if a_idx <= b_idx {
+                    (a_idx, b_idx)
+                } else {
+                    (b_idx, a_idx)
+                };
+                for cid in &order[lo..=hi] {
+                    self.selected_clip_ids.insert(*cid);
+                }
+            } else {
+                self.selected_clip_ids.insert(id);
+                self.selection_anchor = Some(id);
+            }
+            if self.library_filter == LibraryFilter::Trash {
+                self.editor.selected_clip_id = Some(id);
+            } else {
+                self.select_clip(id);
+            }
+            return;
+        }
+
+        if mods.ctrl || mods.cmd {
+            self.selection_anchor = Some(id);
+            if self.selected_clip_ids.contains(&id) {
+                self.selected_clip_ids.remove(&id);
+                if self.editor.selected_clip_id == Some(id) {
+                    let next = self.selected_clip_ids.iter().copied().next();
+                    if let Some(next_id) = next {
+                        if self.library_filter == LibraryFilter::Trash {
+                            self.editor.selected_clip_id = Some(next_id);
+                        } else {
+                            self.select_clip(next_id);
+                        }
+                    } else {
+                        self.editor.selected_clip_id = None;
+                    }
+                }
+            } else {
+                self.selected_clip_ids.insert(id);
+                if self.library_filter == LibraryFilter::Trash {
+                    self.editor.selected_clip_id = Some(id);
+                } else {
+                    self.select_clip(id);
+                }
+            }
+            return;
+        }
+
+        self.selected_clip_ids.clear();
+        self.selected_clip_ids.insert(id);
+        self.selection_anchor = Some(id);
+        if self.library_filter == LibraryFilter::Trash {
+            self.editor.selected_clip_id = Some(id);
+        } else {
+            self.select_clip(id);
+        }
+    }
+
+    /// Toggles a clip's membership in the multi-selection set (explicit checkbox fallback).
+    pub fn toggle_clip_in_selection(&mut self, id: ClipId) {
+        self.selection_anchor = Some(id);
+        if self.selected_clip_ids.contains(&id) {
+            self.selected_clip_ids.remove(&id);
+        } else {
+            self.selected_clip_ids.insert(id);
+        }
+    }
+
+    /// Selects all clips matching the active library filter.
+    pub fn select_all_filtered(&mut self) {
+        let ids: Vec<ClipId> = self.filtered_clips().into_iter().map(|c| c.id).collect();
+        for id in ids {
+            self.selected_clip_ids.insert(id);
+        }
+    }
+
+    /// Clears the multi-selection set.
+    pub fn clear_selection(&mut self) {
+        self.selected_clip_ids.clear();
+        self.selection_anchor = None;
     }
 
     /// Selects a clip (synchronized across Library and Editor) without switching views.
@@ -443,12 +621,291 @@ impl AppState {
         }
     }
 
-    /// Returns filtered clips for the Clip Library view.
+    /// Toggles favorite status for all selected clips (favorites all if any is unfavorited, else unfavorites all).
+    pub fn toggle_favorite_bulk(&mut self, ids: Vec<ClipId>) {
+        if ids.is_empty() {
+            return;
+        }
+        let target_fav = ids.iter().any(|id| !self.favorite_ids.contains(id));
+        for id in &ids {
+            if target_fav {
+                self.favorite_ids.insert(*id);
+            } else {
+                self.favorite_ids.remove(id);
+            }
+        }
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::SetFavoriteBulk {
+                ids,
+                favorite: target_fav,
+            });
+        } else {
+            self.status_banner = Some(if target_fav {
+                "Added selected clips to Favorites".to_string()
+            } else {
+                "Removed selected clips from Favorites".to_string()
+            });
+        }
+    }
+
+    /// Requests confirmation before moving clips to Trash.
+    pub fn request_move_to_trash(&mut self, ids: Vec<ClipId>) {
+        self.context_menu = None;
+        let trashable: Vec<ClipId> = ids
+            .into_iter()
+            .filter(|id| {
+                self.find_clip(*id).is_some_and(|c| {
+                    !matches!(
+                        self.clip_origin(c),
+                        ClipOrigin::Sample | ClipOrigin::Imported
+                    )
+                })
+            })
+            .collect();
+        if trashable.is_empty() {
+            self.status_banner = Some(
+                "Sample or external imported clips cannot be moved to Trash — use Delete Permanently to remove from library"
+                    .to_string(),
+            );
+            return;
+        }
+        self.pending_confirm = Some(ConfirmAction::MoveToTrash(trashable));
+    }
+
+    /// Requests confirmation before restoring clips from Trash.
+    pub fn request_restore_from_trash(&mut self, ids: Vec<ClipId>) {
+        self.context_menu = None;
+        if ids.is_empty() {
+            return;
+        }
+        self.pending_confirm = Some(ConfirmAction::RestoreFromTrash(ids));
+    }
+
+    /// Requests confirmation before permanently deleting clips.
+    pub fn request_permanent_delete(&mut self, ids: Vec<ClipId>) {
+        self.context_menu = None;
+        if ids.is_empty() {
+            return;
+        }
+        self.pending_confirm = Some(ConfirmAction::PermanentlyDelete(ids));
+    }
+
+    /// Cancels any pending trash/restore/delete confirmation.
+    pub fn cancel_confirmation(&mut self) {
+        self.pending_confirm = None;
+    }
+
+    /// Executes the pending trash/restore/delete confirmation and updates UI & stats immediately.
+    pub fn confirm_pending_action(&mut self) {
+        let Some(action) = self.pending_confirm.take() else {
+            return;
+        };
+        match action {
+            ConfirmAction::MoveToTrash(ids) => {
+                self.close_active_player_if_affected(&ids);
+                let id_set: HashSet<ClipId> = ids.iter().copied().collect();
+                let mut remaining = Vec::with_capacity(self.clips.len());
+                let now = Utc::now();
+                let mut moved_count = 0usize;
+                for clip in self.clips.drain(..) {
+                    if id_set.contains(&clip.id) {
+                        self.trashed_at.insert(clip.id, now);
+                        self.trashed_clips.push(clip);
+                        moved_count += 1;
+                    } else {
+                        remaining.push(clip);
+                    }
+                }
+                self.clips = remaining;
+                for id in &ids {
+                    self.selected_clip_ids.remove(id);
+                }
+                self.ensure_valid_selection_after_removal();
+                if let Some(worker) = &self.worker {
+                    worker.send(WorkerCommand::MoveToTrash {
+                        ids,
+                        managed_roots: vec![self.config.clips_dir.clone()],
+                    });
+                } else {
+                    self.status_banner = Some(format!("Moved {moved_count} clip(s) to Trash"));
+                }
+            }
+            ConfirmAction::RestoreFromTrash(ids) => {
+                let id_set: HashSet<ClipId> = ids.iter().copied().collect();
+                let mut remaining_trash = Vec::with_capacity(self.trashed_clips.len());
+                let mut restored_count = 0usize;
+                for clip in self.trashed_clips.drain(..) {
+                    if id_set.contains(&clip.id) {
+                        self.trashed_at.remove(&clip.id);
+                        self.clips.push(clip);
+                        restored_count += 1;
+                    } else {
+                        remaining_trash.push(clip);
+                    }
+                }
+                self.trashed_clips = remaining_trash;
+                for id in &ids {
+                    self.selected_clip_ids.remove(id);
+                }
+                if let Some(worker) = &self.worker {
+                    worker.send(WorkerCommand::RestoreFromTrash { ids });
+                } else {
+                    self.status_banner =
+                        Some(format!("Restored {restored_count} clip(s) from Trash"));
+                }
+            }
+            ConfirmAction::PermanentlyDelete(ids) => {
+                self.close_active_player_if_affected(&ids);
+                let id_set: HashSet<ClipId> = ids.iter().copied().collect();
+                let before = self.clips.len() + self.trashed_clips.len();
+                self.clips.retain(|c| !id_set.contains(&c.id));
+                self.trashed_clips.retain(|c| !id_set.contains(&c.id));
+                let after = self.clips.len() + self.trashed_clips.len();
+                let deleted_count = before.saturating_sub(after);
+                for id in &ids {
+                    self.favorite_ids.remove(id);
+                    self.selected_clip_ids.remove(id);
+                    self.library_thumbs.remove(id);
+                    self.trashed_at.remove(id);
+                    self.clip_origins.remove(id);
+                }
+                self.ensure_valid_selection_after_removal();
+                if let Some(worker) = &self.worker {
+                    worker.send(WorkerCommand::PermanentlyDelete {
+                        ids,
+                        managed_roots: vec![self.config.clips_dir.clone()],
+                    });
+                } else {
+                    self.status_banner =
+                        Some(format!("Permanently deleted {deleted_count} clip(s)"));
+                }
+            }
+        }
+    }
+
+    fn close_active_player_if_affected(&mut self, ids: &[ClipId]) {
+        if let Some(sel_id) = self.editor.selected_clip_id
+            && ids.contains(&sel_id)
+        {
+            self.editor.playing = false;
+            self.editor.has_video_frame = false;
+            self.editor.decoder_error = None;
+            self.editor.timeline_thumbs.clear();
+            self.editor.selected_clip_id = None;
+            if let Some(worker) = &self.worker {
+                worker.send(WorkerCommand::ClosePlayer);
+            }
+        }
+    }
+
+    fn ensure_valid_selection_after_removal(&mut self) {
+        if let Some(sel_id) = self.editor.selected_clip_id
+            && !self.clips.iter().any(|c| c.id == sel_id)
+        {
+            self.editor.selected_clip_id = None;
+        }
+    }
+
+    /// Starts inline rename for the given clip.
+    pub fn begin_rename(&mut self, id: ClipId) {
+        self.context_menu = None;
+        let Some(title) = self.find_clip(id).map(|c| c.title.clone()) else {
+            return;
+        };
+        self.renaming_clip_id = Some(id);
+        let mut edit = rune::TextEdit::new(title);
+        edit.focused = true;
+        self.rename_edit = edit;
+    }
+
+    /// Cancels inline rename without saving.
+    pub fn cancel_rename(&mut self) {
+        self.renaming_clip_id = None;
+        self.rename_edit = rune::TextEdit::default();
+    }
+
+    /// Commits the inline rename to state and SQLite.
+    pub fn commit_rename(&mut self) {
+        let Some(id) = self.renaming_clip_id else {
+            return;
+        };
+        let trimmed = self.rename_edit.text.trim().to_string();
+        if trimmed.is_empty() {
+            self.status_banner = Some("Clip title cannot be empty".to_string());
+            return;
+        }
+        if let Some(clip) = self
+            .clips
+            .iter_mut()
+            .chain(self.trashed_clips.iter_mut())
+            .find(|c| c.id == id)
+        {
+            clip.title = trimmed.clone();
+        }
+        self.renaming_clip_id = None;
+        self.rename_edit = rune::TextEdit::default();
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::RenameClip { id, title: trimmed });
+        } else {
+            self.status_banner = Some(format!("Renamed clip to \"{trimmed}\""));
+        }
+    }
+
+    /// Opens the clip's containing folder in the system file manager.
+    pub fn open_containing_folder(&mut self, id: ClipId) {
+        self.context_menu = None;
+        let Some(clip) = self.find_clip(id).cloned() else {
+            return;
+        };
+        if is_sample_clip(&clip) {
+            self.status_banner = Some("Sample clips do not have a folder on disk".to_string());
+            return;
+        }
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::OpenContainingFolder(clip.file_path));
+        } else {
+            let valid = clip.file_path.parent().is_some_and(|p| p.is_dir());
+            self.status_banner = Some(if valid {
+                format!("Opened folder for {}", clip.title)
+            } else {
+                format!(
+                    "Containing folder does not exist: {}",
+                    clip.file_path.display()
+                )
+            });
+        }
+    }
+
+    /// Opens the floating context menu for a clip at window coordinates `(x, y)`.
+    pub fn open_context_menu(&mut self, clip_id: ClipId, x: f32, y: f32) {
+        let is_trashed = self.trashed_clips.iter().any(|c| c.id == clip_id);
+        self.context_menu = Some(LibraryContextMenu {
+            clip_id,
+            x,
+            y,
+            is_trashed,
+        });
+    }
+
+    /// Closes any open context menu.
+    pub fn close_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    /// Returns filtered and sorted clips for the Clip Library view.
     pub fn filtered_clips(&self) -> Vec<&ClipMetadata> {
-        self.clips
+        let query = self.library_search.text.trim().to_ascii_lowercase();
+        let source = if self.library_filter == LibraryFilter::Trash {
+            &self.trashed_clips
+        } else {
+            &self.clips
+        };
+        let mut list: Vec<&ClipMetadata> = source
             .iter()
             .filter(|c| match self.library_filter {
-                LibraryFilter::All => true,
+                LibraryFilter::All | LibraryFilter::Trash => true,
+                LibraryFilter::Recorded => self.clip_origin(c) == ClipOrigin::Recorded,
+                LibraryFilter::Trimmed => self.clip_origin(c) == ClipOrigin::Trimmed,
                 LibraryFilter::Favorites => self.favorite_ids.contains(&c.id),
                 LibraryFilter::Shared => c.cloud_share.is_some(),
             })
@@ -456,7 +913,56 @@ impl AppState {
                 Some(game) => c.game.as_ref().is_some_and(|g| &g.name == game),
                 None => true,
             })
-            .collect()
+            .filter(|c| {
+                if query.is_empty() {
+                    return true;
+                }
+                c.title.to_ascii_lowercase().contains(&query)
+                    || c.codec.to_ascii_lowercase().contains(&query)
+                    || c.game
+                        .as_ref()
+                        .is_some_and(|g| g.name.to_ascii_lowercase().contains(&query))
+                    || c.tags
+                        .iter()
+                        .any(|t| t.to_ascii_lowercase().contains(&query))
+            })
+            .collect();
+
+        match self.library_sort {
+            ClipSort::CreatedDesc => list.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| a.id.0.cmp(&b.id.0))
+            }),
+            ClipSort::CreatedAsc => list.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.0.cmp(&b.id.0))
+            }),
+            ClipSort::DurationDesc => list.sort_by(|a, b| {
+                b.duration_ms
+                    .cmp(&a.duration_ms)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            }),
+            ClipSort::DurationAsc => list.sort_by(|a, b| {
+                a.duration_ms
+                    .cmp(&b.duration_ms)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            }),
+            ClipSort::SizeDesc => list.sort_by(|a, b| {
+                b.size_bytes
+                    .cmp(&a.size_bytes)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            }),
+            ClipSort::TitleAsc => list.sort_by(|a, b| {
+                a.title
+                    .to_ascii_lowercase()
+                    .cmp(&b.title.to_ascii_lowercase())
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            }),
+        }
+
+        list
     }
 
     /// Toggles replay buffering state via `GsrCaptureBackend` (or in-memory in headless tests).
@@ -709,27 +1215,50 @@ impl AppState {
                 WorkerEvent::DependenciesProbed(deps) => {
                     self.deps = deps;
                 }
-                WorkerEvent::LibraryLoaded { clips, favorites } => {
-                    if !clips.is_empty() {
+                WorkerEvent::LibraryLoaded {
+                    clips,
+                    trashed_clips,
+                    favorites,
+                    origins,
+                    trashed_at,
+                } => {
+                    if !clips.is_empty() || !trashed_clips.is_empty() || !self.using_sample_clips {
                         self.using_sample_clips = false;
                         self.clips = clips;
+                        self.trashed_clips = trashed_clips;
                         self.favorite_ids = favorites;
+                        self.clip_origins = origins;
+                        self.trashed_at = trashed_at;
                         self.uploads.retain(|u| {
                             u.share
                                 .as_ref()
                                 .is_none_or(|sh| sh.share_id != "shr_mirage_01")
                         });
+                        let active_ids: HashSet<ClipId> = self
+                            .clips
+                            .iter()
+                            .chain(self.trashed_clips.iter())
+                            .map(|c| c.id)
+                            .collect();
+                        self.selected_clip_ids.retain(|id| active_ids.contains(id));
+
                         let selected_valid = self
                             .editor
                             .selected_clip_id
                             .is_some_and(|id| self.clips.iter().any(|c| c.id == id));
-                        if !selected_valid && let Some(first) = self.clips.first() {
-                            self.editor.selected_clip_id = Some(first.id);
-                            self.editor.trim_start_ms = 0;
-                            self.editor.trim_end_ms = first.duration_ms;
+                        if !selected_valid {
+                            if let Some(first) = self.clips.first() {
+                                self.editor.selected_clip_id = Some(first.id);
+                                self.editor.trim_start_ms = 0;
+                                self.editor.trim_end_ms = first.duration_ms;
+                            } else {
+                                self.editor.selected_clip_id = None;
+                                self.editor.playing = false;
+                                self.editor.has_video_frame = false;
+                            }
                         }
                         if let Some(worker) = &self.worker {
-                            for clip in &self.clips {
+                            for clip in self.clips.iter().chain(self.trashed_clips.iter()) {
                                 if !self.library_thumbs.contains_key(&clip.id)
                                     && let Some(thumb_path) = &clip.thumbnail_path
                                     && thumb_path.is_file()

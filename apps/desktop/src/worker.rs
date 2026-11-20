@@ -1,18 +1,18 @@
 //! Non-blocking background Tokio worker wired to real ClipForge workspace backends.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clipforge_capture::{CaptureBackend, GsrCaptureBackend, detect_gsr};
 use clipforge_cloud_client::{HttpCloudClient, RemoteClipSummary, ShareVisibility};
 use clipforge_common::{
     AppConfig, CaptureConfig, CaptureEvent, CaptureStatus, ClipFilter, ClipId, ClipMetadata,
     ClipStore, MediaProcessor, TrimRequest,
 };
-use clipforge_library::{DirectoryScanner, SqliteClipStore};
+use clipforge_library::{ClipListOptions, ClipOrigin, DirectoryScanner, SqliteClipStore};
 use clipforge_media::{
     DEFAULT_MAX_DECODE_DIM, FfmpegMediaProcessor, PlaybackState, PlayerEvent, VideoPlayerHandle,
     extract_timeline_thumbnails,
@@ -44,6 +44,26 @@ pub enum WorkerCommand {
         id: ClipId,
         favorite: bool,
     },
+    SetFavoriteBulk {
+        ids: Vec<ClipId>,
+        favorite: bool,
+    },
+    MoveToTrash {
+        ids: Vec<ClipId>,
+        managed_roots: Vec<PathBuf>,
+    },
+    RestoreFromTrash {
+        ids: Vec<ClipId>,
+    },
+    PermanentlyDelete {
+        ids: Vec<ClipId>,
+        managed_roots: Vec<PathBuf>,
+    },
+    RenameClip {
+        id: ClipId,
+        title: String,
+    },
+    OpenContainingFolder(PathBuf),
     StartReplayBuffer(CaptureConfig),
     StartRecording(CaptureConfig),
     SaveReplay,
@@ -86,7 +106,10 @@ pub enum WorkerEvent {
     DependenciesProbed(DependencyStatus),
     LibraryLoaded {
         clips: Vec<ClipMetadata>,
+        trashed_clips: Vec<ClipMetadata>,
         favorites: HashSet<ClipId>,
+        origins: HashMap<ClipId, ClipOrigin>,
+        trashed_at: HashMap<ClipId, DateTime<Utc>>,
     },
     CaptureStatusChanged(CaptureStatus),
     CaptureEventReceived(CaptureEvent),
@@ -303,6 +326,160 @@ async fn handle_command(
                 )));
                 (waker)();
             }
+        }
+        WorkerCommand::SetFavoriteBulk { ids, favorite } => {
+            let store = svc.store.lock().ok().and_then(|g| g.clone());
+            if let Some(store) = store {
+                let mut errs = Vec::new();
+                for id in ids {
+                    if let Err(err) = store.set_favorite(id, favorite).await {
+                        errs.push(err.to_string());
+                    }
+                }
+                if !errs.is_empty() {
+                    let _ = evt_tx.send(WorkerEvent::Banner(format!(
+                        "Favorite update failed: {}",
+                        errs.join("; ")
+                    )));
+                }
+                emit_library_loaded(&store, evt_tx).await;
+                (waker)();
+            }
+        }
+        WorkerCommand::MoveToTrash { ids, managed_roots } => {
+            close_player_if_matches(&svc, &ids);
+            let store = svc.store.lock().ok().and_then(|g| g.clone());
+            if let Some(store) = store {
+                let mut moved = 0usize;
+                let mut missing_files = 0usize;
+                let mut errs = Vec::new();
+                for id in ids {
+                    match store.move_to_trash(id, &managed_roots).await {
+                        Ok(res) => {
+                            moved += 1;
+                            if !res.file_moved {
+                                missing_files += 1;
+                            }
+                        }
+                        Err(err) => errs.push(err.to_string()),
+                    }
+                }
+                let msg = if errs.is_empty() {
+                    if missing_files > 0 {
+                        format!(
+                            "Moved {moved} clip(s) to Trash ({missing_files} file(s) already missing on disk)"
+                        )
+                    } else {
+                        format!("Moved {moved} clip(s) to Trash")
+                    }
+                } else {
+                    format!(
+                        "Moved {moved} clip(s) to Trash; {} error(s): {}",
+                        errs.len(),
+                        errs.join("; ")
+                    )
+                };
+                let _ = evt_tx.send(WorkerEvent::Banner(msg));
+                emit_library_loaded(&store, evt_tx).await;
+                (waker)();
+            }
+        }
+        WorkerCommand::RestoreFromTrash { ids } => {
+            let store = svc.store.lock().ok().and_then(|g| g.clone());
+            if let Some(store) = store {
+                let mut restored = 0usize;
+                let mut errs = Vec::new();
+                for id in ids {
+                    match store.restore_from_trash(id).await {
+                        Ok(_) => restored += 1,
+                        Err(err) => errs.push(err.to_string()),
+                    }
+                }
+                let msg = if errs.is_empty() {
+                    format!("Restored {restored} clip(s) from Trash")
+                } else {
+                    format!(
+                        "Restored {restored} clip(s); {} error(s): {}",
+                        errs.len(),
+                        errs.join("; ")
+                    )
+                };
+                let _ = evt_tx.send(WorkerEvent::Banner(msg));
+                emit_library_loaded(&store, evt_tx).await;
+                (waker)();
+            }
+        }
+        WorkerCommand::PermanentlyDelete { ids, managed_roots } => {
+            close_player_if_matches(&svc, &ids);
+            let store = svc.store.lock().ok().and_then(|g| g.clone());
+            if let Some(store) = store {
+                let mut deleted = 0usize;
+                let mut errs = Vec::new();
+                for id in ids {
+                    match store.permanently_delete(id, &managed_roots).await {
+                        Ok(_) => deleted += 1,
+                        Err(err) => errs.push(err.to_string()),
+                    }
+                }
+                let msg = if errs.is_empty() {
+                    format!("Permanently deleted {deleted} clip(s)")
+                } else {
+                    format!(
+                        "Deleted {deleted} clip(s); {} error(s): {}",
+                        errs.len(),
+                        errs.join("; ")
+                    )
+                };
+                let _ = evt_tx.send(WorkerEvent::Banner(msg));
+                emit_library_loaded(&store, evt_tx).await;
+                (waker)();
+            }
+        }
+        WorkerCommand::RenameClip { id, title } => {
+            let store = svc.store.lock().ok().and_then(|g| g.clone());
+            if let Some(store) = store {
+                match store.rename_clip(id, &title).await {
+                    Ok(true) => {
+                        let _ = evt_tx.send(WorkerEvent::Banner(format!(
+                            "Renamed clip to \"{}\"",
+                            title.trim()
+                        )));
+                        emit_library_loaded(&store, evt_tx).await;
+                    }
+                    Ok(false) => {
+                        let _ = evt_tx.send(WorkerEvent::Banner(
+                            "Clip not found in database".to_string(),
+                        ));
+                    }
+                    Err(err) => {
+                        let _ = evt_tx.send(WorkerEvent::Banner(format!("Rename failed: {err}")));
+                    }
+                }
+                (waker)();
+            }
+        }
+        WorkerCommand::OpenContainingFolder(path) => {
+            let Some(parent) = path.parent().filter(|p| p.is_dir()) else {
+                let _ = evt_tx.send(WorkerEvent::Banner(format!(
+                    "Containing folder does not exist: {}",
+                    path.display()
+                )));
+                (waker)();
+                return;
+            };
+            match Command::new("xdg-open").arg(parent).spawn() {
+                Ok(_) => {
+                    let _ = evt_tx.send(WorkerEvent::Banner(format!(
+                        "Opened folder {}",
+                        parent.display()
+                    )));
+                }
+                Err(err) => {
+                    let _ =
+                        evt_tx.send(WorkerEvent::Banner(format!("Failed to open folder: {err}")));
+                }
+            }
+            (waker)();
         }
         WorkerCommand::StartReplayBuffer(cfg) => {
             match svc.capture.start_replay_buffer(&cfg).await {
@@ -632,15 +809,56 @@ async fn index_single_clip(
     store.upsert_clip(&clip).await.is_ok()
 }
 
+fn close_player_if_matches(svc: &WorkerServices, ids: &[ClipId]) {
+    let active_matches = svc
+        .active_player_clip
+        .lock()
+        .ok()
+        .is_some_and(|g| g.as_ref().is_some_and(|(cid, _)| ids.contains(cid)));
+    if active_matches {
+        if let Ok(mut guard) = svc.active_player_clip.lock() {
+            *guard = None;
+        }
+        svc.player.close();
+    }
+}
+
 async fn emit_library_loaded(store: &SqliteClipStore, evt_tx: &Sender<WorkerEvent>) {
-    if let Ok(clips) = store.list_clips(&ClipFilter::default()).await {
+    let active_opts = ClipListOptions {
+        exclude_trashed: true,
+        ..Default::default()
+    };
+    let trash_opts = ClipListOptions {
+        trashed_only: true,
+        exclude_trashed: false,
+        ..Default::default()
+    };
+    let filter = ClipFilter::default();
+    if let Ok(clips) = store.list_clips_filtered(&filter, active_opts).await {
+        let trashed_clips = store
+            .list_clips_filtered(&filter, trash_opts)
+            .await
+            .unwrap_or_default();
+        let origins = store.list_origins().await.unwrap_or_default();
         let mut favorites = HashSet::new();
-        for c in &clips {
+        for c in clips.iter().chain(trashed_clips.iter()) {
             if store.is_favorite(c.id).await.unwrap_or(false) {
                 favorites.insert(c.id);
             }
         }
-        let _ = evt_tx.send(WorkerEvent::LibraryLoaded { clips, favorites });
+        let mut trashed_at = HashMap::new();
+        for c in &trashed_clips {
+            if let Ok(Some(info)) = store.get_trash_info(c.id).await {
+                trashed_at.insert(c.id, info.trashed_at);
+            }
+        }
+        let _ = evt_tx.send(WorkerEvent::LibraryLoaded {
+            clips,
+            trashed_clips,
+            favorites,
+            origins,
+            trashed_at,
+        });
     }
 }
 

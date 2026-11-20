@@ -19,7 +19,7 @@ use crate::theme::{Palette, radius, snappy_spring, space};
 pub fn root_view(s: &AppState, _cx: &mut rune::Cx<AppState>) -> El {
     let p = Palette::dark();
 
-    row()
+    let shell = row()
         .key("clipforge-shell")
         .role("window")
         .w_full()
@@ -46,6 +46,169 @@ pub fn root_view(s: &AppState, _cx: &mut rune::Cx<AppState>) -> El {
                         })
                         .child(active_view(&p, s)),
                 ),
+        );
+
+    el().key("clipforge-root")
+        .w_full()
+        .h_full()
+        .child(shell)
+        .children(context_menu_overlay(&p, s))
+}
+
+fn context_menu_overlay(p: &Palette, s: &AppState) -> Option<El> {
+    let menu = s.context_menu.as_ref()?;
+    let id = menu.clip_id;
+    let is_fav = s.favorite_ids.contains(&id);
+    let x = menu.x.clamp(16.0, 980.0);
+    let y = menu.y.clamp(16.0, 480.0);
+
+    let mut items = col()
+        .key("context-menu")
+        .absolute(x, y)
+        .w(210.0)
+        .padding(space::SM)
+        .gap(space::XS)
+        .fill(p.bg_elevated)
+        .border(1.0, p.accent)
+        .radius(radius::MD);
+
+    if menu.is_trashed {
+        items = items
+            .child(ctx_item(
+                p,
+                "ctx-restore",
+                "Restore from Trash",
+                move |st| {
+                    st.request_restore_from_trash(vec![id]);
+                },
+            ))
+            .child(ctx_item(
+                p,
+                "ctx-open-folder",
+                "Open Containing Folder",
+                move |st| st.open_containing_folder(id),
+            ))
+            .child(ctx_danger_item(
+                p,
+                "ctx-perm-delete",
+                "Delete Permanently",
+                move |st| st.request_permanent_delete(vec![id]),
+            ));
+    } else {
+        items = items
+            .child(ctx_item(p, "ctx-edit", "Open in Editor", move |st| {
+                st.close_context_menu();
+                st.open_in_editor(id);
+            }))
+            .child(ctx_item(p, "ctx-player", "Open in Player", move |st| {
+                st.close_context_menu();
+                st.open_clip_in_player(id);
+            }))
+            .child(ctx_item(
+                p,
+                "ctx-fav",
+                if is_fav {
+                    "Remove Favorite"
+                } else {
+                    "Add to Favorites"
+                },
+                move |st| {
+                    st.close_context_menu();
+                    st.toggle_favorite(id);
+                },
+            ))
+            .child(ctx_item(p, "ctx-rename", "Rename Clip", move |st| {
+                st.begin_rename(id);
+            }))
+            .child(ctx_item(
+                p,
+                "ctx-open-folder",
+                "Open Containing Folder",
+                move |st| st.open_containing_folder(id),
+            ))
+            .child(ctx_item(p, "ctx-upload", "Upload / Share", move |st| {
+                st.close_context_menu();
+                st.queue_upload(id);
+            }))
+            .child(ctx_item(p, "ctx-trash", "Move to Trash", move |st| {
+                st.request_move_to_trash(vec![id]);
+            }))
+            .child(ctx_danger_item(
+                p,
+                "ctx-perm-delete",
+                "Delete Permanently",
+                move |st| st.request_permanent_delete(vec![id]),
+            ));
+    }
+
+    Some(
+        el().key("context-menu-layer")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .child(
+                el().key("context-menu-scrim")
+                    .w_full()
+                    .h_full()
+                    .on_background_press(|st: &mut AppState| st.close_context_menu()),
+            )
+            .child(items),
+    )
+}
+
+fn ctx_item(
+    p: &Palette,
+    key: &str,
+    label_text: &str,
+    on_press: impl Fn(&mut AppState) + 'static,
+) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(label_text)
+        .focusable(true)
+        .cursor(Cursor::Pointer)
+        .w_full()
+        .h(30.0)
+        .px(space::SM)
+        .center_y()
+        .radius(radius::SM)
+        .fill(rune::Color::TRANSPARENT)
+        .hover(p.bg_hover)
+        .on_press(on_press)
+        .child(
+            text(label_text.to_string())
+                .font(type_::LABEL)
+                .color(p.text_primary)
+                .a11y_hidden(),
+        )
+}
+
+fn ctx_danger_item(
+    p: &Palette,
+    key: &str,
+    label_text: &str,
+    on_press: impl Fn(&mut AppState) + 'static,
+) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .label(label_text)
+        .focusable(true)
+        .cursor(Cursor::Pointer)
+        .w_full()
+        .h(30.0)
+        .px(space::SM)
+        .center_y()
+        .radius(radius::SM)
+        .fill(p.recording_soft)
+        .hover(p.recording)
+        .on_press(on_press)
+        .child(
+            text(label_text.to_string())
+                .font(type_::LABEL)
+                .color(p.text_primary)
+                .a11y_hidden(),
         )
 }
 
