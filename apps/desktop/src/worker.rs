@@ -13,7 +13,10 @@ use clipforge_common::{
     ClipStore, MediaProcessor, TrimRequest,
 };
 use clipforge_library::{DirectoryScanner, SqliteClipStore};
-use clipforge_media::FfmpegMediaProcessor;
+use clipforge_media::{
+    DEFAULT_MAX_DECODE_DIM, FfmpegMediaProcessor, PlaybackState, PlayerEvent, VideoPlayerHandle,
+    extract_timeline_thumbnails,
+};
 use rune::Waker;
 use tokio::process::Command;
 use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedSender};
@@ -32,6 +35,7 @@ pub struct DependencyStatus {
 
 /// Commands dispatched from the Rune UI thread to the background Tokio worker.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum WorkerCommand {
     Initialize(AppConfig),
     ProbeDependencies,
@@ -59,6 +63,21 @@ pub enum WorkerCommand {
     },
     SaveConfig(AppConfig),
     OpenInPlayer(PathBuf),
+    LoadThumbnail {
+        path: PathBuf,
+        pixels: rune::Pixels,
+    },
+    OpenPlayer {
+        clip_id: ClipId,
+        path: PathBuf,
+        trim_range: Option<(u64, u64)>,
+        pixels: rune::Pixels,
+    },
+    ClosePlayer,
+    PlayerPlay,
+    PlayerPause,
+    PlayerSeek(u64),
+    PlayerSetTrimRange(Option<(u64, u64)>),
 }
 
 /// Events emitted by the background Tokio worker back to the Rune UI thread.
@@ -82,6 +101,28 @@ pub enum WorkerEvent {
     },
     ConfigSaved(std::result::Result<PathBuf, String>),
     Banner(String),
+    PlayerFrameDelivered {
+        clip_id: ClipId,
+        width: u32,
+        height: u32,
+        pts_ms: u64,
+    },
+    PlayerStateChanged {
+        clip_id: ClipId,
+        playing: bool,
+    },
+    PlayerPosition {
+        clip_id: ClipId,
+        pts_ms: u64,
+    },
+    PlayerError {
+        clip_id: ClipId,
+        message: String,
+    },
+    TimelineThumbsLoaded {
+        clip_id: ClipId,
+        thumbs: Vec<rune::Pixels>,
+    },
 }
 
 /// Handle held by [`crate::state::AppState`] to communicate with the background worker.
@@ -94,6 +135,8 @@ struct WorkerServices {
     capture: Arc<GsrCaptureBackend>,
     media: Arc<FfmpegMediaProcessor>,
     store: Arc<Mutex<Option<Arc<SqliteClipStore>>>>,
+    player: VideoPlayerHandle,
+    active_player_clip: Arc<Mutex<Option<(ClipId, rune::Pixels)>>>,
 }
 
 impl WorkerHandle {
@@ -120,10 +163,15 @@ impl WorkerHandle {
                 rt.block_on(async move {
                     let capture = Arc::new(GsrCaptureBackend::new());
                     let media = Arc::new(FfmpegMediaProcessor::new());
+                    let (player, mut player_rx) = VideoPlayerHandle::spawn();
+                    let active_player_clip: Arc<Mutex<Option<(ClipId, rune::Pixels)>>> =
+                        Arc::new(Mutex::new(None));
                     let services = Arc::new(WorkerServices {
                         capture: capture.clone(),
                         media,
                         store: Arc::new(Mutex::new(None)),
+                        player,
+                        active_player_clip: active_player_clip.clone(),
                     });
 
                     // Forward asynchronous CaptureEvents from GsrCaptureBackend to the UI.
@@ -134,6 +182,50 @@ impl WorkerHandle {
                         while let Ok(ev) = cap_rx.recv().await {
                             let _ = cap_evt_tx.send(WorkerEvent::CaptureEventReceived(ev));
                             (cap_waker)();
+                        }
+                    });
+
+                    // Forward decoded video frames and player events off the UI thread.
+                    let pl_evt_tx = evt_tx.clone();
+                    let pl_waker = waker.clone();
+                    tokio::spawn(async move {
+                        while let Some(ev) = player_rx.recv().await {
+                            let active = active_player_clip.lock().ok().and_then(|g| g.clone());
+                            let Some((clip_id, pixels)) = active else {
+                                continue;
+                            };
+                            match ev {
+                                PlayerEvent::Metadata(_) => {}
+                                PlayerEvent::Frame(frame) => {
+                                    let width = frame.width;
+                                    let height = frame.height;
+                                    let pts_ms = frame.pts_ms;
+                                    pixels.set(width, height, frame.data);
+                                    let _ = pl_evt_tx.send(WorkerEvent::PlayerFrameDelivered {
+                                        clip_id,
+                                        width,
+                                        height,
+                                        pts_ms,
+                                    });
+                                    (pl_waker)();
+                                }
+                                PlayerEvent::StateChanged(state) => {
+                                    let playing = matches!(state, PlaybackState::Playing);
+                                    let _ = pl_evt_tx
+                                        .send(WorkerEvent::PlayerStateChanged { clip_id, playing });
+                                    (pl_waker)();
+                                }
+                                PlayerEvent::Position(pts_ms) => {
+                                    let _ = pl_evt_tx
+                                        .send(WorkerEvent::PlayerPosition { clip_id, pts_ms });
+                                    (pl_waker)();
+                                }
+                                PlayerEvent::Error(message) => {
+                                    let _ = pl_evt_tx
+                                        .send(WorkerEvent::PlayerError { clip_id, message });
+                                    (pl_waker)();
+                                }
+                            }
                         }
                     });
 
@@ -362,7 +454,105 @@ async fn handle_command(
             }
             (waker)();
         }
+        WorkerCommand::LoadThumbnail { path, pixels } => {
+            if let Ok(rgba) = decode_thumbnail_rgba(&path, 320, 180).await {
+                pixels.set(320, 180, rgba);
+                (waker)();
+            }
+        }
+        WorkerCommand::OpenPlayer {
+            clip_id,
+            path,
+            trim_range,
+            pixels,
+        } => {
+            if let Ok(mut guard) = svc.active_player_clip.lock() {
+                *guard = Some((clip_id, pixels));
+            }
+            svc.player
+                .open(&path, trim_range, Some(DEFAULT_MAX_DECODE_DIM));
+
+            let thumb_tx = evt_tx.clone();
+            let thumb_waker = waker.clone();
+            let active_ref = svc.active_player_clip.clone();
+            tokio::spawn(async move {
+                if let Ok(frames) = extract_timeline_thumbnails(&path, 8, 160, 90).await {
+                    let still_active = active_ref
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|(id, _)| *id))
+                        == Some(clip_id);
+                    if still_active {
+                        let thumbs = frames
+                            .into_iter()
+                            .map(|f| {
+                                let px = rune::Pixels::new();
+                                px.set(f.width, f.height, f.data);
+                                px
+                            })
+                            .collect();
+                        let _ =
+                            thumb_tx.send(WorkerEvent::TimelineThumbsLoaded { clip_id, thumbs });
+                        (thumb_waker)();
+                    }
+                }
+            });
+        }
+        WorkerCommand::ClosePlayer => {
+            if let Ok(mut guard) = svc.active_player_clip.lock() {
+                *guard = None;
+            }
+            svc.player.close();
+        }
+        WorkerCommand::PlayerPlay => {
+            svc.player.play();
+        }
+        WorkerCommand::PlayerPause => {
+            svc.player.pause();
+        }
+        WorkerCommand::PlayerSeek(ms) => {
+            svc.player.seek(ms);
+        }
+        WorkerCommand::PlayerSetTrimRange(range) => {
+            svc.player.set_trim_range(range);
+        }
     }
+}
+
+async fn decode_thumbnail_rgba(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+) -> std::result::Result<Vec<u8>, String> {
+    let filter = format!(
+        "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x161820ff"
+    );
+    let output = Command::new("ffmpeg")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(path)
+        .arg("-vf")
+        .arg(filter)
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("rgba")
+        .arg("pipe:1")
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    let expected = (width as usize) * (height as usize) * 4;
+    if output.stdout.len() != expected {
+        return Err(format!(
+            "unexpected thumbnail byte count: got {}, expected {expected}",
+            output.stdout.len()
+        ));
+    }
+    Ok(output.stdout)
 }
 
 fn ensure_store(svc: &WorkerServices, cfg: &AppConfig) -> Option<Arc<SqliteClipStore>> {

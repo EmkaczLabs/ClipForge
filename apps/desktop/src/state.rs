@@ -1,6 +1,6 @@
 //! Application state for ClipForge Desktop wired to `clipforge-common` domain models.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{Duration, Utc};
@@ -106,6 +106,14 @@ pub struct EditorState {
     pub trim_end_ms: u64,
     pub reencode: bool,
     pub last_export_path: Option<PathBuf>,
+    pub video_pixels: rune::Pixels,
+    pub has_video_frame: bool,
+    pub video_width: u32,
+    pub video_height: u32,
+    pub decoder_error: Option<String>,
+    pub timeline_thumbs: Vec<rune::Pixels>,
+    pub exporting: bool,
+    pub export_error: Option<String>,
 }
 
 impl Default for EditorState {
@@ -118,6 +126,14 @@ impl Default for EditorState {
             trim_end_ms: 15_000,
             reencode: false,
             last_export_path: None,
+            video_pixels: rune::Pixels::new(),
+            has_video_frame: false,
+            video_width: 0,
+            video_height: 0,
+            decoder_error: None,
+            timeline_thumbs: Vec::new(),
+            exporting: false,
+            export_error: None,
         }
     }
 }
@@ -152,6 +168,7 @@ pub struct AppState {
     pub library_mode: LibraryViewMode,
     pub library_filter: LibraryFilter,
     pub library_game_filter: Option<String>,
+    pub library_thumbs: HashMap<ClipId, rune::Pixels>,
     pub editor: EditorState,
     pub uploads: Vec<UploadEntry>,
     pub hotkeys: HotkeyConfig,
@@ -178,6 +195,7 @@ impl Default for AppState {
                 trim_end_ms: c.duration_ms,
                 reencode: false,
                 last_export_path: None,
+                ..EditorState::default()
             }
         } else {
             EditorState::default()
@@ -212,6 +230,7 @@ impl Default for AppState {
             library_mode: LibraryViewMode::Grid,
             library_filter: LibraryFilter::All,
             library_game_filter: None,
+            library_thumbs: HashMap::new(),
             editor,
             uploads,
             hotkeys: HotkeyConfig::default(),
@@ -228,15 +247,186 @@ impl AppState {
         self.clips.iter().find(|c| c.id == id)
     }
 
-    /// Selects a clip for editing and navigates to the Video Editor view.
+    /// Selects a clip (synchronized across Library and Editor) without switching views.
+    pub fn select_clip(&mut self, id: ClipId) {
+        let Some(clip) = self.clips.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        if self.editor.selected_clip_id == Some(id) {
+            return;
+        }
+        self.editor.selected_clip_id = Some(id);
+        self.editor.playing = false;
+        self.editor.playhead_ms = 0;
+        self.editor.trim_start_ms = 0;
+        self.editor.trim_end_ms = clip.duration_ms;
+        self.editor.has_video_frame = false;
+        self.editor.video_width = clip.width;
+        self.editor.video_height = clip.height;
+        self.editor.decoder_error = None;
+        self.editor.timeline_thumbs.clear();
+        self.editor.export_error = None;
+
+        if let Some(worker) = &self.worker {
+            if is_sample_clip(&clip) || !clip.file_path.is_file() {
+                worker.send(WorkerCommand::ClosePlayer);
+            } else if self.nav == NavSection::Editor {
+                worker.send(WorkerCommand::OpenPlayer {
+                    clip_id: id,
+                    path: clip.file_path,
+                    trim_range: Some((0, clip.duration_ms)),
+                    pixels: self.editor.video_pixels.clone(),
+                });
+            } else {
+                worker.send(WorkerCommand::ClosePlayer);
+            }
+        }
+    }
+
+    /// Selects a clip for editing, opens the decoder if backed by a file, and navigates to the Video Editor view.
     pub fn open_in_editor(&mut self, id: ClipId) {
-        if let Some(clip) = self.clips.iter().find(|c| c.id == id) {
+        let Some(clip) = self.clips.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        let changed = self.editor.selected_clip_id != Some(id);
+        if changed {
             self.editor.selected_clip_id = Some(id);
             self.editor.playing = false;
             self.editor.playhead_ms = 0;
             self.editor.trim_start_ms = 0;
             self.editor.trim_end_ms = clip.duration_ms;
-            self.nav = NavSection::Editor;
+            self.editor.has_video_frame = false;
+            self.editor.video_width = clip.width;
+            self.editor.video_height = clip.height;
+            self.editor.decoder_error = None;
+            self.editor.timeline_thumbs.clear();
+            self.editor.export_error = None;
+        }
+        self.nav = NavSection::Editor;
+
+        if let Some(worker) = &self.worker {
+            if is_sample_clip(&clip) || !clip.file_path.is_file() {
+                worker.send(WorkerCommand::ClosePlayer);
+            } else {
+                worker.send(WorkerCommand::OpenPlayer {
+                    clip_id: id,
+                    path: clip.file_path,
+                    trim_range: Some((self.editor.trim_start_ms, self.editor.trim_end_ms)),
+                    pixels: self.editor.video_pixels.clone(),
+                });
+            }
+        }
+    }
+
+    /// Toggles playback in the Video Editor, clamping to `[trim_start_ms, trim_end_ms]`.
+    #[allow(dead_code)]
+    pub fn toggle_play(&mut self) {
+        let Some(clip) = self.selected_clip().cloned() else {
+            return;
+        };
+        if self.editor.playing {
+            self.editor.playing = false;
+            if let Some(worker) = &self.worker {
+                worker.send(WorkerCommand::PlayerPause);
+            }
+            return;
+        }
+        if is_sample_clip(&clip) || (self.worker.is_some() && !clip.file_path.is_file()) {
+            self.editor.decoder_error = Some(
+                "Sample clip has no video file on disk — record or scan a real clip to play it"
+                    .to_string(),
+            );
+            if self.worker.is_none() {
+                self.editor.playing = true;
+            }
+            return;
+        }
+        if self.editor.playhead_ms >= self.editor.trim_end_ms {
+            self.editor.playhead_ms = self.editor.trim_start_ms;
+            if let Some(worker) = &self.worker {
+                worker.send(WorkerCommand::PlayerSeek(self.editor.trim_start_ms));
+            }
+        }
+        self.editor.playing = true;
+        self.editor.decoder_error = None;
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::PlayerPlay);
+        }
+    }
+
+    /// Seeks the Video Editor playhead to `ms` (clamped to clip duration).
+    #[allow(dead_code)]
+    pub fn seek_editor(&mut self, ms: u64) {
+        let Some(clip) = self.selected_clip().cloned() else {
+            return;
+        };
+        let clamped = ms.min(clip.duration_ms);
+        self.editor.playhead_ms = clamped;
+        if let Some(worker) = &self.worker
+            && !is_sample_clip(&clip)
+            && clip.file_path.is_file()
+        {
+            worker.send(WorkerCommand::PlayerSeek(clamped));
+        }
+    }
+
+    /// Restarts Video Editor playback from `trim_start_ms`.
+    #[allow(dead_code)]
+    pub fn restart_editor(&mut self) {
+        let start = self.editor.trim_start_ms;
+        self.editor.playhead_ms = start;
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::PlayerSeek(start));
+        }
+    }
+
+    /// Updates `trim_start_ms` (clamped strictly below `trim_end_ms`) and notifies the decoder.
+    #[allow(dead_code)]
+    pub fn set_trim_start(&mut self, ms: u64) {
+        let max_start = self.editor.trim_end_ms.saturating_sub(100);
+        let clamped = ms.min(max_start);
+        self.editor.trim_start_ms = clamped;
+        if self.editor.playhead_ms < clamped {
+            self.editor.playhead_ms = clamped;
+        }
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::PlayerSetTrimRange(Some((
+                self.editor.trim_start_ms,
+                self.editor.trim_end_ms,
+            ))));
+        }
+    }
+
+    /// Updates `trim_end_ms` (clamped between `trim_start_ms + 100` and clip duration) and notifies the decoder.
+    #[allow(dead_code)]
+    pub fn set_trim_end(&mut self, ms: u64) {
+        let duration_ms = self
+            .selected_clip()
+            .map(|c| c.duration_ms)
+            .unwrap_or(ms)
+            .max(100);
+        let min_end = (self.editor.trim_start_ms + 100).min(duration_ms);
+        let clamped = ms.clamp(min_end, duration_ms);
+        self.editor.trim_end_ms = clamped;
+        if self.editor.playhead_ms > clamped {
+            self.editor.playhead_ms = clamped;
+        }
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::PlayerSetTrimRange(Some((
+                self.editor.trim_start_ms,
+                self.editor.trim_end_ms,
+            ))));
+        }
+    }
+
+    /// Resets trim range to the full clip duration.
+    #[allow(dead_code)]
+    pub fn reset_trim(&mut self) {
+        let duration_ms = self.selected_clip().map(|c| c.duration_ms).unwrap_or(0);
+        self.editor.trim_start_ms = 0;
+        self.editor.trim_end_ms = duration_ms;
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::PlayerSetTrimRange(Some((0, duration_ms))));
         }
     }
 
@@ -389,26 +579,38 @@ impl AppState {
 
         if let Some(worker) = &self.worker {
             if is_sample || !req.source_path.is_file() {
-                self.status_banner = Some(
-                    "Sample clip cannot be exported — record or scan a real clip first".to_string(),
-                );
+                let msg =
+                    "Sample clip cannot be exported — record or scan a real clip first".to_string();
+                self.editor.exporting = false;
+                self.editor.export_error = Some(msg.clone());
+                self.status_banner = Some(msg);
                 return;
             }
             if let Err(err) = req.validate() {
-                self.status_banner = Some(format!("Invalid trim range: {err}"));
+                let msg = format!("Invalid trim range: {err}");
+                self.editor.exporting = false;
+                self.editor.export_error = Some(msg.clone());
+                self.status_banner = Some(msg);
                 return;
             }
+            self.editor.exporting = true;
+            self.editor.export_error = None;
             self.status_banner = Some("Exporting trimmed clip...".to_string());
             worker.send(WorkerCommand::TrimClip(req));
         } else {
             match req.validate() {
                 Ok(()) => {
+                    self.editor.exporting = false;
+                    self.editor.export_error = None;
                     self.editor.last_export_path = Some(req.output_path.clone());
                     self.status_banner =
                         Some(format!("Trim validated: {}", req.output_path.display()));
                 }
                 Err(err) => {
-                    self.status_banner = Some(format!("Trim error: {err}"));
+                    let msg = format!("Trim error: {err}");
+                    self.editor.exporting = false;
+                    self.editor.export_error = Some(msg.clone());
+                    self.status_banner = Some(msg);
                 }
             }
         }
@@ -526,6 +728,21 @@ impl AppState {
                             self.editor.trim_start_ms = 0;
                             self.editor.trim_end_ms = first.duration_ms;
                         }
+                        if let Some(worker) = &self.worker {
+                            for clip in &self.clips {
+                                if !self.library_thumbs.contains_key(&clip.id)
+                                    && let Some(thumb_path) = &clip.thumbnail_path
+                                    && thumb_path.is_file()
+                                {
+                                    let pixels = rune::Pixels::new();
+                                    self.library_thumbs.insert(clip.id, pixels.clone());
+                                    worker.send(WorkerCommand::LoadThumbnail {
+                                        path: thumb_path.clone(),
+                                        pixels,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 WorkerEvent::CaptureStatusChanged(status) => {
@@ -553,6 +770,8 @@ impl AppState {
                     self.status_banner = Some(format!("Failed to save config: {err}"));
                 }
                 WorkerEvent::TrimCompleted(Ok(path)) => {
+                    self.editor.exporting = false;
+                    self.editor.export_error = None;
                     self.editor.last_export_path = Some(path.clone());
                     self.status_banner = Some(format!("Trimmed clip exported: {}", path.display()));
                     if let Some(worker) = &self.worker {
@@ -560,7 +779,43 @@ impl AppState {
                     }
                 }
                 WorkerEvent::TrimCompleted(Err(err)) => {
+                    self.editor.exporting = false;
+                    self.editor.export_error = Some(err.clone());
                     self.status_banner = Some(format!("Trim failed: {err}"));
+                }
+                WorkerEvent::PlayerFrameDelivered {
+                    clip_id,
+                    width,
+                    height,
+                    pts_ms,
+                } => {
+                    if self.editor.selected_clip_id == Some(clip_id) {
+                        self.editor.has_video_frame = true;
+                        self.editor.video_width = width;
+                        self.editor.video_height = height;
+                        self.editor.playhead_ms = pts_ms;
+                    }
+                }
+                WorkerEvent::PlayerStateChanged { clip_id, playing } => {
+                    if self.editor.selected_clip_id == Some(clip_id) {
+                        self.editor.playing = playing;
+                    }
+                }
+                WorkerEvent::PlayerPosition { clip_id, pts_ms } => {
+                    if self.editor.selected_clip_id == Some(clip_id) {
+                        self.editor.playhead_ms = pts_ms;
+                    }
+                }
+                WorkerEvent::PlayerError { clip_id, message } => {
+                    if self.editor.selected_clip_id == Some(clip_id) {
+                        self.editor.playing = false;
+                        self.editor.decoder_error = Some(message);
+                    }
+                }
+                WorkerEvent::TimelineThumbsLoaded { clip_id, thumbs } => {
+                    if self.editor.selected_clip_id == Some(clip_id) {
+                        self.editor.timeline_thumbs = thumbs;
+                    }
                 }
                 WorkerEvent::UploadCompleted { clip_id, result } => {
                     if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {

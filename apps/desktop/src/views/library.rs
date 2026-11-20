@@ -1,7 +1,7 @@
 //! Clip Library view: Grid/List toggle, filters, favorites, and quick clip actions.
 
 use rune::tok::type_;
-use rune::{El, col, el, row, text};
+use rune::{Cursor, El, SurfaceFit, col, el, row, text};
 
 use crate::components::{badge, btn_primary, btn_secondary, card, pill_option, section_header};
 use crate::state::{
@@ -73,6 +73,146 @@ pub fn view(p: &Palette, s: &AppState) -> El {
     );
 
     let mut content = col().key("lib-items").w_full().gap(space::MD);
+    if let Some(selected) = s.selected_clip() {
+        let sel_id = selected.id;
+        let sel_fav = s.favorite_ids.contains(&sel_id);
+        let sel_sample = is_sample_clip(selected);
+        let sel_game = selected
+            .game
+            .as_ref()
+            .map(|g| g.name.as_str())
+            .unwrap_or("Desktop");
+        let sel_path = if sel_sample {
+            "Sample clip (no file on disk)".to_string()
+        } else {
+            selected.file_path.display().to_string()
+        };
+        let preview_thumb = if let Some(px) = s.library_thumbs.get(&sel_id) {
+            el().key("detail-thumb-img")
+                .w(220.0)
+                .h(124.0)
+                .radius(radius::MD)
+                .fill(p.bg_base)
+                .border(1.0, p.border_subtle)
+                .pixels_fit(px, SurfaceFit::Fit)
+        } else {
+            col()
+                .key("detail-thumb-placeholder")
+                .w(220.0)
+                .h(124.0)
+                .radius(radius::MD)
+                .fill(p.bg_base)
+                .border(1.0, p.border_subtle)
+                .center()
+                .gap(space::XS)
+                .child(
+                    text(if sel_sample {
+                        "Sample Preview"
+                    } else {
+                        "Clip Preview"
+                    })
+                    .font(type_::LABEL)
+                    .color(p.text_secondary),
+                )
+                .child(
+                    text(format_duration_ms(selected.duration_ms))
+                        .font(type_::SECTION)
+                        .color(p.text_primary),
+                )
+        };
+
+        content = content.child(
+            card(p, "lib-selected-detail").child(
+                row()
+                    .key("detail-row")
+                    .w_full()
+                    .gap(space::LG)
+                    .center_y()
+                    .child(preview_thumb)
+                    .child(
+                        col()
+                            .key("detail-meta")
+                            .grow(1.0)
+                            .gap(space::SM)
+                            .child(
+                                row()
+                                    .key("detail-title-row")
+                                    .w_full()
+                                    .justify_between()
+                                    .center_y()
+                                    .child(
+                                        text(selected.title.clone())
+                                            .font(type_::TITLE)
+                                            .color(p.text_primary),
+                                    )
+                                    .child(if sel_sample {
+                                        badge(
+                                            "detail-sample-badge",
+                                            "SAMPLE",
+                                            p.warning,
+                                            p.warning_soft,
+                                        )
+                                    } else {
+                                        badge(
+                                            "detail-rec-badge",
+                                            "RECORDED",
+                                            p.success,
+                                            p.success_soft,
+                                        )
+                                    }),
+                            )
+                            .child(
+                                text(format!(
+                                    "{sel_game} • {}x{} @ {}fps • {} • {} • {}",
+                                    selected.width,
+                                    selected.height,
+                                    selected.fps as u32,
+                                    selected.codec.to_uppercase(),
+                                    format_duration_ms(selected.duration_ms),
+                                    format_bytes(selected.size_bytes),
+                                ))
+                                .font(type_::LABEL)
+                                .color(p.text_secondary),
+                            )
+                            .child(text(sel_path).font(type_::LABEL).color(p.text_muted))
+                            .child(
+                                row()
+                                    .key("detail-actions")
+                                    .gap(space::SM)
+                                    .child(pill_option(
+                                        p,
+                                        "detail-fav",
+                                        if sel_fav {
+                                            "★ Favorited"
+                                        } else {
+                                            "☆ Favorite"
+                                        },
+                                        sel_fav,
+                                        move |st| st.toggle_favorite(sel_id),
+                                    ))
+                                    .child(btn_primary(
+                                        p,
+                                        "detail-edit",
+                                        "Trim & Edit",
+                                        move |st| st.open_in_editor(sel_id),
+                                    ))
+                                    .child(btn_secondary(
+                                        p,
+                                        "detail-player",
+                                        "Open in Player",
+                                        move |st| st.open_clip_in_player(sel_id),
+                                    ))
+                                    .child(btn_secondary(
+                                        p,
+                                        "detail-upload",
+                                        "Upload",
+                                        move |st| st.queue_upload(sel_id),
+                                    )),
+                            ),
+                    ),
+            ),
+        );
+    }
     if s.using_sample_clips {
         content = content.child(
             card(p, "lib-sample-notice").child(
@@ -115,6 +255,7 @@ pub fn view(p: &Palette, s: &AppState) -> El {
         for clip in filtered {
             let id = clip.id;
             let fav = s.favorite_ids.contains(&id);
+            let is_selected = s.editor.selected_clip_id == Some(id);
             let game = clip
                 .game
                 .as_ref()
@@ -127,9 +268,23 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                     .padding(space::MD)
                     .justify_between()
                     .center_y()
-                    .fill(p.bg_surface)
-                    .border(1.0, p.border_subtle)
+                    .cursor(Cursor::Pointer)
+                    .fill(if is_selected {
+                        p.bg_elevated
+                    } else {
+                        p.bg_surface
+                    })
+                    .border(
+                        if is_selected { 2.0 } else { 1.0 },
+                        if is_selected {
+                            p.accent
+                        } else {
+                            p.border_subtle
+                        },
+                    )
                     .radius(radius::MD)
+                    .on_press(move |st: &mut AppState| st.select_clip(id))
+                    .on_double_press(move |st: &mut AppState| st.open_in_editor(id))
                     .child(
                         col()
                             .key("info")
@@ -175,6 +330,9 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                             .child(btn_primary(p, &format!("edit-{id}"), "Edit", move |st| {
                                 st.open_in_editor(id)
                             }))
+                            .child(btn_secondary(p, &format!("play-{id}"), "Play", move |st| {
+                                st.open_clip_in_player(id)
+                            }))
                             .child(btn_secondary(
                                 p,
                                 &format!("share-{id}"),
@@ -193,40 +351,66 @@ pub fn view(p: &Palette, s: &AppState) -> El {
             for clip in chunk {
                 let id = clip.id;
                 let fav = s.favorite_ids.contains(&id);
+                let is_selected = s.editor.selected_clip_id == Some(id);
                 let game = clip
                     .game
                     .as_ref()
                     .map(|g| g.name.as_str())
                     .unwrap_or("Desktop");
+                let thumb_box = if let Some(px) = s.library_thumbs.get(&id) {
+                    el().key("thumb")
+                        .w_full()
+                        .h(110.0)
+                        .radius(radius::MD)
+                        .fill(p.bg_elevated)
+                        .border(1.0, p.border_subtle)
+                        .pixels_fit(px, SurfaceFit::Fit)
+                } else {
+                    el().key("thumb")
+                        .w_full()
+                        .h(110.0)
+                        .radius(radius::MD)
+                        .fill(p.bg_elevated)
+                        .border(1.0, p.border_subtle)
+                        .padding(space::SM)
+                        .child(
+                            row()
+                                .key("thumb-badges")
+                                .w_full()
+                                .justify_between()
+                                .child(badge(
+                                    "dur",
+                                    &format_duration_ms(clip.duration_ms),
+                                    p.text_primary,
+                                    p.bg_base,
+                                ))
+                                .child(if is_sample_clip(clip) {
+                                    badge("sample", "SAMPLE", p.warning, p.warning_soft)
+                                } else {
+                                    badge("recorded", "REC", p.success, p.success_soft)
+                                }),
+                        )
+                };
                 r = r.child(
                     card(p, &format!("lib-card-{id}"))
                         .grow(1.0)
-                        .child(
-                            el().key("thumb")
-                                .w_full()
-                                .h(110.0)
-                                .radius(radius::MD)
-                                .fill(p.bg_elevated)
-                                .border(1.0, p.border_subtle)
-                                .padding(space::SM)
-                                .child(
-                                    row()
-                                        .key("thumb-badges")
-                                        .w_full()
-                                        .justify_between()
-                                        .child(badge(
-                                            "dur",
-                                            &format_duration_ms(clip.duration_ms),
-                                            p.text_primary,
-                                            p.bg_base,
-                                        ))
-                                        .child(if is_sample_clip(clip) {
-                                            badge("sample", "SAMPLE", p.warning, p.warning_soft)
-                                        } else {
-                                            badge("recorded", "REC", p.success, p.success_soft)
-                                        }),
-                                ),
+                        .cursor(Cursor::Pointer)
+                        .fill(if is_selected {
+                            p.bg_elevated
+                        } else {
+                            p.bg_surface
+                        })
+                        .border(
+                            if is_selected { 2.0 } else { 1.0 },
+                            if is_selected {
+                                p.accent
+                            } else {
+                                p.border_subtle
+                            },
                         )
+                        .on_press(move |st: &mut AppState| st.select_clip(id))
+                        .on_double_press(move |st: &mut AppState| st.open_in_editor(id))
+                        .child(thumb_box)
                         .child(
                             row()
                                 .key("title-row")
@@ -272,6 +456,12 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                                     &format!("edit-{id}"),
                                     "Trim & Edit",
                                     move |st| st.open_in_editor(id),
+                                ))
+                                .child(btn_secondary(
+                                    p,
+                                    &format!("play-{id}"),
+                                    "Player",
+                                    move |st| st.open_clip_in_player(id),
                                 ))
                                 .child(btn_secondary(
                                     p,

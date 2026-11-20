@@ -166,4 +166,58 @@ mod tests {
         click_key(&mut rt, "dash-clear-err");
         assert_eq!(rt.state.capture_status, CaptureStatus::Idle);
     }
+
+    #[test]
+    fn library_click_selects_and_double_click_opens_editor() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(AppState::default(), views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        let second_id = rt.state.clips[1].id;
+        click_key(&mut rt, NavSection::Library.key());
+        click_key(&mut rt, &format!("lib-card-{second_id}"));
+        assert_eq!(rt.state.editor.selected_clip_id, Some(second_id));
+        assert!(rt.find("lib-selected-detail").is_some());
+        assert_eq!(rt.state.nav, NavSection::Library);
+
+        // Double-click the card to open it in the Video Editor.
+        click_key(&mut rt, &format!("lib-card-{second_id}"));
+        assert_eq!(rt.state.nav, NavSection::Editor);
+        assert_eq!(rt.state.editor.selected_clip_id, Some(second_id));
+    }
+
+    #[test]
+    fn library_context_actions_and_editor_playback_helpers() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(AppState::default(), views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        let second_id = rt.state.clips[1].id;
+        click_key(&mut rt, NavSection::Library.key());
+        click_key(&mut rt, &format!("lib-card-{second_id}"));
+
+        let was_fav = rt.state.favorite_ids.contains(&second_id);
+        click_key(&mut rt, "detail-fav");
+        assert_eq!(rt.state.favorite_ids.contains(&second_id), !was_fav);
+
+        click_key(&mut rt, "detail-player");
+        assert!(rt.state.status_banner.is_some());
+
+        click_key(&mut rt, "detail-edit");
+        assert_eq!(rt.state.nav, NavSection::Editor);
+        assert_eq!(rt.state.editor.selected_clip_id, Some(second_id));
+
+        rt.state.toggle_play();
+        assert!(rt.state.editor.playing);
+        rt.state.seek_editor(5_000);
+        assert_eq!(rt.state.editor.playhead_ms, 5_000);
+        rt.state.set_trim_start(2_000);
+        assert_eq!(rt.state.editor.trim_start_ms, 2_000);
+        rt.state.set_trim_end(10_000);
+        assert_eq!(rt.state.editor.trim_end_ms, 10_000);
+        rt.state.restart_editor();
+        assert_eq!(rt.state.editor.playhead_ms, 2_000);
+        rt.state.reset_trim();
+        assert_eq!(rt.state.editor.trim_start_ms, 0);
+    }
 }
