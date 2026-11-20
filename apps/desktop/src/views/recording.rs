@@ -5,7 +5,7 @@ use clipforge_common::{
     AudioCodec, CaptureStatus, CaptureTarget, ContainerFormat, EncoderMode, QualityPreset,
     VideoCodec,
 };
-use rune::{Cursor, El, col, row, text};
+use rune::{Cursor, El, ScrollSpec, col, row, text};
 
 use crate::components::{
     badge, btn_danger, btn_primary, btn_secondary, card, checkbox, error_state, kv_row,
@@ -1104,14 +1104,20 @@ fn audio_sources_card(p: &Palette, s: &AppState) -> El {
             row()
                 .key("rec-audio-hdr-row")
                 .w_full()
+                .min_w(0.0)
+                .gap(space::SM)
                 .justify_between()
                 .center_y()
-                .child(section_header(
-                    p,
-                    "rec-audio-hdr",
-                    "Audio Sources & Codec",
-                    "Multi-track PipeWire / PulseAudio routing",
-                ))
+                .child(
+                    section_header(
+                        p,
+                        "rec-audio-hdr",
+                        "Audio Sources & Codec",
+                        "Multi-track PipeWire / PulseAudio routing",
+                    )
+                    .grow(1.0)
+                    .min_w(0.0),
+                )
                 .child(btn_secondary(p, "rec-audio-refresh", "Refresh", |st| {
                     st.discover_capture_sources();
                 })),
@@ -1120,6 +1126,8 @@ fn audio_sources_card(p: &Palette, s: &AppState) -> El {
             row()
                 .key("cfg-acodec-row")
                 .w_full()
+                .min_w(0.0)
+                .gap(space::SM)
                 .justify_between()
                 .center_y()
                 .child(
@@ -1168,65 +1176,148 @@ fn audio_sources_card(p: &Palette, s: &AppState) -> El {
             p,
             "audio-default-out",
             "default_output",
-            "System Desktop Audio (default_output)",
+            "System Desktop Audio",
             cfg.audio_sources.iter().any(|src| src == "default_output"),
         ))
         .child(audio_source_row(
             p,
             "audio-default-in",
             "default_input",
-            "Default Microphone (default_input)",
+            "Default Microphone",
             cfg.audio_sources.iter().any(|src| src == "default_input"),
         ));
 
-    if !s.available_audio_devices.is_empty() {
-        c = c.child(
-            text("Discovered Audio Devices")
-                .font(typography::MONO_BADGE)
-                .color(p.text_muted),
-        );
-        for (idx, dev) in s.available_audio_devices.iter().enumerate() {
-            if dev.id == "default_output" || dev.id == "default_input" {
-                continue;
+    let has_discovered = !s.available_audio_devices.is_empty() || !s.available_app_audio.is_empty();
+    if has_discovered {
+        let mut list = col()
+            .key("rec-audio-list")
+            .w_full()
+            .min_w(0.0)
+            .min_h(0.0)
+            .max_h(260.0)
+            .gap(space::XS)
+            .clip_rounded(radius::SM)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            });
+
+        let extra_devices: Vec<_> = s
+            .available_audio_devices
+            .iter()
+            .enumerate()
+            .filter(|(_, dev)| dev.id != "default_output" && dev.id != "default_input")
+            .collect();
+
+        if !extra_devices.is_empty() {
+            list = list.child(
+                text("Discovered Audio Devices")
+                    .font(typography::MONO_BADGE)
+                    .color(p.text_muted),
+            );
+            for (idx, dev) in extra_devices {
+                let active = cfg.audio_sources.iter().any(|src| src == &dev.id);
+                list = list.child(audio_source_row(
+                    p,
+                    &format!("audio-dev-{idx}"),
+                    &dev.id,
+                    &dev.label,
+                    active,
+                ));
             }
-            let active = cfg.audio_sources.iter().any(|src| src == &dev.id);
-            c = c.child(audio_source_row(
-                p,
-                &format!("audio-dev-{idx}"),
-                &dev.id,
-                &dev.label,
-                active,
-            ));
         }
-    }
 
-    if !s.available_app_audio.is_empty() {
-        c = c.child(
-            text("Application Audio Streams")
-                .font(typography::MONO_BADGE)
-                .color(p.text_muted),
-        );
-        for (idx, app) in s.available_app_audio.iter().enumerate() {
-            let active = cfg.audio_sources.iter().any(|src| src == &app.id);
-            c = c.child(audio_source_row(
-                p,
-                &format!("audio-app-{idx}"),
-                &app.id,
-                &app.label,
-                active,
-            ));
+        if !s.available_app_audio.is_empty() {
+            list = list.child(
+                text("Application Audio Streams")
+                    .font(typography::MONO_BADGE)
+                    .color(p.text_muted),
+            );
+            for (idx, app) in s.available_app_audio.iter().enumerate() {
+                let active = cfg.audio_sources.iter().any(|src| src == &app.id);
+                list = list.child(audio_source_row(
+                    p,
+                    &format!("audio-app-{idx}"),
+                    &app.id,
+                    &app.label,
+                    active,
+                ));
+            }
         }
-    }
 
-    if s.available_audio_devices.is_empty() && s.available_app_audio.is_empty() {
+        c = c.child(list);
+    } else {
         c = c.child(
             text("Click Refresh to discover additional audio devices and per-app streams.")
                 .font(typography::LABEL)
-                .color(p.text_muted),
+                .color(p.text_muted)
+                .w_full()
+                .wrap(),
         );
     }
 
+    if !cfg.audio_sources.is_empty() {
+        let mut inspector = col()
+            .key("rec-audio-inspector")
+            .w_full()
+            .min_w(0.0)
+            .gap(space::XS)
+            .px(space::SM)
+            .py(space::XS)
+            .fill(p.bg_lowest)
+            .border(1.0, p.border_subtle)
+            .radius(radius::SM)
+            .clip_rounded(radius::SM)
+            .child(
+                text("ACTIVE ROUTING DETAIL")
+                    .font(typography::MONO_BADGE)
+                    .color(p.text_muted),
+            );
+
+        for (idx, src_id) in cfg.audio_sources.iter().enumerate() {
+            let full_label = resolve_audio_source_label(s, src_id);
+            inspector = inspector.child(
+                col()
+                    .key(format!("rec-audio-active-{idx}"))
+                    .w_full()
+                    .min_w(0.0)
+                    .gap(2.0)
+                    .child(
+                        text(full_label)
+                            .w_full()
+                            .font(typography::LABEL)
+                            .color(p.text_primary)
+                            .wrap(),
+                    )
+                    .child(
+                        text(src_id.clone())
+                            .w_full()
+                            .font(typography::MONO_BADGE)
+                            .color(p.text_muted)
+                            .wrap_anywhere(),
+                    ),
+            );
+        }
+
+        c = c.child(inspector);
+    }
+
     c
+}
+
+fn resolve_audio_source_label(s: &AppState, id: &str) -> String {
+    if id == "default_output" {
+        return "System Desktop Audio".to_string();
+    }
+    if id == "default_input" {
+        return "Default Microphone".to_string();
+    }
+    if let Some(dev) = s.available_audio_devices.iter().find(|d| d.id == id) {
+        return dev.label.clone();
+    }
+    if let Some(app) = s.available_app_audio.iter().find(|a| a.id == id) {
+        return app.label.clone();
+    }
+    id.to_string()
 }
 
 fn audio_source_row(p: &Palette, key: &str, id: &str, label: &str, checked: bool) -> El {
@@ -1234,37 +1325,54 @@ fn audio_source_row(p: &Palette, key: &str, id: &str, label: &str, checked: bool
     row()
         .key(key)
         .w_full()
+        .min_w(0.0)
         .px(space::SM)
-        .py(space::XS)
-        .justify_between()
+        .py(space::SM)
+        .gap(space::SM)
         .center_y()
-        .fill(p.bg_lowest)
-        .border(1.0, p.border_subtle)
+        .fill(if checked { p.accent_soft } else { p.bg_lowest })
+        .border(
+            1.0,
+            if checked {
+                p.border_active
+            } else {
+                p.border_subtle
+            },
+        )
         .radius(radius::SM)
+        .clip_rounded(radius::SM)
         .child(
-            row()
-                .key("audio-row-left")
-                .gap(space::SM)
-                .center_y()
+            checkbox(p, &format!("{key}-chk"), label, checked, move |st| {
+                st.toggle_audio_source(source_id.clone());
+            })
+            .min_w(16.0),
+        )
+        .child(
+            col()
+                .key(format!("{key}-info"))
                 .grow(1.0)
                 .min_w(0.0)
-                .child(checkbox(p, "chk", label, checked, move |st| {
-                    st.toggle_audio_source(source_id.clone());
-                }))
+                .gap(2.0)
                 .child(
                     text(label.to_string())
+                        .key(format!("{key}-label"))
+                        .w_full()
                         .font(typography::LABEL)
                         .color(if checked {
                             p.text_primary
                         } else {
                             p.text_secondary
-                        }),
+                        })
+                        .truncate(),
+                )
+                .child(
+                    text(id.to_string())
+                        .key(format!("{key}-id"))
+                        .w_full()
+                        .font(typography::MONO_BADGE)
+                        .color(p.text_muted)
+                        .truncate_middle(),
                 ),
-        )
-        .child(
-            text(id.to_string())
-                .font(typography::MONO_BADGE)
-                .color(p.text_muted),
         )
 }
 
@@ -1392,5 +1500,147 @@ fn encoder_short_label(encoder: EncoderMode) -> &'static str {
     match encoder {
         EncoderMode::Gpu => "GPU",
         EncoderMode::Cpu => "CPU",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clipforge_capture::AudioDeviceInfo;
+    use rune::{Env, Runtime};
+
+    use crate::state::{AppState, NavSection};
+    use crate::views::root_view;
+
+    fn long_pipewire_state() -> AppState {
+        AppState {
+            nav: NavSection::Recording,
+            available_audio_devices: vec![
+                AudioDeviceInfo {
+                    id: "alsa_input.usb-Logitech_G_PRO_X_Gaming_Headset-00.mono-fallback"
+                        .to_string(),
+                    label: "Logitech G PRO X Gaming Headset".to_string(),
+                },
+                AudioDeviceInfo {
+                    id: "alsa_output.usb-Logitech_G_PRO_X_Gaming_Headset-00.analog-stereo.monitor"
+                        .to_string(),
+                    label: "Monitor of Logitech G PRO X Gaming Headset Analog Stereo".to_string(),
+                },
+                AudioDeviceInfo {
+                    id: "alsa_output.pci-0000_01_00.1.hdmi-stereo.monitor".to_string(),
+                    label: "Monitor of GA104 High Definition Audio Controller Digital Stereo"
+                        .to_string(),
+                },
+                AudioDeviceInfo {
+                    id: "linuxsoundboard.virtual_mic_feeder".to_string(),
+                    label: "linuxsoundboard.virtual_mic_feeder".to_string(),
+                },
+            ],
+            available_app_audio: vec![AudioDeviceInfo {
+                id: "app:Firefox:12345".to_string(),
+                label: "Firefox Nightly Audio Stream (WebRTC Conference)".to_string(),
+            }],
+            ..AppState::default()
+        }
+    }
+
+    fn assert_contained_horizontally(inner: [f32; 4], outer: [f32; 4], label: &str) {
+        assert!(
+            inner[0] >= outer[0] - 0.5 && inner[0] + inner[2] <= outer[0] + outer[2] + 0.5,
+            "{label} horizontal overflow: inner={inner:?}, outer={outer:?}"
+        );
+    }
+
+    fn assert_contained_vertically(inner: [f32; 4], outer: [f32; 4], label: &str) {
+        assert!(
+            inner[1] >= outer[1] - 0.5 && inner[1] + inner[3] <= outer[1] + outer[3] + 0.5,
+            "{label} vertical overflow: inner={inner:?}, outer={outer:?}"
+        );
+    }
+
+    fn rect_of(rt: &Runtime<AppState>, key: &str) -> [f32; 4] {
+        rt.presented(key)
+            .unwrap_or_else(|| panic!("missing presented rect for {key}"))
+            .0
+    }
+
+    #[test]
+    fn pipewire_device_list_renders_without_overlap_at_multiple_sizes() {
+        for (width, height) in [(1280.0_f32, 800.0_f32), (960.0_f32, 640.0_f32)] {
+            let mut rt = Runtime::new(
+                long_pipewire_state(),
+                root_view,
+                (width, height),
+                Env::new(true, 1.0),
+            );
+            rt.frame(0.0);
+
+            let card_rect = rect_of(&rt, "rec-audio-card");
+            let list_rect = rect_of(&rt, "rec-audio-list");
+            assert_contained_horizontally(list_rect, card_rect, "rec-audio-list");
+            assert!(
+                list_rect[3] <= 261.0,
+                "rec-audio-list should stay bounded for scrolling, got height {}",
+                list_rect[3]
+            );
+
+            for key in [
+                "audio-default-out",
+                "audio-default-in",
+                "audio-dev-0",
+                "audio-dev-1",
+                "audio-dev-2",
+                "audio-dev-3",
+                "audio-app-0",
+            ] {
+                let row_rect = rect_of(&rt, key);
+                let chk_rect = rect_of(&rt, &format!("{key}-chk"));
+                let info_rect = rect_of(&rt, &format!("{key}-info"));
+                let label_rect = rect_of(&rt, &format!("{key}-label"));
+                let id_rect = rect_of(&rt, &format!("{key}-id"));
+
+                assert_contained_horizontally(row_rect, card_rect, key);
+                assert_contained_horizontally(info_rect, row_rect, &format!("{key}-info"));
+                assert_contained_horizontally(label_rect, row_rect, &format!("{key}-label"));
+                assert_contained_horizontally(id_rect, row_rect, &format!("{key}-id"));
+                assert_contained_vertically(label_rect, row_rect, &format!("{key}-label"));
+                assert_contained_vertically(id_rect, row_rect, &format!("{key}-id"));
+
+                assert!(
+                    chk_rect[0] + chk_rect[2] <= info_rect[0] + 0.5,
+                    "{key} checkbox overlaps text column: chk={chk_rect:?}, info={info_rect:?}"
+                );
+                assert!(
+                    label_rect[1] + label_rect[3] <= id_rect[1] + 0.5,
+                    "{key} label overlaps id vertically: label={label_rect:?}, id={id_rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pipewire_device_checkbox_toggles_source_and_updates_inspector() {
+        let mut rt = Runtime::new(
+            long_pipewire_state(),
+            root_view,
+            (1280.0, 1200.0),
+            Env::new(true, 1.0),
+        );
+        rt.frame(0.0);
+
+        let (cx, cy) = rt
+            .find("audio-dev-1-chk")
+            .expect("audio-dev-1-chk should be clickable");
+        rt.pointer_down(cx, cy);
+        rt.pointer_up(cx, cy);
+        rt.frame(0.0);
+        assert!(
+            rt.state.config.capture.audio_sources.iter().any(|id| id
+                == "alsa_output.usb-Logitech_G_PRO_X_Gaming_Headset-00.analog-stereo.monitor"),
+            "clicking audio-dev-1-chk should select the PipeWire monitor source"
+        );
+        assert!(
+            rt.presented("rec-audio-inspector").is_some(),
+            "rec-audio-inspector should render when sources are selected"
+        );
     }
 }
