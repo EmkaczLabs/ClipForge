@@ -4,7 +4,9 @@ use rune::tok::type_;
 use rune::{El, col, el, row, text};
 
 use crate::components::{badge, btn_primary, btn_secondary, card, pill_option, section_header};
-use crate::state::{AppState, LibraryFilter, LibraryViewMode, format_bytes, format_duration_ms};
+use crate::state::{
+    AppState, LibraryFilter, LibraryViewMode, format_bytes, format_duration_ms, is_sample_clip,
+};
 use crate::theme::{Palette, radius, space};
 
 pub fn view(p: &Palette, s: &AppState) -> El {
@@ -71,6 +73,28 @@ pub fn view(p: &Palette, s: &AppState) -> El {
     );
 
     let mut content = col().key("lib-items").w_full().gap(space::MD);
+    if s.using_sample_clips {
+        content = content.child(
+            card(p, "lib-sample-notice").child(
+                row()
+                    .key("lib-sample-row")
+                    .w_full()
+                    .justify_between()
+                    .center_y()
+                    .child(
+                        text("Showing sample clips — no local recordings indexed yet")
+                            .font(type_::LABEL)
+                            .color(p.warning),
+                    )
+                    .child(badge(
+                        "lib-sample-badge",
+                        "SAMPLE DATA",
+                        p.warning,
+                        p.warning_soft,
+                    )),
+            ),
+        );
+    }
     if filtered.is_empty() {
         content = content.child(
             card(p, "lib-empty")
@@ -111,9 +135,20 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                             .key("info")
                             .gap(4.0)
                             .child(
-                                text(clip.title.clone())
-                                    .font(type_::BODY)
-                                    .color(p.text_primary),
+                                row()
+                                    .key("list-title-row")
+                                    .gap(space::SM)
+                                    .center_y()
+                                    .child(
+                                        text(clip.title.clone())
+                                            .font(type_::BODY)
+                                            .color(p.text_primary),
+                                    )
+                                    .child(if is_sample_clip(clip) {
+                                        badge("sample", "SAMPLE", p.warning, p.warning_soft)
+                                    } else {
+                                        badge("recorded", "REC", p.success, p.success_soft)
+                                    }),
                             )
                             .child(
                                 text(format!(
@@ -174,12 +209,23 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                                 .fill(p.bg_elevated)
                                 .border(1.0, p.border_subtle)
                                 .padding(space::SM)
-                                .child(badge(
-                                    "dur",
-                                    &format_duration_ms(clip.duration_ms),
-                                    p.text_primary,
-                                    p.bg_base,
-                                )),
+                                .child(
+                                    row()
+                                        .key("thumb-badges")
+                                        .w_full()
+                                        .justify_between()
+                                        .child(badge(
+                                            "dur",
+                                            &format_duration_ms(clip.duration_ms),
+                                            p.text_primary,
+                                            p.bg_base,
+                                        ))
+                                        .child(if is_sample_clip(clip) {
+                                            badge("sample", "SAMPLE", p.warning, p.warning_soft)
+                                        } else {
+                                            badge("recorded", "REC", p.success, p.success_soft)
+                                        }),
+                                ),
                         )
                         .child(
                             row()

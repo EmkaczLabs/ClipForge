@@ -6,7 +6,7 @@ use rune::{El, col, el, row, text};
 use crate::components::{
     badge, btn_primary, btn_secondary, card, kv_row, pill_option, section_header, toggle_switch,
 };
-use crate::state::{AppState, NavSection, format_duration_ms};
+use crate::state::{AppState, NavSection, format_duration_ms, is_sample_clip};
 use crate::theme::{Palette, radius, snappy_spring, space};
 
 pub fn view(p: &Palette, s: &AppState) -> El {
@@ -24,6 +24,13 @@ pub fn view(p: &Palette, s: &AppState) -> El {
             }));
     };
 
+    let clip_id = clip.id;
+    let is_sample = is_sample_clip(clip);
+    let source_label = if is_sample {
+        "Sample clip (no file on disk)".to_string()
+    } else {
+        clip.file_path.display().to_string()
+    };
     let duration_ms = clip.duration_ms.max(1_000);
     let start_ratio = (s.editor.trim_start_ms as f32 / duration_ms as f32).clamp(0.0, 1.0);
     let end_ratio = (s.editor.trim_end_ms as f32 / duration_ms as f32).clamp(start_ratio, 1.0);
@@ -61,12 +68,23 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                             .color(p.text_secondary),
                         ),
                 )
-                .child(badge(
-                    "editor-dur-badge",
-                    &format!("Duration {}", format_duration_ms(clip.duration_ms)),
-                    p.text_primary,
-                    p.bg_elevated,
-                )),
+                .child(
+                    row()
+                        .key("editor-hdr-badges")
+                        .gap(space::SM)
+                        .center_y()
+                        .child(if is_sample {
+                            badge("editor-sample-badge", "SAMPLE", p.warning, p.warning_soft)
+                        } else {
+                            badge("editor-rec-badge", "RECORDED", p.success, p.success_soft)
+                        })
+                        .child(badge(
+                            "editor-dur-badge",
+                            &format!("Duration {}", format_duration_ms(clip.duration_ms)),
+                            p.text_primary,
+                            p.bg_elevated,
+                        )),
+                ),
         )
         .child(
             col()
@@ -95,7 +113,8 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                     ))
                     .font(type_::LABEL)
                     .color(p.text_secondary),
-                ),
+                )
+                .child(text(source_label).font(type_::LABEL).color(p.text_muted)),
         )
         .child(
             row()
@@ -119,7 +138,13 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                         .child(btn_secondary(p, "step-fwd", "+5s", move |st| {
                             st.editor.playhead_ms =
                                 (st.editor.playhead_ms + 5_000).min(duration_ms);
-                        })),
+                        }))
+                        .child(btn_secondary(
+                            p,
+                            "open-player",
+                            "Open in Player",
+                            move |st| st.open_clip_in_player(clip_id),
+                        )),
                 )
                 .child(btn_secondary(
                     p,

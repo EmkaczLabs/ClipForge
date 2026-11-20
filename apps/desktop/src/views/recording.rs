@@ -13,8 +13,14 @@ use crate::theme::{Palette, space};
 pub fn view(p: &Palette, s: &AppState) -> El {
     let is_buffering = matches!(s.capture_status, CaptureStatus::ReplayBuffering { .. });
     let is_recording = matches!(s.capture_status, CaptureStatus::Recording { .. });
+    let capture_error = match &s.capture_status {
+        CaptureStatus::Error { message } => Some(message.as_str()),
+        _ => None,
+    };
 
-    let gsr_status = if s.deps.gsr_available {
+    let gsr_status = if capture_error.is_some() {
+        badge("rec-gsr-error", "Capture Error", p.warning, p.warning_soft)
+    } else if s.deps.gsr_available {
         badge(
             "rec-gsr-ready",
             s.deps
@@ -33,7 +39,7 @@ pub fn view(p: &Palette, s: &AppState) -> El {
         )
     };
 
-    let controls_card = card(p, "rec-controls-card")
+    let mut controls_card = card(p, "rec-controls-card")
         .child(
             row()
                 .key("rec-hdr-row")
@@ -57,9 +63,18 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                         st.toggle_replay_buffer();
                     })
                 } else {
-                    btn_primary(p, "rec-replay-btn", "Start Replay Buffer", |st| {
-                        st.toggle_replay_buffer();
-                    })
+                    btn_primary(
+                        p,
+                        "rec-replay-btn",
+                        if capture_error.is_some() {
+                            "Restart Replay Buffer"
+                        } else {
+                            "Start Replay Buffer"
+                        },
+                        |st| {
+                            st.toggle_replay_buffer();
+                        },
+                    )
                 })
                 .child(btn_secondary(
                     p,
@@ -77,6 +92,23 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                     })
                 }),
         );
+    if let Some(err_msg) = capture_error {
+        controls_card = controls_card.child(
+            row()
+                .key("rec-capture-error")
+                .w_full()
+                .justify_between()
+                .center_y()
+                .child(
+                    text(format!("Capture failed: {err_msg}"))
+                        .font(type_::LABEL)
+                        .color(p.warning),
+                )
+                .child(btn_secondary(p, "rec-clear-err", "Dismiss Error", |st| {
+                    st.clear_capture_error();
+                })),
+        );
+    }
 
     let cfg = &s.config.capture;
 

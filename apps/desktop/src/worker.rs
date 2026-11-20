@@ -58,6 +58,7 @@ pub enum WorkerCommand {
         api_token: Option<String>,
     },
     SaveConfig(AppConfig),
+    OpenInPlayer(PathBuf),
 }
 
 /// Events emitted by the background Tokio worker back to the Rune UI thread.
@@ -174,12 +175,19 @@ async fn handle_command(
 ) {
     match cmd {
         WorkerCommand::Initialize(cfg) => {
+            let t_init = std::time::Instant::now();
             let deps = probe_dependencies().await;
             let _ = evt_tx.send(WorkerEvent::DependenciesProbed(deps));
+            let t_deps = t_init.elapsed();
 
             if let Some(store) = ensure_store(&svc, &cfg) {
                 scan_and_load_library(&store, &svc.media, &cfg, evt_tx).await;
             }
+            tracing::info!(
+                deps_ms = t_deps.as_secs_f64() * 1000.0,
+                total_ms = t_init.elapsed().as_secs_f64() * 1000.0,
+                "Worker Initialize completed"
+            );
             (waker)();
         }
         WorkerCommand::ProbeDependencies => {
@@ -211,7 +219,11 @@ async fn handle_command(
                     let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(st));
                 }
                 Err(err) => {
-                    let _ = evt_tx.send(WorkerEvent::Banner(err.to_string()));
+                    let msg = err.to_string();
+                    let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(CaptureStatus::Error {
+                        message: msg.clone(),
+                    }));
+                    let _ = evt_tx.send(WorkerEvent::Banner(msg));
                 }
             }
             (waker)();
@@ -223,7 +235,11 @@ async fn handle_command(
                     let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(st));
                 }
                 Err(err) => {
-                    let _ = evt_tx.send(WorkerEvent::Banner(err.to_string()));
+                    let msg = err.to_string();
+                    let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(CaptureStatus::Error {
+                        message: msg.clone(),
+                    }));
+                    let _ = evt_tx.send(WorkerEvent::Banner(msg));
                 }
             }
             (waker)();
@@ -235,6 +251,11 @@ async fn handle_command(
                         "Replay saved: {}",
                         path.display()
                     )));
+                    let store = svc.store.lock().ok().and_then(|g| g.clone());
+                    if let Some(store) = store {
+                        let _ = index_single_clip(&store, &svc.media, &path, true).await;
+                        emit_library_loaded(&store, evt_tx).await;
+                    }
                 }
                 Err(err) => {
                     let _ = evt_tx.send(WorkerEvent::Banner(err.to_string()));
@@ -318,6 +339,29 @@ async fn handle_command(
             let _ = evt_tx.send(WorkerEvent::ConfigSaved(res));
             (waker)();
         }
+        WorkerCommand::OpenInPlayer(path) => {
+            if !path.is_file() {
+                let _ = evt_tx.send(WorkerEvent::Banner(format!(
+                    "Clip file not found on disk: {}",
+                    path.display()
+                )));
+                (waker)();
+                return;
+            }
+            match Command::new("xdg-open").arg(&path).spawn() {
+                Ok(_) => {
+                    let _ = evt_tx.send(WorkerEvent::Banner(format!(
+                        "Opened {} in system player",
+                        path.display()
+                    )));
+                }
+                Err(err) => {
+                    let _ =
+                        evt_tx.send(WorkerEvent::Banner(format!("Failed to open player: {err}")));
+                }
+            }
+            (waker)();
+        }
     }
 }
 
@@ -344,63 +388,61 @@ fn ensure_store(svc: &WorkerServices, cfg: &AppConfig) -> Option<Arc<SqliteClipS
     }
 }
 
-async fn scan_and_load_library(
+async fn index_single_clip(
     store: &SqliteClipStore,
     media: &FfmpegMediaProcessor,
-    cfg: &AppConfig,
-    evt_tx: &Sender<WorkerEvent>,
-) {
-    if cfg.clips_dir.exists()
-        && let Ok(new_files) = DirectoryScanner::new()
-            .scan_new_recordings(&cfg.clips_dir, store)
-            .await
-    {
-        for path in new_files {
-            if let Ok(probe) = media.probe(&path).await {
-                let id = ClipId::new();
-                let title = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Clip")
-                    .to_string();
-                let thumb_path = if cfg.auto_generate_thumbnails {
-                    let t_path = cfg.clips_dir.join(".thumbs").join(format!("{id}.png"));
-                    let at_ms = (probe.duration_ms / 4).min(5_000);
-                    if media
-                        .generate_thumbnail(&path, at_ms, &t_path)
-                        .await
-                        .is_ok()
-                    {
-                        Some(t_path)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let clip = ClipMetadata {
-                    id,
-                    title,
-                    game: None,
-                    file_path: path,
-                    thumbnail_path: thumb_path,
-                    created_at: Utc::now(),
-                    duration_ms: probe.duration_ms,
-                    width: probe.width,
-                    height: probe.height,
-                    fps: probe.fps,
-                    size_bytes: probe.size_bytes,
-                    codec: probe.video_codec,
-                    audio_tracks: probe.audio_tracks,
-                    tags: vec![],
-                    cloud_share: None,
-                    notes: None,
-                };
-                let _ = store.upsert_clip(&clip).await;
-            }
-        }
+    path: &std::path::Path,
+    auto_generate_thumbnails: bool,
+) -> bool {
+    if store.get_by_file_path(path).await.ok().flatten().is_some() {
+        return false;
     }
+    let Ok(probe) = media.probe(path).await else {
+        return false;
+    };
+    let id = ClipId::new();
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Clip")
+        .to_string();
+    let thumb_path = if auto_generate_thumbnails {
+        let thumbs_dir = path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(".thumbs");
+        let t_path = thumbs_dir.join(format!("{id}.png"));
+        let at_ms = (probe.duration_ms / 4).min(5_000);
+        if media.generate_thumbnail(path, at_ms, &t_path).await.is_ok() {
+            Some(t_path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let clip = ClipMetadata {
+        id,
+        title,
+        game: None,
+        file_path: path.to_path_buf(),
+        thumbnail_path: thumb_path,
+        created_at: Utc::now(),
+        duration_ms: probe.duration_ms,
+        width: probe.width,
+        height: probe.height,
+        fps: probe.fps,
+        size_bytes: probe.size_bytes,
+        codec: probe.video_codec,
+        audio_tracks: probe.audio_tracks,
+        tags: vec![],
+        cloud_share: None,
+        notes: None,
+    };
+    store.upsert_clip(&clip).await.is_ok()
+}
 
+async fn emit_library_loaded(store: &SqliteClipStore, evt_tx: &Sender<WorkerEvent>) {
     if let Ok(clips) = store.list_clips(&ClipFilter::default()).await {
         let mut favorites = HashSet::new();
         for c in &clips {
@@ -409,6 +451,33 @@ async fn scan_and_load_library(
             }
         }
         let _ = evt_tx.send(WorkerEvent::LibraryLoaded { clips, favorites });
+    }
+}
+
+async fn scan_and_load_library(
+    store: &SqliteClipStore,
+    media: &FfmpegMediaProcessor,
+    cfg: &AppConfig,
+    evt_tx: &Sender<WorkerEvent>,
+) {
+    // Emit existing SQLite clips immediately so the UI does not wait on ffprobe/ffmpeg for new files.
+    emit_library_loaded(store, evt_tx).await;
+
+    let mut indexed_any = false;
+    if cfg.clips_dir.exists()
+        && let Ok(new_files) = DirectoryScanner::new()
+            .scan_new_recordings(&cfg.clips_dir, store)
+            .await
+    {
+        for path in new_files {
+            if index_single_clip(store, media, &path, cfg.auto_generate_thumbnails).await {
+                indexed_any = true;
+            }
+        }
+    }
+
+    if indexed_any {
+        emit_library_loaded(store, evt_tx).await;
     }
 }
 

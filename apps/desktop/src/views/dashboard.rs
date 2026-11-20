@@ -7,7 +7,7 @@ use rune::{El, col, row, text};
 use crate::components::{
     badge, btn_danger, btn_primary, btn_secondary, card, section_header, stat_tile,
 };
-use crate::state::{AppState, NavSection, format_bytes, format_duration_ms};
+use crate::state::{AppState, NavSection, format_bytes, format_duration_ms, is_sample_clip};
 use crate::theme::{Palette, space};
 
 pub fn view(p: &Palette, s: &AppState) -> El {
@@ -16,7 +16,13 @@ pub fn view(p: &Palette, s: &AppState) -> El {
     let shared_count = s.uploads.len();
 
     let is_buffering = matches!(s.capture_status, CaptureStatus::ReplayBuffering { .. });
-    let gsr_badge = if s.deps.gsr_available {
+    let capture_error = match &s.capture_status {
+        CaptureStatus::Error { message } => Some(message.as_str()),
+        _ => None,
+    };
+    let gsr_badge = if capture_error.is_some() {
+        badge("dash-gsr-err", "GSR Error", p.warning, p.warning_soft)
+    } else if s.deps.gsr_available {
         badge("dash-gsr-ok", "GSR Ready", p.success, p.success_soft)
     } else {
         badge(
@@ -27,7 +33,7 @@ pub fn view(p: &Palette, s: &AppState) -> El {
         )
     };
 
-    let status_card = card(p, "dash-status-card")
+    let mut status_card = card(p, "dash-status-card")
         .child(
             row()
                 .key("dash-status-top")
@@ -51,9 +57,18 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                         st.toggle_replay_buffer();
                     })
                 } else {
-                    btn_primary(p, "dash-toggle-replay", "Start Replay Buffer", |st| {
-                        st.toggle_replay_buffer();
-                    })
+                    btn_primary(
+                        p,
+                        "dash-toggle-replay",
+                        if capture_error.is_some() {
+                            "Restart Replay Buffer"
+                        } else {
+                            "Start Replay Buffer"
+                        },
+                        |st| {
+                            st.toggle_replay_buffer();
+                        },
+                    )
                 })
                 .child(btn_secondary(
                     p,
@@ -68,6 +83,23 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                     |st| st.nav = NavSection::Recording,
                 )),
         );
+    if let Some(err_msg) = capture_error {
+        status_card = status_card.child(
+            row()
+                .key("dash-capture-error")
+                .w_full()
+                .justify_between()
+                .center_y()
+                .child(
+                    text(format!("Capture failed: {err_msg}"))
+                        .font(type_::LABEL)
+                        .color(p.warning),
+                )
+                .child(btn_secondary(p, "dash-clear-err", "Clear Error", |st| {
+                    st.clear_capture_error();
+                })),
+        );
+    }
 
     let stats_row = row()
         .key("dash-stats")
@@ -78,7 +110,11 @@ pub fn view(p: &Palette, s: &AppState) -> El {
             "stat-clips",
             "Total Clips",
             s.clips.len().to_string(),
-            "Local library",
+            if s.using_sample_clips {
+                "Sample data (no recordings yet)"
+            } else {
+                "Local library"
+            },
         ))
         .child(stat_tile(
             p,
@@ -126,9 +162,20 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                         .key("meta")
                         .gap(2.0)
                         .child(
-                            text(clip.title.clone())
-                                .font(type_::BODY)
-                                .color(p.text_primary),
+                            row()
+                                .key("title-row")
+                                .gap(space::SM)
+                                .center_y()
+                                .child(
+                                    text(clip.title.clone())
+                                        .font(type_::BODY)
+                                        .color(p.text_primary),
+                                )
+                                .child(if is_sample_clip(clip) {
+                                    badge("sample", "SAMPLE", p.warning, p.warning_soft)
+                                } else {
+                                    badge("recorded", "REC", p.success, p.success_soft)
+                                }),
                         )
                         .child(
                             text(format!(

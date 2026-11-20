@@ -147,6 +147,7 @@ pub struct AppState {
     pub capture_status: CaptureStatus,
     pub deps: DependencyStatus,
     pub clips: Vec<ClipMetadata>,
+    pub using_sample_clips: bool,
     pub favorite_ids: HashSet<ClipId>,
     pub library_mode: LibraryViewMode,
     pub library_filter: LibraryFilter,
@@ -206,6 +207,7 @@ impl Default for AppState {
             capture_status: CaptureStatus::Idle,
             deps: DependencyStatus::default(),
             clips,
+            using_sample_clips: true,
             favorite_ids,
             library_mode: LibraryViewMode::Grid,
             library_filter: LibraryFilter::All,
@@ -373,6 +375,7 @@ impl AppState {
             self.status_banner = Some("No clip selected for trim export".to_string());
             return;
         };
+        let is_sample = is_sample_clip(&clip);
         let out_name = format!("{}-trimmed.mp4", clip.id);
         let output_path = self.config.clips_dir.join(out_name);
         let req = TrimRequest {
@@ -385,6 +388,12 @@ impl AppState {
         };
 
         if let Some(worker) = &self.worker {
+            if is_sample || !req.source_path.is_file() {
+                self.status_banner = Some(
+                    "Sample clip cannot be exported — record or scan a real clip first".to_string(),
+                );
+                return;
+            }
             if let Err(err) = req.validate() {
                 self.status_banner = Some(format!("Invalid trim range: {err}"));
                 return;
@@ -430,6 +439,12 @@ impl AppState {
             },
         );
         if let Some(worker) = &self.worker {
+            if is_sample_clip(&clip) || !clip.file_path.is_file() {
+                self.status_banner = Some(
+                    "Sample clip cannot be uploaded — record or scan a real clip first".to_string(),
+                );
+                return;
+            }
             worker.send(WorkerCommand::UploadClip {
                 clip: Box::new(clip),
                 visibility: ShareVisibility::Public,
@@ -494,12 +509,21 @@ impl AppState {
                 }
                 WorkerEvent::LibraryLoaded { clips, favorites } => {
                     if !clips.is_empty() {
+                        self.using_sample_clips = false;
                         self.clips = clips;
                         self.favorite_ids = favorites;
-                        if self.editor.selected_clip_id.is_none()
-                            && let Some(first) = self.clips.first()
-                        {
+                        self.uploads.retain(|u| {
+                            u.share
+                                .as_ref()
+                                .is_none_or(|sh| sh.share_id != "shr_mirage_01")
+                        });
+                        let selected_valid = self
+                            .editor
+                            .selected_clip_id
+                            .is_some_and(|id| self.clips.iter().any(|c| c.id == id));
+                        if !selected_valid && let Some(first) = self.clips.first() {
                             self.editor.selected_clip_id = Some(first.id);
+                            self.editor.trim_start_ms = 0;
                             self.editor.trim_end_ms = first.duration_ms;
                         }
                     }
@@ -587,6 +611,37 @@ impl AppState {
     pub fn set_container(&mut self, container: ContainerFormat) {
         self.config.capture.container = container;
     }
+
+    /// Launches the clip in the system video player via the background worker.
+    pub fn open_clip_in_player(&mut self, id: ClipId) {
+        let Some(clip) = self.clips.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        if is_sample_clip(&clip) || !clip.file_path.is_file() {
+            self.status_banner = Some(
+                "Sample clip has no video file on disk — record a real clip to play it".to_string(),
+            );
+            return;
+        }
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::OpenInPlayer(clip.file_path));
+        } else {
+            self.status_banner = Some(format!("Play clip: {}", clip.file_path.display()));
+        }
+    }
+
+    /// Resets `CaptureStatus::Error` back to `CaptureStatus::Idle` for recovery.
+    pub fn clear_capture_error(&mut self) {
+        if matches!(self.capture_status, CaptureStatus::Error { .. }) {
+            self.capture_status = CaptureStatus::Idle;
+            self.status_banner = None;
+        }
+    }
+}
+
+/// Returns `true` when `clip` is an in-memory sample/demo entry rather than a real recording.
+pub fn is_sample_clip(clip: &ClipMetadata) -> bool {
+    clip.tags.iter().any(|t| t == "sample")
 }
 
 fn codec_label(codec: VideoCodec) -> &'static str {
@@ -647,7 +702,11 @@ fn seed_initial_clips() -> Vec<ClipMetadata> {
                 sample_rate: 48_000,
                 label: Some("Game + Mic".to_string()),
             }],
-            tags: vec!["clutch".to_string(), "ace".to_string()],
+            tags: vec![
+                "sample".to_string(),
+                "clutch".to_string(),
+                "ace".to_string(),
+            ],
             cloud_share: Some(CloudShareInfo {
                 share_id: "shr_mirage_01".to_string(),
                 url: "https://clips.local/s/shr_mirage_01".to_string(),
@@ -675,7 +734,7 @@ fn seed_initial_clips() -> Vec<ClipMetadata> {
             size_bytes: 38_900_000,
             codec: "hevc".to_string(),
             audio_tracks: vec![],
-            tags: vec!["aerial".to_string()],
+            tags: vec!["sample".to_string(), "aerial".to_string()],
             cloud_share: None,
             notes: None,
         },
@@ -698,7 +757,7 @@ fn seed_initial_clips() -> Vec<ClipMetadata> {
             size_bytes: 61_500_000,
             codec: "h264".to_string(),
             audio_tracks: vec![],
-            tags: vec!["boss".to_string()],
+            tags: vec!["sample".to_string(), "boss".to_string()],
             cloud_share: None,
             notes: None,
         },

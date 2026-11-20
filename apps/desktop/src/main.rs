@@ -9,14 +9,21 @@ mod theme;
 mod views;
 mod worker;
 
+use std::time::Instant;
+
 use rune::{AppSpec, Tx, Waker};
 use state::{AppState, NavSection};
 use worker::{WorkerCommand, WorkerHandle};
 
 fn setup_worker(state: &mut AppState, waker: Waker) {
+    let t0 = Instant::now();
     let handle = WorkerHandle::spawn(waker);
     handle.send(WorkerCommand::Initialize(state.config.clone()));
     state.worker = Some(handle);
+    tracing::info!(
+        elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0,
+        "setup_worker spawned background worker"
+    );
 }
 
 fn poll_worker(state: &mut AppState, _now: f64, _tx: &mut Tx) -> bool {
@@ -139,5 +146,24 @@ mod tests {
         let prev = rt.state.config.auto_generate_thumbnails;
         click_key(&mut rt, "settings-thumbs-switch");
         assert_eq!(rt.state.config.auto_generate_thumbnails, !prev);
+    }
+
+    #[test]
+    fn sample_clips_distinguished_and_recovery_clears_error() {
+        let env = Env::new(true, 1.0);
+        let initial = AppState {
+            capture_status: CaptureStatus::Error {
+                message: "GSR crashed".to_string(),
+            },
+            ..AppState::default()
+        };
+        let mut rt = Runtime::new(initial, views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        assert!(rt.state.using_sample_clips);
+        assert!(rt.state.clips.iter().all(state::is_sample_clip));
+
+        click_key(&mut rt, "dash-clear-err");
+        assert_eq!(rt.state.capture_status, CaptureStatus::Idle);
     }
 }
