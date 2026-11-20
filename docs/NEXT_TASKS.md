@@ -1,9 +1,9 @@
 # ClipForge Next Tasks
 
-Ordered tasks remaining after verified commit `18cd8cb` on CachyOS (KDE Plasma / Wayland):
+Ordered tasks remaining after verified commit `ea43ff0` on CachyOS (KDE Plasma / Wayland):
 
 1. **Manual Interactive Windowed Verification (Wayland):**
-   - Run `cargo run -p clipforge-desktop` interactively on KDE Wayland and verify live multi-frame embedded video playback, pointer-drag timeline scrubbing, draggable trim-in/trim-out handles, and Library click/double-click UX.
+   - Run `cargo run -p clipforge-desktop` interactively on KDE Wayland and verify live multi-frame embedded video playback, pointer-drag timeline scrubbing, draggable trim-in/trim-out handles, and Library multi-select/trash/restore/rename/context-menu UX.
 2. **Migrate `apps/desktop` Sample Tracking to `ClipOrigin::Sample`:**
    - Switch `apps/desktop` (`state.rs`, `worker.rs`) from the `"sample"` tag convention to `crates/library`'s v2 `ClipOrigin::Sample` / `list_clips_filtered` APIs.
 3. **Wayland `FocusedWindow` Guard & Codec UX:**
