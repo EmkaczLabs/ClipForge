@@ -4,10 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Utc};
-use clipforge_cloud_client::ShareVisibility;
+use clipforge_capture::{AudioDeviceInfo, MonitorInfo};
+use clipforge_cloud_client::{RemoteClipSummary, ShareVisibility};
 use clipforge_common::{
-    AppConfig, AudioTrackInfo, CaptureEvent, CaptureStatus, CaptureTarget, ClipId, ClipMetadata,
-    CloudShareInfo, ContainerFormat, EncoderMode, GameInfo, QualityPreset, TrimRequest, VideoCodec,
+    AppConfig, AudioCodec, AudioTrackInfo, CaptureEvent, CaptureStatus, CaptureTarget, ClipId,
+    ClipMetadata, CloudShareInfo, ContainerFormat, EncoderMode, GameInfo, HotkeyBindings,
+    QualityPreset, TrimRequest, VideoCodec,
 };
 use clipforge_library::{ClipOrigin, ClipSort};
 
@@ -17,8 +19,9 @@ use crate::worker::{DependencyStatus, WorkerCommand, WorkerEvent, WorkerHandle};
 /// Top-level navigation sections in the left sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NavSection {
-    #[default]
+    #[allow(dead_code)]
     Dashboard,
+    #[default]
     Library,
     Editor,
     Recording,
@@ -27,8 +30,7 @@ pub enum NavSection {
 }
 
 impl NavSection {
-    pub const ALL: [NavSection; 6] = [
-        NavSection::Dashboard,
+    pub const ALL: [NavSection; 5] = [
         NavSection::Library,
         NavSection::Editor,
         NavSection::Recording,
@@ -42,7 +44,7 @@ impl NavSection {
             NavSection::Library => "Clip Library",
             NavSection::Editor => "Video Editor",
             NavSection::Recording => "Recording",
-            NavSection::Uploads => "Uploads",
+            NavSection::Uploads => "Shared & Cloud",
             NavSection::Settings => "Settings",
         }
     }
@@ -55,6 +57,61 @@ impl NavSection {
             NavSection::Recording => "nav-recording",
             NavSection::Uploads => "nav-uploads",
             NavSection::Settings => "nav-settings",
+        }
+    }
+}
+
+/// Settings category tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
+pub enum SettingsTab {
+    #[default]
+    General,
+    Storage,
+    Recording,
+    Audio,
+    Shortcuts,
+    Appearance,
+    Sharing,
+    About,
+}
+
+#[allow(dead_code)]
+impl SettingsTab {
+    pub const ALL: [SettingsTab; 8] = [
+        SettingsTab::General,
+        SettingsTab::Storage,
+        SettingsTab::Recording,
+        SettingsTab::Audio,
+        SettingsTab::Shortcuts,
+        SettingsTab::Appearance,
+        SettingsTab::Sharing,
+        SettingsTab::About,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsTab::General => "General",
+            SettingsTab::Storage => "Storage & Library",
+            SettingsTab::Recording => "Recording Defaults",
+            SettingsTab::Audio => "Audio",
+            SettingsTab::Shortcuts => "Keyboard Shortcuts",
+            SettingsTab::Appearance => "Appearance",
+            SettingsTab::Sharing => "Sharing & Server",
+            SettingsTab::About => "About",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            SettingsTab::General => "settings-tab-general",
+            SettingsTab::Storage => "settings-tab-storage",
+            SettingsTab::Recording => "settings-tab-recording",
+            SettingsTab::Audio => "settings-tab-audio",
+            SettingsTab::Shortcuts => "settings-tab-shortcuts",
+            SettingsTab::Appearance => "settings-tab-appearance",
+            SettingsTab::Sharing => "settings-tab-sharing",
+            SettingsTab::About => "settings-tab-about",
         }
     }
 }
@@ -137,6 +194,8 @@ pub struct EditorState {
     pub muted: bool,
     pub has_audio: bool,
     pub audio_error: Option<String>,
+    #[allow(dead_code)]
+    pub audio_track: Option<usize>,
     pub timeline_zoom: f32,
     pub exporting: bool,
     pub export_progress: Option<f32>,
@@ -163,6 +222,7 @@ impl Default for EditorState {
             muted: false,
             has_audio: false,
             audio_error: None,
+            audio_track: None,
             timeline_zoom: 1.0,
             exporting: false,
             export_progress: None,
@@ -206,6 +266,8 @@ pub struct AppState {
     pub library_sort: ClipSort,
     pub library_search: rune::TextEdit,
     pub library_game_filter: Option<String>,
+    #[allow(dead_code)]
+    pub inspector_open: bool,
     pub library_thumbs: HashMap<ClipId, rune::Pixels>,
     pub selected_clip_ids: HashSet<ClipId>,
     pub selection_anchor: Option<ClipId>,
@@ -214,7 +276,31 @@ pub struct AppState {
     pub rename_edit: rune::TextEdit,
     pub context_menu: Option<LibraryContextMenu>,
     pub editor: EditorState,
+    #[allow(dead_code)]
+    pub is_wayland: bool,
+    pub available_monitors: Vec<MonitorInfo>,
+    pub available_audio_devices: Vec<AudioDeviceInfo>,
+    pub available_app_audio: Vec<AudioDeviceInfo>,
+    #[allow(dead_code)]
+    pub settings_tab: SettingsTab,
+    #[allow(dead_code)]
+    pub settings_search: rune::TextEdit,
+    #[allow(dead_code)]
+    pub clips_dir_edit: rune::TextEdit,
     pub uploads: Vec<UploadEntry>,
+    pub server_connected: bool,
+    pub server_health_ok: Option<bool>,
+    pub server_error: Option<String>,
+    pub remote_shares: Vec<RemoteClipSummary>,
+    #[allow(dead_code)]
+    pub selected_upload_id: Option<ClipId>,
+    pub server_url_edit: rune::TextEdit,
+    pub api_token_edit: rune::TextEdit,
+    #[allow(dead_code)]
+    pub server_user_edit: rune::TextEdit,
+    #[allow(dead_code)]
+    pub server_pass_edit: rune::TextEdit,
+    pub confirm_remote_delete: Option<String>,
     pub hotkeys: HotkeyConfig,
     pub status_banner: Option<String>,
     pub worker: Option<WorkerHandle>,
@@ -263,8 +349,24 @@ impl Default for AppState {
             })
             .collect();
 
+        let hotkeys = HotkeyConfig {
+            save_replay: config.hotkeys.save_replay.clone(),
+            toggle_replay: config.hotkeys.toggle_replay.clone(),
+            toggle_record: config.hotkeys.toggle_record.clone(),
+        };
+        let is_wayland = std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false);
+        let server_connected = config
+            .server_url
+            .as_ref()
+            .is_some_and(|u| !u.trim().is_empty());
+        let clips_dir_edit = rune::TextEdit::new(config.clips_dir.display().to_string());
+        let server_url_edit = rune::TextEdit::new(config.server_url.clone().unwrap_or_default());
+        let api_token_edit = rune::TextEdit::new(config.api_token.clone().unwrap_or_default());
+
         Self {
-            nav: NavSection::Dashboard,
+            nav: NavSection::Library,
             config,
             capture_status: CaptureStatus::Idle,
             deps: DependencyStatus::default(),
@@ -279,6 +381,7 @@ impl Default for AppState {
             library_sort: ClipSort::CreatedDesc,
             library_search: rune::TextEdit::default(),
             library_game_filter: None,
+            inspector_open: true,
             library_thumbs: HashMap::new(),
             selected_clip_ids: first_clip.iter().map(|c| c.id).collect(),
             selection_anchor: first_clip.map(|c| c.id),
@@ -287,8 +390,25 @@ impl Default for AppState {
             rename_edit: rune::TextEdit::default(),
             context_menu: None,
             editor,
+            is_wayland,
+            available_monitors: Vec::new(),
+            available_audio_devices: Vec::new(),
+            available_app_audio: Vec::new(),
+            settings_tab: SettingsTab::General,
+            settings_search: rune::TextEdit::default(),
+            clips_dir_edit,
             uploads,
-            hotkeys: HotkeyConfig::default(),
+            server_connected,
+            server_health_ok: None,
+            server_error: None,
+            remote_shares: Vec::new(),
+            selected_upload_id: None,
+            server_url_edit,
+            api_token_edit,
+            server_user_edit: rune::TextEdit::default(),
+            server_pass_edit: rune::TextEdit::default(),
+            confirm_remote_delete: None,
+            hotkeys,
             status_banner: None,
             worker: None,
         }
@@ -1499,6 +1619,66 @@ impl AppState {
                             Some(format!("Visibility update failed for {share_id}: {err}"));
                     }
                 }
+                WorkerEvent::CaptureSourcesDiscovered {
+                    monitors,
+                    audio_devices,
+                    app_audio,
+                } => {
+                    self.available_monitors = monitors;
+                    self.available_audio_devices = audio_devices;
+                    self.available_app_audio = app_audio;
+                }
+                WorkerEvent::ServerHealthChecked { ok, error } => {
+                    self.server_health_ok = Some(ok);
+                    self.server_error = error;
+                }
+                WorkerEvent::ServerConnected(res) => match res {
+                    Ok((url, token)) => {
+                        self.config.server_url = Some(url.clone());
+                        if let Some(tok) = token {
+                            self.config.api_token = Some(tok.clone());
+                            self.api_token_edit = rune::TextEdit::new(tok);
+                        }
+                        self.server_url_edit = rune::TextEdit::new(url.clone());
+                        self.server_connected = true;
+                        self.server_health_ok = Some(true);
+                        self.server_error = None;
+                        self.save_config();
+                        self.refresh_remote_shares();
+                        self.status_banner = Some(format!("Connected to {url}"));
+                    }
+                    Err(err) => {
+                        self.server_connected = false;
+                        self.server_health_ok = Some(false);
+                        self.server_error = Some(err.clone());
+                        self.status_banner = Some(format!("Server connection failed: {err}"));
+                    }
+                },
+                WorkerEvent::RemoteSharesLoaded(res) => match res {
+                    Ok(list) => {
+                        self.remote_shares = list;
+                        self.server_error = None;
+                    }
+                    Err(err) => {
+                        self.server_error = Some(err);
+                    }
+                },
+                WorkerEvent::RemoteShareDeleted { share_id, result } => {
+                    self.confirm_remote_delete = None;
+                    match result {
+                        Ok(()) => {
+                            self.remote_shares.retain(|s| s.share_id != share_id);
+                            self.uploads.retain(|u| {
+                                u.share.as_ref().is_none_or(|sh| sh.share_id != share_id)
+                            });
+                            self.status_banner = Some(format!("Deleted remote share {share_id}"));
+                        }
+                        Err(err) => {
+                            self.server_error = Some(err.clone());
+                            self.status_banner = Some(format!("Remote delete failed: {err}"));
+                        }
+                    }
+                }
                 WorkerEvent::Banner(msg) => {
                     self.status_banner = Some(msg);
                 }
@@ -1550,6 +1730,307 @@ impl AppState {
         if matches!(self.capture_status, CaptureStatus::Error { .. }) {
             self.capture_status = CaptureStatus::Idle;
             self.status_banner = None;
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl AppState {
+    /// Sets the Library game filter (`None` for all games) and clears invalid selection.
+    pub fn set_library_game_filter(&mut self, game: Option<String>) {
+        self.library_game_filter = game;
+    }
+
+    /// Returns distinct sorted game names present in the active library.
+    pub fn available_games(&self) -> Vec<String> {
+        let mut games: Vec<String> = self
+            .clips
+            .iter()
+            .filter_map(|c| c.game.as_ref().map(|g| g.name.clone()))
+            .collect();
+        games.sort();
+        games.dedup();
+        games
+    }
+
+    /// Selects the active audio track index in the Video Editor (`None` = default/first).
+    pub fn set_audio_track(&mut self, track: Option<usize>) {
+        self.editor.audio_track = track;
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::SetAudioTrack(track));
+        }
+    }
+
+    /// Requests live monitor, audio device, and app audio discovery from `gpu-screen-recorder`.
+    pub fn discover_capture_sources(&mut self) {
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::DiscoverCaptureSources);
+        }
+    }
+
+    /// Sets capture resolution (`None, None` = native).
+    pub fn set_capture_resolution(&mut self, width: Option<u32>, height: Option<u32>) {
+        self.config.capture.width = width;
+        self.config.capture.height = height;
+    }
+
+    /// Sets capture frame rate.
+    pub fn set_capture_fps(&mut self, fps: u32) {
+        self.config.capture.fps = fps.clamp(15, 240);
+    }
+
+    /// Sets capture video codec.
+    pub fn set_video_codec(&mut self, codec: VideoCodec) {
+        self.config.capture.video_codec = codec;
+    }
+
+    /// Sets capture audio codec.
+    pub fn set_audio_codec(&mut self, codec: AudioCodec) {
+        self.config.capture.audio_codec = codec;
+    }
+
+    /// Sets replay buffer duration in seconds.
+    pub fn set_replay_buffer_secs(&mut self, secs: u32) {
+        self.config.capture.replay_buffer_secs = secs.clamp(5, 600);
+    }
+
+    /// Toggles an audio source entry in `config.capture.audio_sources`.
+    pub fn toggle_audio_source(&mut self, source: String) {
+        if let Some(pos) = self
+            .config
+            .capture
+            .audio_sources
+            .iter()
+            .position(|s| s == &source)
+        {
+            self.config.capture.audio_sources.remove(pos);
+        } else {
+            self.config.capture.audio_sources.push(source);
+        }
+    }
+
+    /// Sets whether replay buffering restarts automatically after saving.
+    pub fn set_restart_replay_on_save(&mut self, enabled: bool) {
+        self.config.capture.restart_replay_on_save = enabled;
+    }
+
+    /// Sets whether Wayland screencast portal session tokens are restored.
+    pub fn set_restore_portal_session(&mut self, enabled: bool) {
+        self.config.capture.restore_portal_session = enabled;
+    }
+
+    /// Updates `clips_dir` and persists settings.
+    pub fn set_clips_dir(&mut self, path: PathBuf) {
+        if !path.as_os_str().is_empty() {
+            self.clips_dir_edit = rune::TextEdit::new(path.display().to_string());
+            self.config.clips_dir = path;
+        }
+    }
+
+    /// Syncs editable Settings fields (`clips_dir_edit`, `hotkeys`, `server_url_edit`, `api_token_edit`)
+    /// into `AppConfig` and persists `config.json`.
+    pub fn save_settings(&mut self) {
+        let dir_text = self.clips_dir_edit.text.trim();
+        if !dir_text.is_empty() {
+            self.config.clips_dir = PathBuf::from(dir_text);
+        }
+        let url_text = self.server_url_edit.text.trim();
+        self.config.server_url = if url_text.is_empty() {
+            None
+        } else {
+            Some(url_text.trim_end_matches('/').to_string())
+        };
+        let tok_text = self.api_token_edit.text.trim();
+        self.config.api_token = if tok_text.is_empty() {
+            None
+        } else {
+            Some(tok_text.to_string())
+        };
+        self.config.hotkeys = HotkeyBindings {
+            save_replay: self.hotkeys.save_replay.clone(),
+            toggle_replay: self.hotkeys.toggle_replay.clone(),
+            toggle_record: self.hotkeys.toggle_record.clone(),
+        };
+        self.save_config();
+    }
+
+    /// Resets `AppConfig` to defaults (preserving worker) and updates editable fields.
+    pub fn reset_settings(&mut self) {
+        self.config = AppConfig::default();
+        self.hotkeys = HotkeyConfig::default();
+        self.clips_dir_edit = rune::TextEdit::new(self.config.clips_dir.display().to_string());
+        self.server_url_edit = rune::TextEdit::default();
+        self.api_token_edit = rune::TextEdit::default();
+        self.server_connected = false;
+        self.server_health_ok = None;
+        self.server_error = None;
+        self.save_config();
+    }
+
+    /// Checks cloud server `/health` endpoint.
+    pub fn check_server_health(&mut self) {
+        let url = self.server_url_edit.text.trim().to_string();
+        let target = if url.is_empty() {
+            self.config.server_url.clone().unwrap_or_default()
+        } else {
+            url
+        };
+        if target.is_empty() {
+            self.server_health_ok = Some(false);
+            self.server_error = Some("Enter a server URL first".to_string());
+            return;
+        }
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::CheckServerHealth { server_url: target });
+        }
+    }
+
+    /// Connects (and optionally logs in or registers) to the configured ClipForge server.
+    pub fn connect_server(&mut self, register: bool) {
+        let url = self.server_url_edit.text.trim().to_string();
+        let token = {
+            let t = self.api_token_edit.text.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+        let user = {
+            let u = self.server_user_edit.text.trim();
+            if u.is_empty() {
+                None
+            } else {
+                Some(u.to_string())
+            }
+        };
+        let pass = {
+            let p = self.server_pass_edit.text.trim();
+            if p.is_empty() {
+                None
+            } else {
+                Some(p.to_string())
+            }
+        };
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::ConnectServer {
+                server_url: url,
+                api_token: token,
+                username: user,
+                password: pass,
+                register,
+            });
+        }
+    }
+
+    /// Disconnects from the cloud server and clears cached remote state.
+    pub fn disconnect_server(&mut self) {
+        self.server_connected = false;
+        self.server_health_ok = None;
+        self.server_error = None;
+        self.remote_shares.clear();
+        self.confirm_remote_delete = None;
+        self.config.api_token = None;
+        self.api_token_edit = rune::TextEdit::default();
+        self.save_config();
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::DisconnectServer);
+        }
+    }
+
+    /// Refreshes the list of remote shared clips from the server.
+    pub fn refresh_remote_shares(&mut self) {
+        let Some(url) = self.config.server_url.clone().filter(|u| !u.is_empty()) else {
+            return;
+        };
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::RefreshRemoteShares {
+                server_url: url,
+                api_token: self.config.api_token.clone(),
+            });
+        }
+    }
+
+    /// Requests confirmation before deleting a remote share.
+    pub fn request_delete_remote_share(&mut self, share_id: String) {
+        self.confirm_remote_delete = Some(share_id);
+    }
+
+    /// Cancels a pending remote share deletion.
+    pub fn cancel_delete_remote_share(&mut self) {
+        self.confirm_remote_delete = None;
+    }
+
+    /// Confirms and dispatches remote share deletion.
+    pub fn confirm_delete_remote_share(&mut self) {
+        let Some(share_id) = self.confirm_remote_delete.take() else {
+            return;
+        };
+        let Some(url) = self.config.server_url.clone().filter(|u| !u.is_empty()) else {
+            self.server_error = Some("No server URL configured".to_string());
+            return;
+        };
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::DeleteRemoteShare {
+                share_id,
+                server_url: url,
+                api_token: self.config.api_token.clone(),
+            });
+        }
+    }
+
+    /// Retries a failed upload entry.
+    pub fn retry_upload(&mut self, clip_id: ClipId) {
+        if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {
+            entry.status = UploadStatus::Queued;
+        }
+        if let Some(clip) = self.clips.iter().find(|c| c.id == clip_id).cloned()
+            && let Some(worker) = &self.worker
+        {
+            let visibility = self
+                .uploads
+                .iter()
+                .find(|u| u.clip_id == clip_id)
+                .map(|u| {
+                    if u.is_public {
+                        ShareVisibility::Public
+                    } else {
+                        ShareVisibility::Private
+                    }
+                })
+                .unwrap_or(ShareVisibility::Public);
+            worker.send(WorkerCommand::UploadClip {
+                clip: Box::new(clip),
+                visibility,
+                server_url: self.config.server_url.clone(),
+                api_token: self.config.api_token.clone(),
+            });
+        }
+    }
+
+    /// Cancels/removes a queued or failed upload entry from the local queue.
+    pub fn cancel_upload(&mut self, clip_id: ClipId) {
+        self.uploads.retain(|u| u.clip_id != clip_id);
+        if self.selected_upload_id == Some(clip_id) {
+            self.selected_upload_id = None;
+        }
+    }
+
+    /// Copies text to the system clipboard via the background worker.
+    pub fn copy_to_clipboard(&mut self, text: String) {
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::CopyToClipboard(text));
+        } else {
+            self.status_banner = Some(format!("Copied: {text}"));
+        }
+    }
+
+    /// Opens an `http://` or `https://` URL in the default browser via `xdg-open`.
+    pub fn open_url(&mut self, url: String) {
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::OpenUrl(url));
+        } else {
+            self.status_banner = Some(format!("Open URL: {url}"));
         }
     }
 }

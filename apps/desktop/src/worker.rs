@@ -6,11 +6,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use clipforge_capture::{CaptureBackend, GsrCaptureBackend, detect_gsr};
+use clipforge_capture::{
+    AudioDeviceInfo, CaptureBackend, GsrCaptureBackend, MonitorInfo, detect_gsr,
+    list_application_audio, list_audio_devices, list_monitors,
+};
 use clipforge_cloud_client::{HttpCloudClient, RemoteClipSummary, ShareVisibility};
 use clipforge_common::{
     AppConfig, CaptureConfig, CaptureEvent, CaptureStatus, ClipFilter, ClipId, ClipMetadata,
-    ClipStore, MediaProcessor, TrimRequest,
+    ClipStore, CloudClient, MediaProcessor, TrimRequest,
 };
 use clipforge_library::{ClipListOptions, ClipOrigin, DirectoryScanner, SqliteClipStore};
 use clipforge_media::{
@@ -104,6 +107,30 @@ pub enum WorkerCommand {
     PlayerSetTrimRange(Option<(u64, u64)>),
     PlayerSetVolume(f32),
     PlayerSetMuted(bool),
+    SetAudioTrack(Option<usize>),
+    DiscoverCaptureSources,
+    CheckServerHealth {
+        server_url: String,
+    },
+    ConnectServer {
+        server_url: String,
+        api_token: Option<String>,
+        username: Option<String>,
+        password: Option<String>,
+        register: bool,
+    },
+    DisconnectServer,
+    RefreshRemoteShares {
+        server_url: String,
+        api_token: Option<String>,
+    },
+    DeleteRemoteShare {
+        share_id: String,
+        server_url: String,
+        api_token: Option<String>,
+    },
+    CopyToClipboard(String),
+    OpenUrl(String),
 }
 
 /// Events emitted by the background Tokio worker back to the Rune UI thread.
@@ -157,6 +184,21 @@ pub enum WorkerEvent {
     TimelineThumbsLoaded {
         clip_id: ClipId,
         thumbs: Vec<rune::Pixels>,
+    },
+    CaptureSourcesDiscovered {
+        monitors: Vec<MonitorInfo>,
+        audio_devices: Vec<AudioDeviceInfo>,
+        app_audio: Vec<AudioDeviceInfo>,
+    },
+    ServerHealthChecked {
+        ok: bool,
+        error: Option<String>,
+    },
+    ServerConnected(std::result::Result<(String, Option<String>), String>),
+    RemoteSharesLoaded(std::result::Result<Vec<RemoteClipSummary>, String>),
+    RemoteShareDeleted {
+        share_id: String,
+        result: std::result::Result<(), String>,
     },
 }
 
@@ -766,7 +808,167 @@ async fn handle_command(
         WorkerCommand::PlayerSetMuted(muted) => {
             svc.player.set_muted(muted);
         }
+        WorkerCommand::SetAudioTrack(track) => {
+            svc.player.set_audio_track(track);
+        }
+        WorkerCommand::DiscoverCaptureSources => {
+            if let Ok(install) = detect_gsr().await {
+                let (monitors_res, audio_res, app_res) = tokio::join!(
+                    list_monitors(&install),
+                    list_audio_devices(&install),
+                    list_application_audio(&install)
+                );
+                let _ = evt_tx.send(WorkerEvent::CaptureSourcesDiscovered {
+                    monitors: monitors_res.unwrap_or_default(),
+                    audio_devices: audio_res.unwrap_or_default(),
+                    app_audio: app_res.unwrap_or_default(),
+                });
+            } else {
+                let _ = evt_tx.send(WorkerEvent::CaptureSourcesDiscovered {
+                    monitors: Vec::new(),
+                    audio_devices: Vec::new(),
+                    app_audio: Vec::new(),
+                });
+            }
+            (waker)();
+        }
+        WorkerCommand::CheckServerHealth { server_url } => {
+            let client = HttpCloudClient::new(server_url, None);
+            let res = client.health_check().await;
+            let _ = evt_tx.send(WorkerEvent::ServerHealthChecked {
+                ok: res.is_ok(),
+                error: res.err().map(|e| e.to_string()),
+            });
+            (waker)();
+        }
+        WorkerCommand::ConnectServer {
+            server_url,
+            api_token,
+            username,
+            password,
+            register,
+        } => {
+            let clean_url = server_url.trim().trim_end_matches('/').to_string();
+            let result = async {
+                if clean_url.is_empty() {
+                    return Err("Server URL cannot be empty".to_string());
+                }
+                let client = HttpCloudClient::new(&clean_url, api_token.clone());
+                client.health_check().await.map_err(|e| e.to_string())?;
+                if let (Some(u), Some(p)) = (username, password) {
+                    let auth = if register {
+                        client.register(&u, &p).await.map_err(|e| e.to_string())?
+                    } else {
+                        client.login(&u, &p).await.map_err(|e| e.to_string())?
+                    };
+                    Ok((clean_url, Some(auth.token)))
+                } else {
+                    if api_token.is_some() {
+                        client
+                            .list_clips(Some(1), Some(0))
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok((clean_url, api_token))
+                }
+            }
+            .await;
+            let _ = evt_tx.send(WorkerEvent::ServerConnected(result));
+            (waker)();
+        }
+        WorkerCommand::DisconnectServer => {
+            let _ = evt_tx.send(WorkerEvent::Banner(
+                "Disconnected from cloud server".to_string(),
+            ));
+            (waker)();
+        }
+        WorkerCommand::RefreshRemoteShares {
+            server_url,
+            api_token,
+        } => {
+            let client = HttpCloudClient::new(server_url, api_token);
+            let res = client
+                .list_clips(Some(50), Some(0))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = evt_tx.send(WorkerEvent::RemoteSharesLoaded(res));
+            (waker)();
+        }
+        WorkerCommand::DeleteRemoteShare {
+            share_id,
+            server_url,
+            api_token,
+        } => {
+            let client = HttpCloudClient::new(server_url, api_token);
+            let res = client
+                .delete_share(&share_id)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = evt_tx.send(WorkerEvent::RemoteShareDeleted {
+                share_id,
+                result: res,
+            });
+            (waker)();
+        }
+        WorkerCommand::CopyToClipboard(text) => {
+            let copied = copy_text_to_clipboard(&text).await;
+            let msg = if copied {
+                format!("Copied to clipboard: {text}")
+            } else {
+                format!("Share link: {text} (install wl-copy or xclip for clipboard copy)")
+            };
+            let _ = evt_tx.send(WorkerEvent::Banner(msg));
+            (waker)();
+        }
+        WorkerCommand::OpenUrl(url) => {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                let _ = evt_tx.send(WorkerEvent::Banner(
+                    "Invalid URL scheme (expected http:// or https://)".to_string(),
+                ));
+                (waker)();
+                return;
+            }
+            match Command::new("xdg-open").arg(&url).spawn() {
+                Ok(_) => {
+                    let _ = evt_tx.send(WorkerEvent::Banner(format!("Opened {url}")));
+                }
+                Err(err) => {
+                    let _ = evt_tx.send(WorkerEvent::Banner(format!("Failed to open URL: {err}")));
+                }
+            }
+            (waker)();
+        }
     }
+}
+
+async fn copy_text_to_clipboard(text: &str) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let candidates: [(&str, &[&str]); 3] = [
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (bin, args) in candidates {
+        let Ok(mut child) = Command::new(bin)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        }
+        if let Ok(status) = child.wait().await
+            && status.success()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn decode_thumbnail_rgba(

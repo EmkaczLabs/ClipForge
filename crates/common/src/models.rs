@@ -285,6 +285,28 @@ pub struct ClipFilter {
     pub offset: Option<usize>,
 }
 
+/// Persisted global hotkey bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyBindings {
+    pub save_replay: String,
+    pub toggle_replay: String,
+    pub toggle_record: String,
+}
+
+impl Default for HotkeyBindings {
+    fn default() -> Self {
+        Self {
+            save_replay: "F9".to_string(),
+            toggle_replay: "F10".to_string(),
+            toggle_record: "F11".to_string(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -294,6 +316,14 @@ pub struct AppConfig {
     pub server_url: Option<String>,
     pub api_token: Option<String>,
     pub auto_generate_thumbnails: bool,
+    #[serde(default)]
+    pub hotkeys: HotkeyBindings,
+    #[serde(default = "default_true")]
+    pub confirm_trash: bool,
+    #[serde(default)]
+    pub start_minimized: bool,
+    #[serde(default)]
+    pub compact_density: bool,
 }
 
 impl Default for AppConfig {
@@ -305,6 +335,10 @@ impl Default for AppConfig {
             server_url: None,
             api_token: None,
             auto_generate_thumbnails: true,
+            hotkeys: HotkeyBindings::default(),
+            confirm_trash: true,
+            start_minimized: false,
+            compact_density: false,
         }
     }
 }

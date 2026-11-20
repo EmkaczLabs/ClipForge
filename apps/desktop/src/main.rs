@@ -87,7 +87,7 @@ mod tests {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(AppState::default(), views::root_view, (1240.0, 800.0), env);
         rt.frame(0.0);
-        assert_eq!(rt.state.nav, NavSection::Dashboard);
+        assert_eq!(rt.state.nav, NavSection::Library);
 
         for section in NavSection::ALL {
             click_key(&mut rt, section.key());
@@ -177,7 +177,8 @@ mod tests {
         assert!(rt.state.using_sample_clips);
         assert!(rt.state.clips.iter().all(state::is_sample_clip));
 
-        click_key(&mut rt, "dash-clear-err");
+        click_key(&mut rt, NavSection::Recording.key());
+        click_key(&mut rt, "rec-clear-err");
         assert_eq!(rt.state.capture_status, CaptureStatus::Idle);
     }
 
