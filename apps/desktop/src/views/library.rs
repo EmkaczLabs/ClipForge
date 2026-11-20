@@ -570,6 +570,12 @@ fn selected_detail_view(
             }))
             .child(btn_secondary(
                 p,
+                "detail-play-editor",
+                "Play in Editor",
+                move |st| st.play_in_editor(sel_id),
+            ))
+            .child(btn_secondary(
+                p,
                 "detail-player",
                 "Open in Player",
                 move |st| st.open_clip_in_player(sel_id),
@@ -683,7 +689,7 @@ fn list_row_view(p: &Palette, s: &AppState, clip: &ClipMetadata, is_trash_view: 
                 st.open_in_editor(id)
             }))
             .child(btn_secondary(p, &format!("play-{id}"), "Play", move |st| {
-                st.open_clip_in_player(id)
+                st.play_in_editor(id)
             }))
             .child(btn_secondary(
                 p,
@@ -847,6 +853,9 @@ fn grid_card_view(p: &Palette, s: &AppState, clip: &ClipMetadata, is_trash_view:
                 "Trim & Edit",
                 move |st| st.open_in_editor(id),
             ))
+            .child(btn_secondary(p, &format!("play-{id}"), "Play", move |st| {
+                st.play_in_editor(id)
+            }))
             .child(btn_secondary(
                 p,
                 &format!("trash-{id}"),

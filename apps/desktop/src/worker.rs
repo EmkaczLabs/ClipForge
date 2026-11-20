@@ -14,8 +14,8 @@ use clipforge_common::{
 };
 use clipforge_library::{ClipListOptions, ClipOrigin, DirectoryScanner, SqliteClipStore};
 use clipforge_media::{
-    DEFAULT_MAX_DECODE_DIM, FfmpegMediaProcessor, PlaybackState, PlayerEvent, VideoPlayerHandle,
-    extract_timeline_thumbnails,
+    DEFAULT_MAX_DECODE_DIM, ExportCancelToken, FfmpegMediaProcessor, PlaybackState, PlayerEvent,
+    VideoPlayerHandle, extract_timeline_thumbnails,
 };
 use rune::Waker;
 use tokio::process::Command;
@@ -69,6 +69,7 @@ pub enum WorkerCommand {
     SaveReplay,
     StopCapture,
     TrimClip(TrimRequest),
+    CancelTrim,
     UploadClip {
         clip: Box<ClipMetadata>,
         visibility: ShareVisibility,
@@ -92,12 +93,17 @@ pub enum WorkerCommand {
         path: PathBuf,
         trim_range: Option<(u64, u64)>,
         pixels: rune::Pixels,
+        autoplay: bool,
+        volume: f32,
+        muted: bool,
     },
     ClosePlayer,
     PlayerPlay,
     PlayerPause,
     PlayerSeek(u64),
     PlayerSetTrimRange(Option<(u64, u64)>),
+    PlayerSetVolume(f32),
+    PlayerSetMuted(bool),
 }
 
 /// Events emitted by the background Tokio worker back to the Rune UI thread.
@@ -113,6 +119,7 @@ pub enum WorkerEvent {
     },
     CaptureStatusChanged(CaptureStatus),
     CaptureEventReceived(CaptureEvent),
+    TrimProgress(f32),
     TrimCompleted(std::result::Result<PathBuf, String>),
     UploadCompleted {
         clip_id: ClipId,
@@ -138,6 +145,11 @@ pub enum WorkerEvent {
         clip_id: ClipId,
         pts_ms: u64,
     },
+    PlayerAudioStatus {
+        clip_id: ClipId,
+        has_audio: bool,
+        error: Option<String>,
+    },
     PlayerError {
         clip_id: ClipId,
         message: String,
@@ -160,6 +172,7 @@ struct WorkerServices {
     store: Arc<Mutex<Option<Arc<SqliteClipStore>>>>,
     player: VideoPlayerHandle,
     active_player_clip: Arc<Mutex<Option<(ClipId, rune::Pixels)>>>,
+    active_trim_cancel: Arc<Mutex<Option<ExportCancelToken>>>,
 }
 
 impl WorkerHandle {
@@ -195,6 +208,7 @@ impl WorkerHandle {
                         store: Arc::new(Mutex::new(None)),
                         player,
                         active_player_clip: active_player_clip.clone(),
+                        active_trim_cancel: Arc::new(Mutex::new(None)),
                     });
 
                     // Forward asynchronous CaptureEvents from GsrCaptureBackend to the UI.
@@ -241,6 +255,14 @@ impl WorkerHandle {
                                 PlayerEvent::Position(pts_ms) => {
                                     let _ = pl_evt_tx
                                         .send(WorkerEvent::PlayerPosition { clip_id, pts_ms });
+                                    (pl_waker)();
+                                }
+                                PlayerEvent::AudioStatus { has_audio, error } => {
+                                    let _ = pl_evt_tx.send(WorkerEvent::PlayerAudioStatus {
+                                        clip_id,
+                                        has_audio,
+                                        error,
+                                    });
                                     (pl_waker)();
                                 }
                                 PlayerEvent::Error(message) => {
@@ -545,9 +567,46 @@ async fn handle_command(
             (waker)();
         }
         WorkerCommand::TrimClip(req) => {
-            let res = svc.media.trim(&req).await.map_err(|e| e.to_string());
+            let cancel = ExportCancelToken::new();
+            if let Ok(mut guard) = svc.active_trim_cancel.lock() {
+                *guard = Some(cancel.clone());
+            }
+            let prog_tx = evt_tx.clone();
+            let prog_waker = waker.clone();
+            let res = svc
+                .media
+                .trim_with_progress(&req, Some(&cancel), |p| {
+                    let _ = prog_tx.send(WorkerEvent::TrimProgress(p));
+                    (prog_waker)();
+                })
+                .await
+                .map_err(|e| e.to_string());
+            if let Ok(mut guard) = svc.active_trim_cancel.lock() {
+                *guard = None;
+            }
+            if let Ok(ref out_path) = res
+                && let Some(store) = svc.store.lock().ok().and_then(|g| g.clone())
+                && index_clip_with_origin(
+                    &store,
+                    &svc.media,
+                    out_path,
+                    true,
+                    Some(ClipOrigin::Trimmed),
+                    true,
+                )
+                .await
+            {
+                emit_library_loaded(&store, evt_tx).await;
+            }
             let _ = evt_tx.send(WorkerEvent::TrimCompleted(res));
             (waker)();
+        }
+        WorkerCommand::CancelTrim => {
+            if let Ok(guard) = svc.active_trim_cancel.lock()
+                && let Some(token) = guard.as_ref()
+            {
+                token.cancel();
+            }
         }
         WorkerCommand::UploadClip {
             clip,
@@ -642,12 +701,20 @@ async fn handle_command(
             path,
             trim_range,
             pixels,
+            autoplay,
+            volume,
+            muted,
         } => {
             if let Ok(mut guard) = svc.active_player_clip.lock() {
                 *guard = Some((clip_id, pixels));
             }
+            svc.player.set_volume(volume);
+            svc.player.set_muted(muted);
             svc.player
                 .open(&path, trim_range, Some(DEFAULT_MAX_DECODE_DIM));
+            if autoplay {
+                svc.player.play();
+            }
 
             let thumb_tx = evt_tx.clone();
             let thumb_waker = waker.clone();
@@ -692,6 +759,12 @@ async fn handle_command(
         }
         WorkerCommand::PlayerSetTrimRange(range) => {
             svc.player.set_trim_range(range);
+        }
+        WorkerCommand::PlayerSetVolume(volume) => {
+            svc.player.set_volume(volume);
+        }
+        WorkerCommand::PlayerSetMuted(muted) => {
+            svc.player.set_muted(muted);
         }
     }
 }
@@ -761,13 +834,25 @@ async fn index_single_clip(
     path: &std::path::Path,
     auto_generate_thumbnails: bool,
 ) -> bool {
-    if store.get_by_file_path(path).await.ok().flatten().is_some() {
+    index_clip_with_origin(store, media, path, auto_generate_thumbnails, None, false).await
+}
+
+async fn index_clip_with_origin(
+    store: &SqliteClipStore,
+    media: &FfmpegMediaProcessor,
+    path: &std::path::Path,
+    auto_generate_thumbnails: bool,
+    origin: Option<ClipOrigin>,
+    overwrite_existing: bool,
+) -> bool {
+    let existing = store.get_by_file_path(path).await.ok().flatten();
+    if existing.is_some() && !overwrite_existing {
         return false;
     }
     let Ok(probe) = media.probe(path).await else {
         return false;
     };
-    let id = ClipId::new();
+    let id = existing.as_ref().map(|c| c.id).unwrap_or_else(ClipId::new);
     let title = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -806,7 +891,11 @@ async fn index_single_clip(
         cloud_share: None,
         notes: None,
     };
-    store.upsert_clip(&clip).await.is_ok()
+    if let Some(origin) = origin {
+        store.upsert_clip_with_origin(&clip, origin).await.is_ok()
+    } else {
+        store.upsert_clip(&clip).await.is_ok()
+    }
 }
 
 fn close_player_if_matches(svc: &WorkerServices, ids: &[ClipId]) {

@@ -11,7 +11,7 @@ mod worker;
 
 use std::time::Instant;
 
-use rune::{AppSpec, Tx, Waker};
+use rune::{AppSpec, Key, KeyEvent, Tx, Waker};
 use state::{AppState, NavSection};
 use worker::{WorkerCommand, WorkerHandle};
 
@@ -30,6 +30,19 @@ fn poll_worker(state: &mut AppState, _now: f64, _tx: &mut Tx) -> bool {
     state.poll_worker()
 }
 
+fn on_key(state: &mut AppState, event: &KeyEvent, _tx: &mut Tx) -> bool {
+    if state.nav != NavSection::Editor || state.renaming_clip_id.is_some() {
+        return false;
+    }
+    match &event.key {
+        Key::Text(t) if t == " " => state.toggle_play(),
+        Key::Left => state.seek_relative_ms(-5_000),
+        Key::Right => state.seek_relative_ms(5_000),
+        _ => return false,
+    }
+    true
+}
+
 fn main() {
     clipforge_common::init_tracing("info");
     rune::run(AppSpec::<AppState> {
@@ -44,6 +57,7 @@ fn main() {
         ],
         setup: Some(setup_worker),
         poll: Some(poll_worker),
+        on_key: Some(on_key),
         ..AppSpec::new(
             "ClipForge",
             (1240.0, 800.0),
@@ -523,5 +537,78 @@ mod tests {
             rt.state.find_clip(id1).map(|c| c.title.as_str()),
             Some("Renamed Clutch")
         );
+    }
+
+    #[test]
+    fn play_in_editor_audio_zoom_cancel_and_keyboard_nav() {
+        let env = Env::new(true, 1.0);
+        let c1 = make_real_clip("Editor Clip", 30_000, 12_000_000, 2);
+        let id1 = c1.id;
+
+        let initial = AppState {
+            using_sample_clips: false,
+            clips: vec![c1],
+            ..Default::default()
+        };
+        let mut rt = Runtime::new(initial, views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        // Library "Play" button opens editor and starts playback immediately.
+        click_key(&mut rt, NavSection::Library.key());
+        click_key(&mut rt, &format!("play-{id1}"));
+        assert_eq!(rt.state.nav, NavSection::Editor);
+        assert_eq!(rt.state.editor.selected_clip_id, Some(id1));
+        assert!(rt.state.editor.playing);
+
+        // Volume, mute, and timeline zoom clamping.
+        rt.state.set_volume(1.5);
+        assert_eq!(rt.state.editor.volume, 1.0);
+        rt.state.set_volume(0.35);
+        assert!((rt.state.editor.volume - 0.35).abs() < f32::EPSILON);
+        rt.state.toggle_mute();
+        assert!(rt.state.editor.muted);
+        rt.state.set_timeline_zoom(12.0);
+        assert_eq!(rt.state.editor.timeline_zoom, 8.0);
+        rt.state.set_timeline_zoom(0.2);
+        assert_eq!(rt.state.editor.timeline_zoom, 1.0);
+
+        // Keyboard navigation in Editor: Space toggles play/pause, Right/Left seek +/-5s.
+        let mut tx = Tx::default();
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Text(" ".into()),
+                mods: rune::Mods::default(),
+            },
+            &mut tx
+        ));
+        assert!(!rt.state.editor.playing);
+
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Right,
+                mods: rune::Mods::default(),
+            },
+            &mut tx
+        ));
+        assert_eq!(rt.state.editor.playhead_ms, 5_000);
+
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Left,
+                mods: rune::Mods::default(),
+            },
+            &mut tx
+        ));
+        assert_eq!(rt.state.editor.playhead_ms, 0);
+
+        // Export cancel clears exporting and export_progress.
+        rt.state.editor.exporting = true;
+        rt.state.editor.export_progress = Some(0.42);
+        rt.state.cancel_export();
+        assert!(!rt.state.editor.exporting);
+        assert_eq!(rt.state.editor.export_progress, None);
     }
 }
