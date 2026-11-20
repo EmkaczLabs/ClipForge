@@ -290,7 +290,7 @@ async fn video_player_open_seek_play_trim_and_switch_clips() {
 
     // Helper to collect events until a predicate matches or timeout expires.
     async fn wait_for<F>(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
+        rx: &mut tokio::sync::mpsc::Receiver<PlayerEvent>,
         mut pred: F,
     ) -> Vec<PlayerEvent>
     where
@@ -473,4 +473,241 @@ async fn extract_timeline_thumbnails_returns_scaled_rgba_frames() {
         .await
         .unwrap_err();
     assert!(matches!(missing_err, ClipForgeError::NotFound(_)));
+}
+
+fn generate_video_only_mp4(path: &Path) {
+    let status = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-v")
+        .arg("error")
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg("testsrc=size=320x240:rate=15:duration=1.2")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg(path)
+        .status()
+        .expect("failed to invoke ffmpeg for video-only fixture");
+    assert!(status.success(), "ffmpeg video-only fixture failed");
+}
+
+#[tokio::test]
+async fn video_player_no_audio_clip_fallback_and_volume_mute() {
+    use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
+    use std::time::Duration;
+
+    let dir = TestDir::new("clipforge_no_audio_it");
+    let video_only = dir.join("video_only.mp4");
+    generate_video_only_mp4(&video_only);
+
+    let (player, mut rx) = VideoPlayerHandle::spawn();
+    player.set_volume(0.45);
+    assert!((player.volume() - 0.45).abs() < 0.001);
+    player.set_muted(true);
+    assert!(player.is_muted());
+    player.set_muted(false);
+    assert!(!player.is_muted());
+
+    player.open(&video_only, Some((0, 800)), Some(160));
+    let mut saw_audio_status = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out opening no-audio clip");
+        let ev = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("timeout")
+            .expect("closed");
+        match ev {
+            PlayerEvent::AudioStatus { has_audio, error } => {
+                saw_audio_status = Some((has_audio, error));
+            }
+            PlayerEvent::StateChanged(PlaybackState::Paused) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(saw_audio_status, Some((false, None)));
+
+    player.play();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut frames = Vec::new();
+    let mut ended = false;
+    while !ended {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out playing no-audio clip");
+        let ev = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("timeout")
+            .expect("closed");
+        match ev {
+            PlayerEvent::Frame(f) => frames.push(f),
+            PlayerEvent::StateChanged(PlaybackState::Ended) => ended = true,
+            _ => {}
+        }
+    }
+    assert!(
+        frames.len() >= 4,
+        "expected >=4 frames, got {}",
+        frames.len()
+    );
+    assert!(frames.windows(2).all(|w| w[0].pts_ms <= w[1].pts_ms));
+}
+
+#[tokio::test]
+async fn video_player_pause_seek_resume_av_sync() {
+    use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
+    use std::time::Duration;
+
+    let dir = TestDir::new("clipforge_av_sync_it");
+    let source = dir.join("av_clip.mp4");
+    generate_synthetic_mp4(&source);
+
+    let (player, mut rx) = VideoPlayerHandle::spawn();
+    player.set_volume(0.0);
+    player.open(&source, None, Some(160));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out opening av clip");
+        if matches!(
+            tokio::time::timeout(remaining, rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            PlayerEvent::StateChanged(PlaybackState::Paused)
+        ) {
+            break;
+        }
+    }
+
+    player.play();
+    let mut playing = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while !playing {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out starting playback");
+        if matches!(
+            tokio::time::timeout(remaining, rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            PlayerEvent::StateChanged(PlaybackState::Playing)
+        ) {
+            playing = true;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    player.pause();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out pausing");
+        if matches!(
+            tokio::time::timeout(remaining, rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            PlayerEvent::StateChanged(PlaybackState::Paused)
+        ) {
+            break;
+        }
+    }
+
+    player.seek(900);
+    let seek_pos;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out seeking");
+        if let PlayerEvent::Position(pos) = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            seek_pos = Some(pos);
+            break;
+        }
+    }
+    assert_eq!(seek_pos, Some(900));
+
+    player.play();
+    let mut resumed_frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for end");
+        match tokio::time::timeout(remaining, rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            PlayerEvent::Frame(f) => resumed_frames.push(f),
+            PlayerEvent::StateChanged(PlaybackState::Ended) => break,
+            _ => {}
+        }
+    }
+    assert!(!resumed_frames.is_empty());
+    assert!(resumed_frames.iter().all(|f| f.pts_ms >= 900));
+}
+
+#[tokio::test]
+async fn trim_with_progress_reports_progress_and_supports_cancellation() {
+    use clipforge_media::ExportCancelToken;
+    use std::sync::{Arc, Mutex};
+
+    let dir = TestDir::new("clipforge_export_progress_it");
+    let source = dir.join("source.mp4");
+    generate_synthetic_mp4(&source);
+
+    let processor = FfmpegMediaProcessor::new();
+
+    // 1. Progress reporting + output validation
+    let out_ok = dir.join("exported.mp4");
+    let req_ok = TrimRequest {
+        source_path: source.clone(),
+        output_path: out_ok.clone(),
+        start_ms: 200,
+        end_ms: 1500,
+        reencode: true,
+        video_codec: Some(VideoCodec::H264),
+    };
+    let progress_values = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let pv = Arc::clone(&progress_values);
+    let returned = processor
+        .trim_with_progress(&req_ok, None, move |p| {
+            pv.lock().unwrap().push(p);
+        })
+        .await
+        .expect("trim_with_progress should succeed");
+    assert_eq!(returned, out_ok);
+    assert!(out_ok.exists());
+
+    let vals = progress_values.lock().unwrap().clone();
+    assert!(!vals.is_empty(), "expected progress updates");
+    assert!((vals.last().copied().unwrap() - 1.0).abs() < f32::EPSILON);
+    assert!(vals.iter().all(|&p| (0.0..=1.0).contains(&p)));
+
+    // 2. Cancellation
+    let out_cancel = dir.join("cancelled.mp4");
+    let req_cancel = TrimRequest {
+        source_path: source,
+        output_path: out_cancel.clone(),
+        start_ms: 0,
+        end_ms: 2000,
+        reencode: true,
+        video_codec: Some(VideoCodec::H264),
+    };
+    let token = ExportCancelToken::new();
+    token.cancel();
+    let err = processor
+        .trim_with_progress(&req_cancel, Some(&token), |_| {})
+        .await
+        .expect_err("cancelled export must fail");
+    assert!(err.to_string().contains("cancelled"));
+    assert!(!out_cancel.exists());
 }

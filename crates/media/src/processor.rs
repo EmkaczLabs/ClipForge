@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use clipforge_common::{
@@ -8,12 +10,46 @@ use clipforge_common::{
     VideoCodec,
 };
 use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 const DEFAULT_THUMBNAIL_CONCURRENCY: usize = 4;
+
+/// Cancellation token for [`FfmpegMediaProcessor::trim_with_progress`].
+#[derive(Clone, Debug, Default)]
+pub struct ExportCancelToken {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl ExportCancelToken {
+    /// Creates a new uncancelled export token.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests cancellation of any in-flight export using this token.
+    pub fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Returns `true` if cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
 
 /// `MediaProcessor` implementation backed by `ffmpeg` and `ffprobe` subprocesses.
 #[derive(Debug, Clone)]
@@ -57,6 +93,203 @@ impl FfmpegMediaProcessor {
     /// Returns the number of currently available thumbnail concurrency permits.
     pub fn available_thumbnail_permits(&self) -> usize {
         self.thumbnail_semaphore.available_permits()
+    }
+
+    /// Trims/exports a clip according to `req` while reporting progress (`0.0..=1.0`),
+    /// supporting cancellation via `cancel`, and validating the output file with `ffprobe`.
+    pub async fn trim_with_progress<F>(
+        &self,
+        req: &TrimRequest,
+        cancel: Option<&ExportCancelToken>,
+        mut on_progress: F,
+    ) -> Result<PathBuf>
+    where
+        F: FnMut(f32) + Send,
+    {
+        req.validate()?;
+        if cancel.is_some_and(ExportCancelToken::is_cancelled) {
+            return Err(ClipForgeError::MediaFailed("export cancelled".into()));
+        }
+
+        let canonical_in = validate_input_path(&req.source_path).await?;
+        let ext = validate_video_extension(&req.output_path)?;
+        let resolved_out = prepare_output_path(&req.output_path).await?;
+        let temp_out = make_temp_sibling(&resolved_out, &ext);
+
+        let start_ts = format_timestamp_ms(req.start_ms);
+        let end_ts = format_timestamp_ms(req.end_ms);
+        let total_us = req.end_ms.saturating_sub(req.start_ms).saturating_mul(1000);
+
+        debug!(
+            source = %canonical_in.display(),
+            output = %resolved_out.display(),
+            start_ms = req.start_ms,
+            end_ms = req.end_ms,
+            reencode = req.reencode,
+            "trimming media with progress"
+        );
+
+        let mut cmd = Command::new(&self.ffmpeg_bin);
+        cmd.arg("-y")
+            .arg("-v")
+            .arg("error")
+            .arg("-nostats")
+            .arg("-progress")
+            .arg("pipe:1")
+            .arg("-ss")
+            .arg(&start_ts)
+            .arg("-to")
+            .arg(&end_ts)
+            .arg("-i")
+            .arg(&canonical_in)
+            .arg("-map")
+            .arg("0:v:0?")
+            .arg("-map")
+            .arg("0:a?");
+
+        if req.reencode {
+            let vcodec = ffmpeg_video_codec(req.video_codec);
+            let acodec = ffmpeg_audio_codec(&ext);
+            cmd.arg("-c:v").arg(vcodec).arg("-c:a").arg(acodec);
+        } else {
+            cmd.arg("-c")
+                .arg("copy")
+                .arg("-avoid_negative_ts")
+                .arg("make_zero");
+        }
+
+        if ext == "mp4" || ext == "m4v" {
+            cmd.arg("-movflags").arg("+faststart");
+        }
+
+        cmd.arg(&temp_out)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&temp_out).await;
+                return Err(ClipForgeError::MediaFailed(format!(
+                    "failed to spawn ffmpeg ({}): {e}",
+                    self.ffmpeg_bin.display()
+                )));
+            }
+        };
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ClipForgeError::MediaFailed("failed to capture ffmpeg progress stdout".into())
+        })?;
+        let stderr_pipe = child.stderr.take();
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut err) = stderr_pipe {
+                let _ = err.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+
+        let mut lines = BufReader::new(stdout).lines();
+        on_progress(0.0);
+
+        loop {
+            let next_line = if let Some(tok) = cancel {
+                tokio::select! {
+                    biased;
+                    _ = tok.cancelled() => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        stderr_task.abort();
+                        let _ = tokio::fs::remove_file(&temp_out).await;
+                        return Err(ClipForgeError::MediaFailed("export cancelled".into()));
+                    }
+                    res = lines.next_line() => res,
+                }
+            } else {
+                lines.next_line().await
+            };
+
+            match next_line {
+                Ok(Some(line)) => {
+                    if let Some(out_us) = parse_ffmpeg_progress_us(&line)
+                        && total_us > 0
+                    {
+                        let p = (out_us as f32 / total_us as f32).clamp(0.0, 0.99);
+                        on_progress(p);
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(error = %e, "error reading ffmpeg progress pipe");
+                    break;
+                }
+            }
+        }
+
+        let status = if let Some(tok) = cancel {
+            tokio::select! {
+                biased;
+                _ = tok.cancelled() => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    stderr_task.abort();
+                    let _ = tokio::fs::remove_file(&temp_out).await;
+                    return Err(ClipForgeError::MediaFailed("export cancelled".into()));
+                }
+                res = child.wait() => res,
+            }
+        } else {
+            child.wait().await
+        };
+
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => {
+                stderr_task.abort();
+                let _ = tokio::fs::remove_file(&temp_out).await;
+                return Err(ClipForgeError::Io(e));
+            }
+        };
+
+        let stderr_bytes = stderr_task.await.unwrap_or_default();
+        if !status.success() {
+            let _ = tokio::fs::remove_file(&temp_out).await;
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            return Err(ClipForgeError::MediaFailed(format!(
+                "ffmpeg trim failed with status {}: {}",
+                status,
+                stderr.trim()
+            )));
+        }
+
+        // Validate non-empty output and valid container/streams via ffprobe before atomic rename.
+        let file_len = tokio::fs::metadata(&temp_out)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if file_len == 0 {
+            let _ = tokio::fs::remove_file(&temp_out).await;
+            return Err(ClipForgeError::MediaFailed(
+                "ffmpeg trim produced an empty output file".into(),
+            ));
+        }
+
+        if let Err(e) = self.probe(&temp_out).await {
+            let _ = tokio::fs::remove_file(&temp_out).await;
+            return Err(ClipForgeError::MediaFailed(format!(
+                "exported output failed ffprobe validation: {e}"
+            )));
+        }
+
+        if let Err(e) = tokio::fs::rename(&temp_out, &resolved_out).await {
+            let _ = tokio::fs::remove_file(&temp_out).await;
+            return Err(ClipForgeError::Io(e));
+        }
+
+        on_progress(1.0);
+        Ok(req.output_path.clone())
     }
 }
 
@@ -159,85 +392,20 @@ impl MediaProcessor for FfmpegMediaProcessor {
     }
 
     async fn trim(&self, req: &TrimRequest) -> Result<PathBuf> {
-        req.validate()?;
-
-        let canonical_in = validate_input_path(&req.source_path).await?;
-        let ext = validate_video_extension(&req.output_path)?;
-        let resolved_out = prepare_output_path(&req.output_path).await?;
-        let temp_out = make_temp_sibling(&resolved_out, &ext);
-
-        let start_ts = format_timestamp_ms(req.start_ms);
-        let end_ts = format_timestamp_ms(req.end_ms);
-
-        debug!(
-            source = %canonical_in.display(),
-            output = %resolved_out.display(),
-            start_ms = req.start_ms,
-            end_ms = req.end_ms,
-            reencode = req.reencode,
-            "trimming media"
-        );
-
-        let mut cmd = Command::new(&self.ffmpeg_bin);
-        cmd.arg("-y")
-            .arg("-v")
-            .arg("error")
-            .arg("-ss")
-            .arg(&start_ts)
-            .arg("-to")
-            .arg(&end_ts)
-            .arg("-i")
-            .arg(&canonical_in)
-            .arg("-map")
-            .arg("0:v:0?")
-            .arg("-map")
-            .arg("0:a?");
-
-        if req.reencode {
-            let vcodec = ffmpeg_video_codec(req.video_codec);
-            let acodec = ffmpeg_audio_codec(&ext);
-            cmd.arg("-c:v").arg(vcodec).arg("-c:a").arg(acodec);
-        } else {
-            cmd.arg("-c")
-                .arg("copy")
-                .arg("-avoid_negative_ts")
-                .arg("make_zero");
-        }
-
-        if ext == "mp4" || ext == "m4v" {
-            cmd.arg("-movflags").arg("+faststart");
-        }
-
-        cmd.arg(&temp_out).kill_on_drop(true);
-
-        let output = match cmd.output().await {
-            Ok(out) => out,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&temp_out).await;
-                return Err(ClipForgeError::MediaFailed(format!(
-                    "failed to spawn ffmpeg ({}): {e}",
-                    self.ffmpeg_bin.display()
-                )));
-            }
-        };
-
-        if !output.status.success() {
-            let _ = tokio::fs::remove_file(&temp_out).await;
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ClipForgeError::MediaFailed(format!(
-                "ffmpeg trim failed with status {}: {}",
-                output.status,
-                stderr.trim()
-            )));
-        }
-
-        if let Err(e) = tokio::fs::rename(&temp_out, &resolved_out).await {
-            let _ = tokio::fs::remove_file(&temp_out).await;
-            return Err(ClipForgeError::Io(e));
-        }
-
-        Ok(req.output_path.clone())
+        self.trim_with_progress(req, None, |_| {}).await
     }
+}
+
+fn parse_ffmpeg_progress_us(line: &str) -> Option<u64> {
+    let trimmed = line.trim();
+    if let Some(val) = trimmed.strip_prefix("out_time_us=") {
+        return val.trim().parse::<i64>().ok().map(|v| v.max(0) as u64);
+    }
+    if let Some(val) = trimmed.strip_prefix("out_time_ms=") {
+        // In ffmpeg -progress output, out_time_ms is emitted in microseconds.
+        return val.trim().parse::<i64>().ok().map(|v| v.max(0) as u64);
+    }
+    None
 }
 
 fn validate_path_chars(path: &Path) -> Result<()> {

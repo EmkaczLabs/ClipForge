@@ -10,9 +10,9 @@ use clipforge_common::{ClipForgeError, MediaProbeResult, MediaProcessor, Result}
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Semaphore, mpsc};
-use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
+use crate::audio::{AudioControlState, AudioSession, PlaybackClock};
 use crate::processor::{FfmpegMediaProcessor, format_timestamp_ms, validate_input_path};
 
 /// Default maximum frame dimension (matches Rune's 1024x1024 image atlas fast path).
@@ -22,6 +22,8 @@ const DEFAULT_FPS: f64 = 30.0;
 const MIN_FPS: f64 = 1.0;
 const MAX_FPS: f64 = 240.0;
 const THUMBNAIL_EXTRACT_CONCURRENCY: usize = 4;
+const EVENT_CHANNEL_CAPACITY: usize = 16;
+const RESERVED_CONTROL_SLOTS: usize = 4;
 
 /// A single decoded video frame in tightly packed sRGB RGBA8 format (`width * height * 4` bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +62,10 @@ pub enum PlayerEvent {
     Frame(DecodedFrame),
     StateChanged(PlaybackState),
     Position(u64),
+    AudioStatus {
+        has_audio: bool,
+        error: Option<String>,
+    },
     Error(String),
 }
 
@@ -75,6 +81,7 @@ enum PlayerCommand {
     Seek(u64),
     Restart,
     SetTrimRange(Option<(u64, u64)>),
+    SetAudioTrack(Option<usize>),
     Close,
 }
 
@@ -85,11 +92,12 @@ enum PlayerCommand {
 #[derive(Clone, Debug)]
 pub struct VideoPlayerHandle {
     cmd_tx: mpsc::UnboundedSender<PlayerCommand>,
+    audio_controls: AudioControlState,
 }
 
 impl VideoPlayerHandle {
     /// Spawns a new background video decoder worker using `ffmpeg` and `ffprobe` from `PATH`.
-    pub fn spawn() -> (Self, mpsc::UnboundedReceiver<PlayerEvent>) {
+    pub fn spawn() -> (Self, mpsc::Receiver<PlayerEvent>) {
         Self::spawn_with_binaries("ffmpeg", "ffprobe")
     }
 
@@ -97,18 +105,26 @@ impl VideoPlayerHandle {
     pub fn spawn_with_binaries(
         ffmpeg_bin: impl Into<PathBuf>,
         ffprobe_bin: impl Into<PathBuf>,
-    ) -> (Self, mpsc::UnboundedReceiver<PlayerEvent>) {
+    ) -> (Self, mpsc::Receiver<PlayerEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let audio_controls = AudioControlState::new();
         let ffmpeg_bin = ffmpeg_bin.into();
         let ffprobe_bin = ffprobe_bin.into();
+        let worker_controls = audio_controls.clone();
 
         tokio::spawn(async move {
-            let mut worker = PlayerWorker::new(ffmpeg_bin, ffprobe_bin, event_tx);
+            let mut worker = PlayerWorker::new(ffmpeg_bin, ffprobe_bin, event_tx, worker_controls);
             worker.run(cmd_rx).await;
         });
 
-        (Self { cmd_tx }, event_rx)
+        (
+            Self {
+                cmd_tx,
+                audio_controls,
+            },
+            event_rx,
+        )
     }
 
     /// Opens a video file, probes its metadata, and decodes the initial frame at trim start (or 0ms).
@@ -151,6 +167,31 @@ impl VideoPlayerHandle {
     /// Updates the active trim range `[start_ms, end_ms]` (or clears it with `None`).
     pub fn set_trim_range(&self, trim_range: Option<(u64, u64)>) {
         let _ = self.cmd_tx.send(PlayerCommand::SetTrimRange(trim_range));
+    }
+
+    /// Sets playback volume (`0.0..=1.0`), taking effect immediately on active audio.
+    pub fn set_volume(&self, volume: f32) {
+        self.audio_controls.set_volume(volume);
+    }
+
+    /// Returns the current playback volume (`0.0..=1.0`).
+    pub fn volume(&self) -> f32 {
+        self.audio_controls.volume()
+    }
+
+    /// Sets audio mute state, taking effect immediately on active audio.
+    pub fn set_muted(&self, muted: bool) {
+        self.audio_controls.set_muted(muted);
+    }
+
+    /// Returns whether audio is currently muted.
+    pub fn is_muted(&self) -> bool {
+        self.audio_controls.is_muted()
+    }
+
+    /// Selects the audio track index (`Some(0)` default, or `None` to disable audio output).
+    pub fn set_audio_track(&self, track_index: Option<usize>) {
+        let _ = self.cmd_tx.send(PlayerCommand::SetAudioTrack(track_index));
     }
 
     /// Stops playback, terminates any running decoder subprocess, and releases clip state.
@@ -234,6 +275,7 @@ pub async fn extract_timeline_thumbnails_with_binaries(
 struct OpenedClip {
     path: PathBuf,
     metadata: VideoMetadata,
+    audio_track_count: usize,
     out_width: u32,
     out_height: u32,
     trim_start_ms: u64,
@@ -244,6 +286,8 @@ struct OpenedClip {
 struct ActiveStream {
     child: Child,
     stdout: ChildStdout,
+    audio: Option<AudioSession>,
+    clock: PlaybackClock,
     start_ms: u64,
     trim_end_ms: u64,
     fps: f64,
@@ -251,11 +295,13 @@ struct ActiveStream {
     out_height: u32,
     frame_bytes: usize,
     frame_index: u64,
-    epoch: Instant,
 }
 
 impl ActiveStream {
     async fn stop(mut self) {
+        if let Some(audio) = self.audio.take() {
+            audio.stop().await;
+        }
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
@@ -264,7 +310,9 @@ impl ActiveStream {
 struct PlayerWorker {
     ffmpeg_bin: PathBuf,
     processor: FfmpegMediaProcessor,
-    event_tx: mpsc::UnboundedSender<PlayerEvent>,
+    event_tx: mpsc::Sender<PlayerEvent>,
+    audio_controls: AudioControlState,
+    audio_track_index: Option<usize>,
     clip: Option<OpenedClip>,
     status: PlaybackState,
     stream: Option<ActiveStream>,
@@ -274,7 +322,8 @@ impl PlayerWorker {
     fn new(
         ffmpeg_bin: PathBuf,
         ffprobe_bin: PathBuf,
-        event_tx: mpsc::UnboundedSender<PlayerEvent>,
+        event_tx: mpsc::Sender<PlayerEvent>,
+        audio_controls: AudioControlState,
     ) -> Self {
         let processor = FfmpegMediaProcessor::with_binaries(
             ffmpeg_bin.clone(),
@@ -285,20 +334,35 @@ impl PlayerWorker {
             ffmpeg_bin,
             processor,
             event_tx,
+            audio_controls,
+            audio_track_index: Some(0),
             clip: None,
             status: PlaybackState::Stopped,
             stream: None,
         }
     }
 
-    fn emit(&self, event: PlayerEvent) {
-        let _ = self.event_tx.send(event);
+    async fn emit(&self, event: PlayerEvent) {
+        let _ = self.event_tx.send(event).await;
     }
 
-    fn set_status(&mut self, status: PlaybackState) {
+    fn emit_frame(&self, frame: DecodedFrame) {
+        if self.event_tx.capacity() <= RESERVED_CONTROL_SLOTS {
+            trace!(
+                pts_ms = frame.pts_ms,
+                "dropping video frame due to bounded channel backpressure"
+            );
+            return;
+        }
+        if let Err(err) = self.event_tx.try_send(PlayerEvent::Frame(frame)) {
+            trace!(error = %err, "dropping video frame on full channel");
+        }
+    }
+
+    async fn set_status(&mut self, status: PlaybackState) {
         if self.status != status {
             self.status = status;
-            self.emit(PlayerEvent::StateChanged(status));
+            self.emit(PlayerEvent::StateChanged(status)).await;
         }
     }
 
@@ -324,8 +388,9 @@ impl PlayerWorker {
                     read_res = stream.stdout.read_exact(&mut buf) => {
                         match read_res {
                             Ok(_) => {
-                                let pts_ms = stream.start_ms
-                                    + ((stream.frame_index as f64) * 1000.0 / stream.fps).round() as u64;
+                                let frame_offset_ms =
+                                    (stream.frame_index as f64) * 1000.0 / stream.fps;
+                                let pts_ms = stream.start_ms + frame_offset_ms.round() as u64;
 
                                 if pts_ms > stream.trim_end_ms {
                                     let end_ms = stream.trim_end_ms;
@@ -333,57 +398,77 @@ impl PlayerWorker {
                                     if let Some(clip) = self.clip.as_mut() {
                                         clip.position_ms = end_ms;
                                     }
-                                    self.emit(PlayerEvent::Position(end_ms));
-                                    self.set_status(PlaybackState::Ended);
+                                    self.emit(PlayerEvent::Position(end_ms)).await;
+                                    self.set_status(PlaybackState::Ended).await;
                                     continue;
                                 }
 
-                                let deadline = stream.epoch
-                                    + Duration::from_secs_f64(stream.frame_index as f64 / stream.fps);
+                                let frame_period_ms = 1000.0 / stream.fps;
+                                let clock_offset_ms = stream.clock.elapsed_ms();
                                 let out_w = stream.out_width;
                                 let out_h = stream.out_height;
                                 stream.frame_index += 1;
 
-                                // Pace frame delivery to match clip FPS, while staying responsive to commands.
-                                let interrupted = tokio::select! {
-                                    biased;
-                                    maybe_cmd = cmd_rx.recv() => {
-                                        match maybe_cmd {
-                                            Some(cmd) => {
-                                                self.handle_command(cmd, &mut cmd_rx).await;
-                                                true
-                                            }
-                                            None => return,
-                                        }
+                                // Drop late frames if video decode fell >2 frames behind the master clock.
+                                if clock_offset_ms > frame_offset_ms + frame_period_ms * 2.0 {
+                                    trace!(
+                                        pts_ms,
+                                        clock_offset_ms,
+                                        frame_offset_ms,
+                                        "dropping late video frame to maintain A/V sync"
+                                    );
+                                    if let Some(clip) = self.clip.as_mut() {
+                                        clip.position_ms = pts_ms;
                                     }
-                                    _ = tokio::time::sleep_until(deadline) => false,
-                                };
-
-                                if interrupted {
                                     continue;
+                                }
+
+                                if frame_offset_ms > clock_offset_ms + 1.0 {
+                                    let wait_dur = Duration::from_secs_f64(
+                                        (frame_offset_ms - clock_offset_ms) / 1000.0,
+                                    );
+                                    // Pace frame delivery to match master clock, while staying responsive to commands.
+                                    let interrupted = tokio::select! {
+                                        biased;
+                                        maybe_cmd = cmd_rx.recv() => {
+                                            match maybe_cmd {
+                                                Some(cmd) => {
+                                                    self.handle_command(cmd, &mut cmd_rx).await;
+                                                    true
+                                                }
+                                                None => return,
+                                            }
+                                        }
+                                        _ = tokio::time::sleep(wait_dur) => false,
+                                    };
+
+                                    if interrupted {
+                                        continue;
+                                    }
                                 }
 
                                 if let Some(clip) = self.clip.as_mut() {
                                     clip.position_ms = pts_ms;
                                 }
-                                self.emit(PlayerEvent::Frame(DecodedFrame {
+                                self.emit_frame(DecodedFrame {
                                     width: out_w,
                                     height: out_h,
                                     pts_ms,
                                     data: buf,
-                                }));
-                                self.emit(PlayerEvent::Position(pts_ms));
+                                });
+                                self.emit(PlayerEvent::Position(pts_ms)).await;
                             }
                             Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
                                 self.stop_stream().await;
                                 let pos = self.clip.as_ref().map(|c| c.position_ms).unwrap_or(0);
-                                self.emit(PlayerEvent::Position(pos));
-                                self.set_status(PlaybackState::Ended);
+                                self.emit(PlayerEvent::Position(pos)).await;
+                                self.set_status(PlaybackState::Ended).await;
                             }
                             Err(e) => {
                                 self.stop_stream().await;
-                                self.emit(PlayerEvent::Error(format!("video decode error: {e}")));
-                                self.set_status(PlaybackState::Paused);
+                                self.emit(PlayerEvent::Error(format!("video decode error: {e}")))
+                                    .await;
+                                self.set_status(PlaybackState::Paused).await;
                             }
                         }
                     }
@@ -445,7 +530,7 @@ impl PlayerWorker {
             PlayerCommand::Pause => {
                 if self.status == PlaybackState::Playing {
                     self.stop_stream().await;
-                    self.set_status(PlaybackState::Paused);
+                    self.set_status(PlaybackState::Paused).await;
                 }
             }
             PlayerCommand::Seek(ms) => {
@@ -461,10 +546,16 @@ impl PlayerWorker {
             PlayerCommand::SetTrimRange(range) => {
                 self.update_trim_range(range).await;
             }
+            PlayerCommand::SetAudioTrack(track_index) => {
+                self.audio_track_index = track_index;
+                if self.status == PlaybackState::Playing {
+                    self.start_playback().await;
+                }
+            }
             PlayerCommand::Close => {
                 self.stop_stream().await;
                 self.clip = None;
-                self.set_status(PlaybackState::Stopped);
+                self.set_status(PlaybackState::Stopped).await;
             }
         }
     }
@@ -477,13 +568,13 @@ impl PlayerWorker {
     ) {
         self.stop_stream().await;
         self.clip = None;
-        self.set_status(PlaybackState::Loading);
+        self.set_status(PlaybackState::Loading).await;
 
         let canonical = match validate_input_path(&path).await {
             Ok(p) => p,
             Err(e) => {
-                self.emit(PlayerEvent::Error(e.to_string()));
-                self.set_status(PlaybackState::Stopped);
+                self.emit(PlayerEvent::Error(e.to_string())).await;
+                self.set_status(PlaybackState::Stopped).await;
                 return;
             }
         };
@@ -491,17 +582,18 @@ impl PlayerWorker {
         let probe = match self.processor.probe(&canonical).await {
             Ok(p) => p,
             Err(e) => {
-                self.emit(PlayerEvent::Error(e.to_string()));
-                self.set_status(PlaybackState::Stopped);
+                self.emit(PlayerEvent::Error(e.to_string())).await;
+                self.set_status(PlaybackState::Stopped).await;
                 return;
             }
         };
 
+        let audio_track_count = probe.audio_tracks.len();
         let metadata = match metadata_from_probe(&probe) {
             Ok(m) => m,
             Err(e) => {
-                self.emit(PlayerEvent::Error(e.to_string()));
-                self.set_status(PlaybackState::Stopped);
+                self.emit(PlayerEvent::Error(e.to_string())).await;
+                self.set_status(PlaybackState::Stopped).await;
                 return;
             }
         };
@@ -510,14 +602,19 @@ impl PlayerWorker {
             match compute_scaled_dimensions(metadata.width, metadata.height, max_dim) {
                 Ok(dims) => dims,
                 Err(e) => {
-                    self.emit(PlayerEvent::Error(e.to_string()));
-                    self.set_status(PlaybackState::Stopped);
+                    self.emit(PlayerEvent::Error(e.to_string())).await;
+                    self.set_status(PlaybackState::Stopped).await;
                     return;
                 }
             };
 
         let (trim_start_ms, trim_end_ms) = normalize_trim_range(trim_range, metadata.duration_ms);
-        self.emit(PlayerEvent::Metadata(metadata.clone()));
+        self.emit(PlayerEvent::Metadata(metadata.clone())).await;
+        self.emit(PlayerEvent::AudioStatus {
+            has_audio: metadata.has_audio,
+            error: None,
+        })
+        .await;
 
         match decode_single_frame(
             &self.ffmpeg_bin,
@@ -532,19 +629,20 @@ impl PlayerWorker {
                 self.clip = Some(OpenedClip {
                     path: canonical,
                     metadata,
+                    audio_track_count,
                     out_width,
                     out_height,
                     trim_start_ms,
                     trim_end_ms,
                     position_ms: trim_start_ms,
                 });
-                self.emit(PlayerEvent::Frame(frame));
-                self.emit(PlayerEvent::Position(trim_start_ms));
-                self.set_status(PlaybackState::Paused);
+                self.emit_frame(frame);
+                self.emit(PlayerEvent::Position(trim_start_ms)).await;
+                self.set_status(PlaybackState::Paused).await;
             }
             Err(e) => {
-                self.emit(PlayerEvent::Error(e.to_string()));
-                self.set_status(PlaybackState::Stopped);
+                self.emit(PlayerEvent::Error(e.to_string())).await;
+                self.set_status(PlaybackState::Stopped).await;
             }
         }
     }
@@ -560,8 +658,8 @@ impl PlayerWorker {
 
         if clip.trim_start_ms >= clip.trim_end_ms {
             let pos = clip.trim_start_ms;
-            self.emit(PlayerEvent::Position(pos));
-            self.set_status(PlaybackState::Ended);
+            self.emit(PlayerEvent::Position(pos)).await;
+            self.set_status(PlaybackState::Ended).await;
             return;
         }
 
@@ -569,10 +667,43 @@ impl PlayerWorker {
         let trim_end_ms = clip.trim_end_ms;
         let path = clip.path.clone();
         let fps = clip.metadata.fps;
+        let has_audio = clip.metadata.has_audio;
+        let audio_track_count = clip.audio_track_count;
         let out_w = clip.out_width;
         let out_h = clip.out_height;
 
         self.stop_stream().await;
+
+        let active_audio_track = self
+            .audio_track_index
+            .filter(|&idx| has_audio && idx < audio_track_count);
+
+        let (audio, clock, audio_error) = if let Some(track_idx) = active_audio_track {
+            match AudioSession::start(
+                &self.ffmpeg_bin,
+                &path,
+                start_ms,
+                trim_end_ms,
+                track_idx,
+                self.audio_controls.clone(),
+            )
+            .await
+            {
+                Ok((session, clock)) => (Some(session), clock, None),
+                Err(err) => {
+                    warn!(error = %err, "audio output unavailable; falling back to monotonic wall clock");
+                    (None, PlaybackClock::wall_clock(), Some(err))
+                }
+            }
+        } else {
+            (None, PlaybackClock::wall_clock(), None)
+        };
+
+        self.emit(PlayerEvent::AudioStatus {
+            has_audio,
+            error: audio_error,
+        })
+        .await;
 
         match spawn_playback_stream(
             &self.ffmpeg_bin,
@@ -582,14 +713,16 @@ impl PlayerWorker {
             fps,
             out_w,
             out_h,
+            audio,
+            clock,
         ) {
             Ok(stream) => {
                 self.stream = Some(stream);
-                self.set_status(PlaybackState::Playing);
+                self.set_status(PlaybackState::Playing).await;
             }
             Err(e) => {
-                self.emit(PlayerEvent::Error(e.to_string()));
-                self.set_status(PlaybackState::Paused);
+                self.emit(PlayerEvent::Error(e.to_string())).await;
+                self.set_status(PlaybackState::Paused).await;
             }
         }
     }
@@ -613,17 +746,17 @@ impl PlayerWorker {
                 if let Some(clip) = self.clip.as_mut() {
                     clip.position_ms = clamped_ms;
                 }
-                self.emit(PlayerEvent::Frame(frame));
-                self.emit(PlayerEvent::Position(clamped_ms));
+                self.emit_frame(frame);
+                self.emit(PlayerEvent::Position(clamped_ms)).await;
                 if was_playing {
                     self.start_playback().await;
                 } else {
-                    self.set_status(PlaybackState::Paused);
+                    self.set_status(PlaybackState::Paused).await;
                 }
             }
             Err(e) => {
-                self.emit(PlayerEvent::Error(e.to_string()));
-                self.set_status(PlaybackState::Paused);
+                self.emit(PlayerEvent::Error(e.to_string())).await;
+                self.set_status(PlaybackState::Paused).await;
             }
         }
     }
@@ -841,6 +974,7 @@ async fn decode_single_frame(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_playback_stream(
     ffmpeg_bin: &Path,
     canonical_in: &Path,
@@ -849,6 +983,8 @@ fn spawn_playback_stream(
     fps: f64,
     out_w: u32,
     out_h: u32,
+    audio: Option<AudioSession>,
+    clock: PlaybackClock,
 ) -> Result<ActiveStream> {
     let frame_bytes = (out_w as usize)
         .checked_mul(out_h as usize)
@@ -905,6 +1041,8 @@ fn spawn_playback_stream(
     Ok(ActiveStream {
         child,
         stdout,
+        audio,
+        clock,
         start_ms,
         trim_end_ms,
         fps,
@@ -912,7 +1050,6 @@ fn spawn_playback_stream(
         out_height: out_h,
         frame_bytes,
         frame_index: 0,
-        epoch: Instant::now(),
     })
 }
 
