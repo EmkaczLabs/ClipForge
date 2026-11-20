@@ -13,3 +13,4 @@ tempfile = "3"
 tokio.workspace = true
 tracing.workspace = true
 x11rb = "0.13"
+zbus.workspace = true

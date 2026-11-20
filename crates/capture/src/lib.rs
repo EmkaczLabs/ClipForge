@@ -1,4 +1,4 @@
-//! Capture backend crate (GPU Screen Recorder integration & X11 global hotkeys).
+//! Capture backend crate (GPU Screen Recorder integration & global hotkeys).
 
 pub mod args;
 pub mod backend;
@@ -13,6 +13,9 @@ pub use discovery::{
     list_monitors, parse_application_audio_output, parse_audio_devices_output, parse_capabilities,
     parse_monitors_output, query_capabilities, query_version,
 };
-pub use hotkey::{HotkeyAction, HotkeyManager, HotkeySpec, parse_hotkey};
+pub use hotkey::{
+    GlobalHotkeyStatus, HotkeyAction, HotkeyBackendKind, HotkeyManager, HotkeySpec,
+    detect_hotkey_backend, parse_hotkey, select_hotkey_backend,
+};
 
 pub use clipforge_common::{CaptureBackend, CaptureConfig, CaptureEvent, CaptureStatus};

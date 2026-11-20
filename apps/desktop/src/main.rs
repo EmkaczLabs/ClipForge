@@ -11,8 +11,9 @@ mod worker;
 
 use std::time::Instant;
 
+use clipforge_capture::{HotkeyAction, parse_hotkey};
 use rune::{AppSpec, Key, KeyEvent, Tx, Waker};
-use state::{AppState, NavSection};
+use state::{AppState, HotkeyConfig, NavSection};
 use worker::{WorkerCommand, WorkerHandle};
 
 fn setup_worker(state: &mut AppState, waker: Waker) {
@@ -30,7 +31,64 @@ fn poll_worker(state: &mut AppState, _now: f64, _tx: &mut Tx) -> bool {
     state.poll_worker()
 }
 
+fn key_event_to_keysym(key: &Key) -> Option<u32> {
+    match key {
+        Key::Function(n) if (1..=24).contains(n) => Some(0xFFBE + u32::from(n - 1)),
+        Key::Text(s) if s.chars().count() == 1 => {
+            let ch = s.chars().next()?.to_ascii_lowercase();
+            ch.is_ascii_alphanumeric().then_some(ch as u32)
+        }
+        Key::Text(s) if s == " " => Some(0x0020),
+        Key::Enter => Some(0xFF0D),
+        Key::Escape => Some(0xFF1B),
+        Key::Tab => Some(0xFF09),
+        Key::PrintScreen => Some(0xFF61),
+        Key::Insert => Some(0xFF63),
+        Key::Delete => Some(0xFFFF),
+        Key::Home => Some(0xFF50),
+        Key::End => Some(0xFF57),
+        Key::Pause => Some(0xFF13),
+        _ => None,
+    }
+}
+
+fn match_key_event_to_hotkey(event: &KeyEvent, hotkeys: &HotkeyConfig) -> Option<HotkeyAction> {
+    let keysym = key_event_to_keysym(&event.key)?;
+    for (action, raw) in [
+        (HotkeyAction::SaveReplay, hotkeys.save_replay.as_str()),
+        (
+            HotkeyAction::ToggleReplayBuffer,
+            hotkeys.toggle_replay.as_str(),
+        ),
+        (
+            HotkeyAction::ToggleRecording,
+            hotkeys.toggle_record.as_str(),
+        ),
+    ] {
+        if let Ok(spec) = parse_hotkey(raw)
+            && spec.matches_parts(
+                event.mods.ctrl,
+                event.mods.alt,
+                event.mods.shift,
+                event.mods.logo,
+                keysym,
+            )
+        {
+            return Some(action);
+        }
+    }
+    None
+}
+
 fn on_key(state: &mut AppState, event: &KeyEvent, _tx: &mut Tx) -> bool {
+    let is_function_key = matches!(event.key, Key::Function(_));
+    if (state.renaming_clip_id.is_none() || is_function_key)
+        && let Some(action) = match_key_event_to_hotkey(event, &state.hotkeys)
+    {
+        state.dispatch_hotkey_action(action);
+        return true;
+    }
+
     if state.nav != NavSection::Editor || state.renaming_clip_id.is_some() {
         return false;
     }
@@ -611,5 +669,124 @@ mod tests {
         rt.state.cancel_export();
         assert!(!rt.state.editor.exporting);
         assert_eq!(rt.state.editor.export_progress, None);
+    }
+
+    #[test]
+    fn focused_hotkeys_f9_f10_f11_dispatch_capture_actions_in_any_view() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(AppState::default(), views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+        assert_eq!(rt.state.nav, NavSection::Library);
+
+        let mut tx = Tx::default();
+        let initial_clips = rt.state.clips.len();
+
+        // F10 toggles replay buffer on and off from Library view.
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Function(10),
+                mods: rune::Mods::default(),
+            },
+            &mut tx
+        ));
+        assert!(matches!(
+            rt.state.capture_status,
+            CaptureStatus::ReplayBuffering { .. }
+        ));
+
+        // F9 saves a replay clip.
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Function(9),
+                mods: rune::Mods::default(),
+            },
+            &mut tx
+        ));
+        assert_eq!(rt.state.clips.len(), initial_clips + 1);
+
+        // F10 toggles replay buffer back to Idle.
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Function(10),
+                mods: rune::Mods::default(),
+            },
+            &mut tx
+        ));
+        assert_eq!(rt.state.capture_status, CaptureStatus::Idle);
+
+        // F11 toggles recording on and off.
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Function(11),
+                mods: rune::Mods::default(),
+            },
+            &mut tx
+        ));
+        assert!(matches!(
+            rt.state.capture_status,
+            CaptureStatus::Recording { .. }
+        ));
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Function(11),
+                mods: rune::Mods::default(),
+            },
+            &mut tx
+        ));
+        assert_eq!(rt.state.capture_status, CaptureStatus::Idle);
+
+        // Custom modifier hotkey requires the exact modifier mask.
+        rt.state.hotkeys.save_replay = "Ctrl+Alt+F9".to_string();
+        assert!(!on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Function(9),
+                mods: rune::Mods::default(),
+            },
+            &mut tx
+        ));
+        assert!(on_key(
+            &mut rt.state,
+            &KeyEvent {
+                key: Key::Function(9),
+                mods: rune::Mods {
+                    ctrl: true,
+                    alt: true,
+                    ..Default::default()
+                },
+            },
+            &mut tx
+        ));
+        assert_eq!(rt.state.clips.len(), initial_clips + 2);
+    }
+
+    #[test]
+    fn hotkey_status_labels_reflect_registration_state() {
+        use clipforge_capture::GlobalHotkeyStatus;
+
+        let mut st = AppState::default();
+        assert!(st.hotkey_status.label().starts_with("Focused-Window Only"));
+
+        st.hotkey_status = GlobalHotkeyStatus::PermissionPending;
+        assert_eq!(st.hotkey_status.label(), "Permission Pending");
+
+        st.hotkey_status = GlobalHotkeyStatus::WaylandPortalActive;
+        assert_eq!(
+            st.hotkey_status.label(),
+            "GlobalShortcuts (Wayland Portal Active)"
+        );
+
+        st.hotkey_status = GlobalHotkeyStatus::RegistrationError {
+            message: "portal denied".to_string(),
+        };
+        assert_eq!(
+            st.hotkey_status.label(),
+            "Registration Error: portal denied"
+        );
     }
 }

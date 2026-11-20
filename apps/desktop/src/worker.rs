@@ -7,13 +7,14 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use clipforge_capture::{
-    AudioDeviceInfo, CaptureBackend, GsrCaptureBackend, MonitorInfo, detect_gsr,
-    list_application_audio, list_audio_devices, list_monitors,
+    AudioDeviceInfo, CaptureBackend, GlobalHotkeyStatus, GsrCaptureBackend, HotkeyAction,
+    HotkeyManager, HotkeySpec, MonitorInfo, detect_gsr, list_application_audio, list_audio_devices,
+    list_monitors, parse_hotkey,
 };
 use clipforge_cloud_client::{HttpCloudClient, RemoteClipSummary, ShareVisibility};
 use clipforge_common::{
     AppConfig, CaptureConfig, CaptureEvent, CaptureStatus, ClipFilter, ClipId, ClipMetadata,
-    ClipStore, CloudClient, MediaProcessor, TrimRequest,
+    ClipStore, CloudClient, HotkeyBindings, MediaProcessor, TrimRequest,
 };
 use clipforge_library::{ClipListOptions, ClipOrigin, DirectoryScanner, SqliteClipStore};
 use clipforge_media::{
@@ -146,6 +147,7 @@ pub enum WorkerEvent {
     },
     CaptureStatusChanged(CaptureStatus),
     CaptureEventReceived(CaptureEvent),
+    HotkeyStatusChanged(GlobalHotkeyStatus),
     TrimProgress(f32),
     TrimCompleted(std::result::Result<PathBuf, String>),
     UploadCompleted {
@@ -215,6 +217,10 @@ struct WorkerServices {
     player: VideoPlayerHandle,
     active_player_clip: Arc<Mutex<Option<(ClipId, rune::Pixels)>>>,
     active_trim_cancel: Arc<Mutex<Option<ExportCancelToken>>>,
+    config: Arc<Mutex<AppConfig>>,
+    hotkey_manager: Arc<Mutex<Option<HotkeyManager>>>,
+    hotkey_tx: UnboundedSender<HotkeyAction>,
+    hotkey_status_tx: UnboundedSender<GlobalHotkeyStatus>,
 }
 
 impl WorkerHandle {
@@ -244,6 +250,10 @@ impl WorkerHandle {
                     let (player, mut player_rx) = VideoPlayerHandle::spawn();
                     let active_player_clip: Arc<Mutex<Option<(ClipId, rune::Pixels)>>> =
                         Arc::new(Mutex::new(None));
+                    let (hotkey_tx, mut hotkey_rx) =
+                        tokio_mpsc::unbounded_channel::<HotkeyAction>();
+                    let (hotkey_status_tx, mut hotkey_status_rx) =
+                        tokio_mpsc::unbounded_channel::<GlobalHotkeyStatus>();
                     let services = Arc::new(WorkerServices {
                         capture: capture.clone(),
                         media,
@@ -251,6 +261,30 @@ impl WorkerHandle {
                         player,
                         active_player_clip: active_player_clip.clone(),
                         active_trim_cancel: Arc::new(Mutex::new(None)),
+                        config: Arc::new(Mutex::new(AppConfig::default())),
+                        hotkey_manager: Arc::new(Mutex::new(None)),
+                        hotkey_tx,
+                        hotkey_status_tx,
+                    });
+
+                    // Forward GlobalHotkeyStatus updates to the UI.
+                    let hk_status_evt_tx = evt_tx.clone();
+                    let hk_status_waker = waker.clone();
+                    tokio::spawn(async move {
+                        while let Some(status) = hotkey_status_rx.recv().await {
+                            let _ = hk_status_evt_tx.send(WorkerEvent::HotkeyStatusChanged(status));
+                            (hk_status_waker)();
+                        }
+                    });
+
+                    // Dispatch triggered global hotkeys using the same capture path as UI buttons.
+                    let hk_svc = services.clone();
+                    let hk_evt_tx = evt_tx.clone();
+                    let hk_waker = waker.clone();
+                    tokio::spawn(async move {
+                        while let Some(action) = hotkey_rx.recv().await {
+                            handle_hotkey_action(action, &hk_svc, &hk_evt_tx, &hk_waker).await;
+                        }
                     });
 
                     // Forward asynchronous CaptureEvents from GsrCaptureBackend to the UI.
@@ -355,6 +389,10 @@ async fn handle_command(
     match cmd {
         WorkerCommand::Initialize(cfg) => {
             let t_init = std::time::Instant::now();
+            if let Ok(mut guard) = svc.config.lock() {
+                *guard = cfg.clone();
+            }
+            register_hotkeys(&svc, &cfg.hotkeys);
             let deps = probe_dependencies().await;
             let _ = evt_tx.send(WorkerEvent::DependenciesProbed(deps));
             let t_deps = t_init.elapsed();
@@ -546,67 +584,22 @@ async fn handle_command(
             (waker)();
         }
         WorkerCommand::StartReplayBuffer(cfg) => {
-            match svc.capture.start_replay_buffer(&cfg).await {
-                Ok(()) => {
-                    let st = svc.capture.status().await;
-                    let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(st));
-                }
-                Err(err) => {
-                    let msg = err.to_string();
-                    let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(CaptureStatus::Error {
-                        message: msg.clone(),
-                    }));
-                    let _ = evt_tx.send(WorkerEvent::Banner(msg));
-                }
+            if let Ok(mut guard) = svc.config.lock() {
+                guard.capture = cfg.clone();
             }
-            (waker)();
+            execute_start_replay_buffer(&svc, &cfg, evt_tx, waker).await;
         }
         WorkerCommand::StartRecording(cfg) => {
-            match svc.capture.start_recording(&cfg).await {
-                Ok(()) => {
-                    let st = svc.capture.status().await;
-                    let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(st));
-                }
-                Err(err) => {
-                    let msg = err.to_string();
-                    let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(CaptureStatus::Error {
-                        message: msg.clone(),
-                    }));
-                    let _ = evt_tx.send(WorkerEvent::Banner(msg));
-                }
+            if let Ok(mut guard) = svc.config.lock() {
+                guard.capture = cfg.clone();
             }
-            (waker)();
+            execute_start_recording(&svc, &cfg, evt_tx, waker).await;
         }
         WorkerCommand::SaveReplay => {
-            match svc.capture.save_replay().await {
-                Ok(path) => {
-                    let _ = evt_tx.send(WorkerEvent::Banner(format!(
-                        "Replay saved: {}",
-                        path.display()
-                    )));
-                    let store = svc.store.lock().ok().and_then(|g| g.clone());
-                    if let Some(store) = store {
-                        let _ = index_single_clip(&store, &svc.media, &path, true).await;
-                        emit_library_loaded(&store, evt_tx).await;
-                    }
-                }
-                Err(err) => {
-                    let _ = evt_tx.send(WorkerEvent::Banner(err.to_string()));
-                }
-            }
-            (waker)();
+            execute_save_replay(&svc, evt_tx, waker).await;
         }
         WorkerCommand::StopCapture => {
-            match svc.capture.stop().await {
-                Ok(()) => {
-                    let st = svc.capture.status().await;
-                    let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(st));
-                }
-                Err(err) => {
-                    let _ = evt_tx.send(WorkerEvent::Banner(err.to_string()));
-                }
-            }
-            (waker)();
+            execute_stop_capture(&svc, evt_tx, waker).await;
         }
         WorkerCommand::TrimClip(req) => {
             let cancel = ExportCancelToken::new();
@@ -702,6 +695,18 @@ async fn handle_command(
             (waker)();
         }
         WorkerCommand::SaveConfig(cfg) => {
+            let hotkeys_changed = svc
+                .config
+                .lock()
+                .map(|mut guard| {
+                    let changed = guard.hotkeys != cfg.hotkeys;
+                    *guard = cfg.clone();
+                    changed
+                })
+                .unwrap_or(false);
+            if hotkeys_changed {
+                register_hotkeys(&svc, &cfg.hotkeys);
+            }
             let path = config_file_path();
             let res = save_app_config_to(&path, &cfg)
                 .map(|()| path)
@@ -1210,4 +1215,172 @@ async fn find_binary(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+async fn execute_start_replay_buffer(
+    svc: &Arc<WorkerServices>,
+    cfg: &CaptureConfig,
+    evt_tx: &Sender<WorkerEvent>,
+    waker: &Waker,
+) {
+    match svc.capture.start_replay_buffer(cfg).await {
+        Ok(()) => {
+            let st = svc.capture.status().await;
+            let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(st));
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(CaptureStatus::Error {
+                message: msg.clone(),
+            }));
+            let _ = evt_tx.send(WorkerEvent::Banner(msg));
+        }
+    }
+    (waker)();
+}
+
+async fn execute_start_recording(
+    svc: &Arc<WorkerServices>,
+    cfg: &CaptureConfig,
+    evt_tx: &Sender<WorkerEvent>,
+    waker: &Waker,
+) {
+    match svc.capture.start_recording(cfg).await {
+        Ok(()) => {
+            let st = svc.capture.status().await;
+            let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(st));
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(CaptureStatus::Error {
+                message: msg.clone(),
+            }));
+            let _ = evt_tx.send(WorkerEvent::Banner(msg));
+        }
+    }
+    (waker)();
+}
+
+async fn execute_save_replay(
+    svc: &Arc<WorkerServices>,
+    evt_tx: &Sender<WorkerEvent>,
+    waker: &Waker,
+) {
+    match svc.capture.save_replay().await {
+        Ok(path) => {
+            let _ = evt_tx.send(WorkerEvent::Banner(format!(
+                "Replay saved: {}",
+                path.display()
+            )));
+            let store = svc.store.lock().ok().and_then(|g| g.clone());
+            if let Some(store) = store {
+                let _ = index_single_clip(&store, &svc.media, &path, true).await;
+                emit_library_loaded(&store, evt_tx).await;
+            }
+        }
+        Err(err) => {
+            let _ = evt_tx.send(WorkerEvent::Banner(err.to_string()));
+        }
+    }
+    (waker)();
+}
+
+async fn execute_stop_capture(
+    svc: &Arc<WorkerServices>,
+    evt_tx: &Sender<WorkerEvent>,
+    waker: &Waker,
+) {
+    match svc.capture.stop().await {
+        Ok(()) => {
+            let st = svc.capture.status().await;
+            let _ = evt_tx.send(WorkerEvent::CaptureStatusChanged(st));
+        }
+        Err(err) => {
+            let _ = evt_tx.send(WorkerEvent::Banner(err.to_string()));
+        }
+    }
+    (waker)();
+}
+
+async fn handle_hotkey_action(
+    action: HotkeyAction,
+    svc: &Arc<WorkerServices>,
+    evt_tx: &Sender<WorkerEvent>,
+    waker: &Waker,
+) {
+    match action {
+        HotkeyAction::SaveReplay => {
+            execute_save_replay(svc, evt_tx, waker).await;
+        }
+        HotkeyAction::ToggleReplayBuffer => {
+            let status = svc.capture.status().await;
+            if matches!(status, CaptureStatus::ReplayBuffering { .. }) {
+                execute_stop_capture(svc, evt_tx, waker).await;
+            } else {
+                let cfg = svc
+                    .config
+                    .lock()
+                    .map(|g| g.capture.clone())
+                    .unwrap_or_default();
+                execute_start_replay_buffer(svc, &cfg, evt_tx, waker).await;
+            }
+        }
+        HotkeyAction::ToggleRecording => {
+            let status = svc.capture.status().await;
+            if matches!(status, CaptureStatus::Recording { .. }) {
+                execute_stop_capture(svc, evt_tx, waker).await;
+            } else {
+                let cfg = svc
+                    .config
+                    .lock()
+                    .map(|g| g.capture.clone())
+                    .unwrap_or_default();
+                execute_start_recording(svc, &cfg, evt_tx, waker).await;
+            }
+        }
+    }
+}
+
+fn build_hotkey_bindings(
+    hotkeys: &HotkeyBindings,
+) -> std::result::Result<Vec<(HotkeyAction, HotkeySpec)>, String> {
+    let mut out = Vec::with_capacity(3);
+    for (action, raw) in [
+        (HotkeyAction::SaveReplay, hotkeys.save_replay.as_str()),
+        (
+            HotkeyAction::ToggleReplayBuffer,
+            hotkeys.toggle_replay.as_str(),
+        ),
+        (
+            HotkeyAction::ToggleRecording,
+            hotkeys.toggle_record.as_str(),
+        ),
+    ] {
+        let spec = parse_hotkey(raw).map_err(|e| format!("invalid hotkey '{raw}': {e}"))?;
+        out.push((action, spec));
+    }
+    Ok(out)
+}
+
+fn register_hotkeys(svc: &Arc<WorkerServices>, hotkeys: &HotkeyBindings) {
+    if let Ok(mut guard) = svc.hotkey_manager.lock() {
+        *guard = None;
+    }
+    match build_hotkey_bindings(hotkeys) {
+        Ok(bindings) => {
+            let mgr = HotkeyManager::start_auto(
+                bindings,
+                svc.hotkey_tx.clone(),
+                svc.hotkey_status_tx.clone(),
+            );
+            if let Ok(mut guard) = svc.hotkey_manager.lock() {
+                *guard = Some(mgr);
+            }
+        }
+        Err(message) => {
+            let _ = svc
+                .hotkey_status_tx
+                .send(GlobalHotkeyStatus::RegistrationError { message });
+        }
+    }
 }

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Utc};
-use clipforge_capture::{AudioDeviceInfo, MonitorInfo};
+use clipforge_capture::{AudioDeviceInfo, GlobalHotkeyStatus, HotkeyAction, MonitorInfo};
 use clipforge_cloud_client::{RemoteClipSummary, ShareVisibility};
 use clipforge_common::{
     AppConfig, AudioCodec, AudioTrackInfo, CaptureEvent, CaptureStatus, CaptureTarget, ClipId,
@@ -302,6 +302,7 @@ pub struct AppState {
     pub server_pass_edit: rune::TextEdit,
     pub confirm_remote_delete: Option<String>,
     pub hotkeys: HotkeyConfig,
+    pub hotkey_status: GlobalHotkeyStatus,
     pub status_banner: Option<String>,
     pub worker: Option<WorkerHandle>,
 }
@@ -409,6 +410,7 @@ impl Default for AppState {
             server_pass_edit: rune::TextEdit::default(),
             confirm_remote_delete: None,
             hotkeys,
+            hotkey_status: GlobalHotkeyStatus::FocusedWindowOnly { reason: None },
             status_banner: None,
             worker: None,
         }
@@ -1280,6 +1282,15 @@ impl AppState {
         ));
     }
 
+    /// Dispatches a logical [`HotkeyAction`] using the exact same capture commands as UI buttons.
+    pub fn dispatch_hotkey_action(&mut self, action: HotkeyAction) {
+        match action {
+            HotkeyAction::SaveReplay => self.trigger_save_replay(),
+            HotkeyAction::ToggleReplayBuffer => self.toggle_replay_buffer(),
+            HotkeyAction::ToggleRecording => self.toggle_recording(),
+        }
+    }
+
     /// Queues a trim export request via the background worker (or validates locally in tests).
     pub fn export_trimmed_clip(&mut self) {
         let Some(clip) = self.selected_clip().cloned() else {
@@ -1508,6 +1519,9 @@ impl AppState {
                 }
                 WorkerEvent::CaptureStatusChanged(status) => {
                     self.capture_status = status;
+                }
+                WorkerEvent::HotkeyStatusChanged(status) => {
+                    self.hotkey_status = status;
                 }
                 WorkerEvent::CaptureEventReceived(cap_ev) => match cap_ev {
                     CaptureEvent::StatusChanged(status) => {
