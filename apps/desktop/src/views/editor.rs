@@ -1,10 +1,11 @@
 //! Video Editor view: embedded video viewport, interactive timeline, trim handles, and export.
 
 use rune::tok::type_;
-use rune::{Cursor, Drag, El, Phase, SurfaceFit, Tx, col, el, row, text};
+use rune::{Cursor, Drag, El, Key, KeyEvent, Phase, SurfaceFit, Tx, col, el, row, text};
 
 use crate::components::{
-    badge, btn_primary, btn_secondary, card, kv_row, pill_option, section_header, toggle_switch,
+    badge, btn_danger, btn_primary, btn_secondary, card, kv_row, pill_option, section_header,
+    toggle_switch,
 };
 use crate::state::{AppState, NavSection, format_duration_ms, is_sample_clip};
 use crate::theme::{Palette, radius, space};
@@ -46,12 +47,24 @@ pub fn view(p: &Palette, s: &AppState) -> El {
     let playhead_ratio = (s.editor.playhead_ms as f32 / duration_ms as f32).clamp(0.0, 1.0);
     let selection_ms = s.editor.trim_end_ms.saturating_sub(s.editor.trim_start_ms);
 
-    let track_w: f32 = 640.0;
+    let zoom = s.editor.timeline_zoom.clamp(1.0, 8.0);
+    let base_track_w: f32 = 640.0;
+    let track_w: f32 = base_track_w * zoom;
     let track_h: f32 = 56.0;
     let handle_w: f32 = 10.0;
     let sel_left = start_ratio * track_w;
     let sel_w = ((end_ratio - start_ratio) * track_w).max(handle_w * 2.0);
     let playhead_x = (playhead_ratio * track_w).clamp(0.0, track_w - 3.0);
+
+    let slider_w: f32 = 88.0;
+    let slider_h: f32 = 20.0;
+    let effective_vol = if s.editor.muted {
+        0.0
+    } else {
+        s.editor.volume.clamp(0.0, 1.0)
+    };
+    let vol_fill_w = (effective_vol * slider_w).clamp(0.0, slider_w);
+    let vol_knob_x = (vol_fill_w - 5.0).clamp(0.0, slider_w - 10.0);
 
     let viewport_content = if is_sample {
         col()
@@ -108,6 +121,78 @@ pub fn view(p: &Palette, s: &AppState) -> El {
     } else {
         format!("{}x{}", clip.width, clip.height)
     };
+
+    let mut audio_controls = row()
+        .key("audio-controls")
+        .gap(space::SM)
+        .center_y()
+        .child(pill_option(
+            p,
+            "mute-toggle",
+            if s.editor.muted { "Muted" } else { "Mute" },
+            s.editor.muted,
+            |st| st.toggle_mute(),
+        ))
+        .child(
+            el().key("volume-slider")
+                .w(slider_w)
+                .h(slider_h)
+                .cursor(Cursor::Pointer)
+                .on_drag(move |st: &mut AppState, d: &mut Drag, _tx: &mut Tx| {
+                    if d.cancelled() {
+                        return;
+                    }
+                    let ratio = if d.w > 0.0 {
+                        (d.x / d.w).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    st.set_volume(ratio);
+                })
+                .child(
+                    el().key("volume-track")
+                        .absolute(0.0, 7.0)
+                        .size(slider_w, 6.0)
+                        .radius(radius::PILL)
+                        .fill(p.bg_base)
+                        .border(1.0, p.border_subtle),
+                )
+                .child(
+                    el().key("volume-fill")
+                        .absolute(0.0, 7.0)
+                        .size(vol_fill_w, 6.0)
+                        .radius(radius::PILL)
+                        .fill(if s.editor.muted {
+                            p.text_muted
+                        } else {
+                            p.accent
+                        }),
+                )
+                .child(
+                    el().key("volume-knob")
+                        .absolute(vol_knob_x, 5.0)
+                        .size(10.0, 10.0)
+                        .radius(radius::PILL)
+                        .fill(p.knob),
+                ),
+        )
+        .child(
+            text(format!("{}%", (effective_vol * 100.0).round() as u32))
+                .font(type_::LABEL)
+                .color(p.text_secondary),
+        );
+
+    if let Some(_err) = &s.editor.audio_error {
+        audio_controls = audio_controls.child(badge(
+            "audio-err-badge",
+            "Audio Off",
+            p.warning,
+            p.warning_soft,
+        ));
+    } else if !is_sample && s.editor.has_video_frame && !s.editor.has_audio {
+        audio_controls =
+            audio_controls.child(badge("no-audio-badge", "No Audio", p.text_muted, p.bg_base));
+    }
 
     let preview_card = card(p, "editor-preview-card")
         .child(
@@ -204,8 +289,9 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                 .child(
                     row()
                         .key("timecode-group")
-                        .gap(space::SM)
+                        .gap(space::MD)
                         .center_y()
+                        .child(audio_controls)
                         .child(
                             text(format!(
                                 "{} / {}",
@@ -331,21 +417,66 @@ pub fn view(p: &Palette, s: &AppState) -> El {
         );
 
     let export_btn = if s.editor.exporting {
-        btn_secondary(p, "trim-export", "Exporting...", |_st| {})
+        btn_danger(p, "cancel-export", "Cancel Export", |st| {
+            st.cancel_export();
+        })
     } else {
         btn_primary(p, "trim-export", "Export Clip", |st| {
             st.export_trimmed_clip();
         })
     };
 
-    let timeline_card = card(p, "editor-timeline-card")
-        .child(section_header(
+    let mut zoom_controls = row()
+        .key("timeline-zoom-controls")
+        .gap(space::XS)
+        .center_y()
+        .child(pill_option(p, "zoom-out", "-", false, |st| {
+            let next = (st.editor.timeline_zoom * 0.5).max(1.0);
+            st.set_timeline_zoom(next);
+        }))
+        .child(pill_option(
             p,
-            "timeline-hdr",
-            "Trim Timeline",
-            "Click or drag timeline to scrub; drag accent handles or use buttons to trim",
+            "zoom-reset",
+            "1x",
+            (zoom - 1.0).abs() < 0.05,
+            |st| st.set_timeline_zoom(1.0),
         ))
-        .child(track)
+        .child(pill_option(p, "zoom-in", "+", false, |st| {
+            let next = (st.editor.timeline_zoom * 2.0).min(8.0);
+            st.set_timeline_zoom(next);
+        }));
+
+    if zoom > 1.05 {
+        zoom_controls = zoom_controls.child(badge(
+            "zoom-level-badge",
+            &format!("{zoom:.0}x"),
+            p.accent_text,
+            p.accent_soft,
+        ));
+    }
+
+    let mut timeline_card = card(p, "editor-timeline-card")
+        .child(
+            row()
+                .key("timeline-hdr-row")
+                .w_full()
+                .justify_between()
+                .center_y()
+                .child(section_header(
+                    p,
+                    "timeline-hdr",
+                    "Trim Timeline",
+                    "Click or drag timeline to scrub; drag accent handles or use buttons to trim",
+                ))
+                .child(zoom_controls),
+        )
+        .child(
+            row()
+                .key("timeline-scroll")
+                .w_full()
+                .scroll_x()
+                .child(track),
+        )
         .child(
             row()
                 .key("trim-controls")
@@ -454,10 +585,83 @@ pub fn view(p: &Palette, s: &AppState) -> El {
                 ),
         );
 
+    if s.editor.exporting {
+        let progress = s.editor.export_progress.unwrap_or(0.0).clamp(0.0, 1.0);
+        let pct = (progress * 100.0).round() as u32;
+        let rem = (1.0 - progress).max(0.0);
+        timeline_card = timeline_card.child(
+            col()
+                .key("export-progress-box")
+                .w_full()
+                .gap(space::XS)
+                .child(
+                    row()
+                        .key("export-progress-hdr")
+                        .w_full()
+                        .justify_between()
+                        .center_y()
+                        .child(
+                            text(format!("Exporting clip... {pct}%"))
+                                .font(type_::LABEL)
+                                .color(p.text_primary),
+                        )
+                        .child(
+                            text(if s.editor.reencode {
+                                "Frame-accurate re-encode"
+                            } else {
+                                "Stream copy"
+                            })
+                            .font(type_::LABEL)
+                            .color(p.text_secondary),
+                        ),
+                )
+                .child(
+                    row()
+                        .key("export-progress-track")
+                        .w_full()
+                        .h(8.0)
+                        .radius(radius::PILL)
+                        .fill(p.bg_base)
+                        .border(1.0, p.border_subtle)
+                        .clip_rounded(radius::PILL)
+                        .child(
+                            el().key("export-progress-fill")
+                                .grow(progress)
+                                .h_full()
+                                .fill(p.accent),
+                        )
+                        .child(el().key("export-progress-rem").grow(rem).h_full()),
+                ),
+        );
+    }
+
     let mut root = col()
         .key("editor-view")
         .w_full()
         .gap(space::LG)
+        .focusable(true)
+        .on_key(move |st: &mut AppState, ev: &KeyEvent, _tx: &mut Tx| {
+            if ev.mods.ctrl || ev.mods.alt || ev.mods.cmd || ev.mods.logo {
+                return false;
+            }
+            match &ev.key {
+                Key::Text(t) if t == " " => {
+                    st.toggle_play();
+                    true
+                }
+                Key::Left => {
+                    let target = st.editor.playhead_ms.saturating_sub(5_000);
+                    st.seek_editor(target);
+                    true
+                }
+                Key::Right => {
+                    let target = (st.editor.playhead_ms + 5_000).min(duration_ms);
+                    st.seek_editor(target);
+                    true
+                }
+                _ => false,
+            }
+        })
         .child(preview_card)
         .child(timeline_card);
 
