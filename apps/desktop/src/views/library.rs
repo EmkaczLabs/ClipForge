@@ -220,7 +220,7 @@ fn toolbar_view(p: &Palette, s: &AppState) -> El {
             .radius(radius::XS)
             .fill(p.bg_lowest)
             .border(1.0, p.border_subtle)
-            .focus_ring(1.0, 0.0, p.border_focus)
+            .focus_within_ring(1.0, 0.0, p.border_focus)
             .child(icon(&icons::SEARCH, 14.0).color(p.text_muted).a11y_hidden())
             .child(
                 text_input(&s.library_search, typography::BODY)

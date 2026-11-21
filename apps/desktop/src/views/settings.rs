@@ -7,8 +7,8 @@ use rune::{Color, Cursor, El, col, el, row, text};
 
 use crate::components::{
     badge, btn_primary, btn_secondary, card, empty_state, kv_row, panel, pill_option, search_field,
-    section_header, segmented_control, segmented_item, settings_row, status_pill, text_input_box,
-    toggle_switch,
+    section_header, secure_input_box, segmented_control, segmented_item, settings_row, status_pill,
+    text_input_box, toggle_switch,
 };
 use crate::config::config_file_path;
 use crate::state::{AppState, NavSection, SettingsTab};
@@ -87,6 +87,7 @@ fn category_rail(p: &Palette, s: &AppState) -> El {
                     "settings-search",
                     &s.settings_search,
                     "Filter settings...",
+                    |st| &mut st.settings_search,
                 )),
         )
         .child(
@@ -601,6 +602,7 @@ fn storage_rows(p: &Palette, s: &AppState) -> Vec<SettingRowSpec> {
                         "settings-clips-dir",
                         &s.clips_dir_edit,
                         "~/Videos/ClipForge",
+                        |st| &mut st.clips_dir_edit,
                     )),
             ),
         },
@@ -1454,6 +1456,7 @@ fn sharing_rows(p: &Palette, s: &AppState) -> Vec<SettingRowSpec> {
                     "settings-server-url",
                     &s.server_url_edit,
                     "https://clips.example.com",
+                    |st| &mut st.server_url_edit,
                 )),
             ),
         },
@@ -1466,11 +1469,12 @@ fn sharing_rows(p: &Palette, s: &AppState) -> Vec<SettingRowSpec> {
                 "row-api-token",
                 "API bearer token",
                 "Optional bearer token persisted to config.json for authenticated uploads",
-                el().key("api-token-wrap").w(280.0).child(text_input_box(
+                el().key("api-token-wrap").w(280.0).child(secure_input_box(
                     p,
                     "settings-api-token",
                     &s.api_token_edit,
                     "Bearer token (optional)",
+                    |st| &mut st.api_token_edit,
                 )),
             ),
         },

@@ -6,7 +6,7 @@ use rune::{Cursor, El, SurfaceFit, col, el, icon, row, text};
 
 use crate::components::{
     badge, btn_danger, btn_ghost, btn_primary, btn_secondary, card, empty_state, icon_btn_sized,
-    icons, kv_row, panel, pill_option, progress_bar, status_pill, text_input_box,
+    icons, kv_row, panel, pill_option, progress_bar, secure_input_box, status_pill, text_input_box,
 };
 use crate::state::{
     AppState, NavSection, UploadEntry, UploadStatus, format_bytes, format_duration_ms,
@@ -187,6 +187,7 @@ fn disconnected_view(p: &Palette, s: &AppState) -> El {
                     "server-url-input",
                     &s.server_url_edit,
                     "https://clips.example.com:9443",
+                    |st| &mut st.server_url_edit,
                 )),
         )
         .child(
@@ -211,11 +212,12 @@ fn disconnected_view(p: &Palette, s: &AppState) -> El {
                                 .color(p.text_muted),
                         ),
                 )
-                .child(text_input_box(
+                .child(secure_input_box(
                     p,
                     "server-token-input",
                     &s.api_token_edit,
                     "cf_tok_...",
+                    |st| &mut st.api_token_edit,
                 )),
         )
         .child(
@@ -239,6 +241,7 @@ fn disconnected_view(p: &Palette, s: &AppState) -> El {
                             "server-user-input",
                             &s.server_user_edit,
                             "username",
+                            |st| &mut st.server_user_edit,
                         )),
                 )
                 .child(
@@ -252,11 +255,12 @@ fn disconnected_view(p: &Palette, s: &AppState) -> El {
                                 .font(typography::LABEL)
                                 .color(p.text_secondary),
                         )
-                        .child(text_input_box(
+                        .child(secure_input_box(
                             p,
                             "server-pass-input",
                             &s.server_pass_edit,
                             "password",
+                            |st| &mut st.server_pass_edit,
                         )),
                 ),
         )

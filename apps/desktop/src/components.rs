@@ -433,48 +433,85 @@ pub fn segmented_item(
         )
 }
 
-/// Styled `rune::TextEdit` input field.
-#[allow(dead_code)]
-pub fn text_input_box(p: &Palette, key: &str, edit: &TextEdit, placeholder: &str) -> El {
-    let show_placeholder = edit.text.is_empty() && !placeholder.is_empty();
-    row()
+/// Styled single-line `rune::TextEdit` input field.
+pub fn text_input_box(
+    p: &Palette,
+    key: &str,
+    edit: &TextEdit,
+    placeholder: &str,
+    on_edit: impl for<'a> Fn(&'a mut AppState) -> &'a mut TextEdit + 'static,
+) -> El {
+    text_input_box_inner(p, key, edit, placeholder, false, on_edit)
+}
+
+/// Styled single-line masked `rune::TextEdit` input field for passwords and tokens.
+pub fn secure_input_box(
+    p: &Palette,
+    key: &str,
+    edit: &TextEdit,
+    placeholder: &str,
+    on_edit: impl for<'a> Fn(&'a mut AppState) -> &'a mut TextEdit + 'static,
+) -> El {
+    text_input_box_inner(p, key, edit, placeholder, true, on_edit)
+}
+
+fn text_input_box_inner(
+    p: &Palette,
+    key: &str,
+    edit: &TextEdit,
+    placeholder: &str,
+    secure: bool,
+    on_edit: impl for<'a> Fn(&'a mut AppState) -> &'a mut TextEdit + 'static,
+) -> El {
+    let mut input = text_input(edit, typography::BODY)
+        .single_line()
         .key(key)
+        .color(p.text_primary)
+        .grow(1.0)
+        .min_w(0.0)
+        .on_edit(on_edit);
+    if !placeholder.is_empty() {
+        input = input
+            .placeholder(placeholder, p.text_muted)
+            .label(placeholder);
+    }
+    if secure {
+        input = input.secure();
+    }
+    row()
+        .key(format!("{key}-box"))
         .h(34.0)
         .px(space::SM)
         .center_y()
         .radius(radius::XS)
         .fill(p.bg_lowest)
         .border(1.0, p.border_subtle)
-        .focus_ring(1.0, 0.0, p.border_focus)
-        .child(if show_placeholder {
-            el().key("input-wrap")
-                .grow(1.0)
-                .min_w(0.0)
-                .child(
-                    text(placeholder.to_string())
-                        .font(typography::BODY)
-                        .color(p.text_muted)
-                        .a11y_hidden(),
-                )
-                .child(
-                    text_input(edit, typography::BODY)
-                        .color(p.text_primary)
-                        .w_full(),
-                )
-        } else {
-            text_input(edit, typography::BODY)
-                .color(p.text_primary)
-                .grow(1.0)
-                .min_w(0.0)
-        })
+        .focus_within_ring(1.0, 0.0, p.border_focus)
+        .child(input)
 }
 
 /// Search field with leading magnifying glass icon.
-#[allow(dead_code)]
-pub fn search_field(p: &Palette, key: &str, edit: &TextEdit, placeholder: &str) -> El {
-    let show_placeholder = edit.text.is_empty() && !placeholder.is_empty();
-    row()
+pub fn search_field(
+    p: &Palette,
+    key: &str,
+    edit: &TextEdit,
+    placeholder: &str,
+    on_edit: impl for<'a> Fn(&'a mut AppState) -> &'a mut TextEdit + 'static,
+) -> El {
+    let mut input = text_input(edit, typography::BODY)
+        .single_line()
         .key(key)
+        .color(p.text_primary)
+        .grow(1.0)
+        .min_w(0.0)
+        .on_edit(on_edit);
+    if !placeholder.is_empty() {
+        input = input
+            .placeholder(placeholder, p.text_muted)
+            .label(placeholder);
+    }
+    row()
+        .key(format!("{key}-box"))
         .h(34.0)
         .px(space::SM)
         .gap(space::SM)
@@ -482,26 +519,9 @@ pub fn search_field(p: &Palette, key: &str, edit: &TextEdit, placeholder: &str) 
         .radius(radius::XS)
         .fill(p.bg_lowest)
         .border(1.0, p.border_subtle)
-        .focus_ring(1.0, 0.0, p.border_focus)
+        .focus_within_ring(1.0, 0.0, p.border_focus)
         .child(icon(&icons::SEARCH, 15.0).color(p.text_muted).a11y_hidden())
-        .child(if show_placeholder {
-            row()
-                .key("search-inner")
-                .grow(1.0)
-                .min_w(0.0)
-                .center_y()
-                .child(
-                    text_input(edit, typography::BODY)
-                        .color(p.text_primary)
-                        .grow(1.0)
-                        .min_w(0.0),
-                )
-        } else {
-            text_input(edit, typography::BODY)
-                .color(p.text_primary)
-                .grow(1.0)
-                .min_w(0.0)
-        })
+        .child(input)
 }
 
 /// Compact dropdown/cycle selector trigger with trailing chevron.

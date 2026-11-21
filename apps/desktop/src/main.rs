@@ -789,4 +789,154 @@ mod tests {
             "Registration Error: portal denied"
         );
     }
+
+    fn type_keys(rt: &mut Runtime<AppState>, text: &str) {
+        for ch in text.chars() {
+            rt.key(KeyEvent {
+                key: Key::Text(ch.to_string()),
+                mods: rune::Mods::default(),
+            });
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn uploads_text_inputs_click_type_paste_select_tab_and_mask_password() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(AppState::default(), views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        click_key(&mut rt, NavSection::Uploads.key());
+        assert_eq!(rt.state.nav, NavSection::Uploads);
+
+        // 1. Click Server Endpoint URL field and type.
+        click_key(&mut rt, "server-url-input");
+        type_keys(&mut rt, "https://clips.example.com");
+        assert_eq!(rt.state.server_url_edit.text, "https://clips.example.com");
+
+        // 2. Select all (Ctrl/Cmd+A) and replace via paste.
+        rt.key(KeyEvent {
+            key: Key::Command('a'),
+            mods: rune::Mods::default(),
+        });
+        rt.frame(1.0 / 60.0);
+        rt.paste("https://new.example.com");
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.server_url_edit.text, "https://new.example.com");
+
+        // 3. Tab to API Bearer Token field and paste token; verify masking.
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: rune::Mods::default(),
+        });
+        rt.frame(1.0 / 60.0);
+        rt.paste("cf_tok_secret");
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.api_token_edit.text, "cf_tok_secret");
+
+        // 4. Tab to Username, type, select last 2 chars with Shift+Left, and replace.
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: rune::Mods::default(),
+        });
+        rt.frame(1.0 / 60.0);
+        type_keys(&mut rt, "alixx");
+        assert_eq!(rt.state.server_user_edit.text, "alixx");
+        for _ in 0..2 {
+            rt.key(KeyEvent {
+                key: Key::Left,
+                mods: rune::Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(1.0 / 60.0);
+        }
+        type_keys(&mut rt, "ce");
+        assert_eq!(rt.state.server_user_edit.text, "alice");
+
+        // 5. Tab to Password, type via Key::Text, and verify password masking.
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: rune::Mods::default(),
+        });
+        rt.frame(1.0 / 60.0);
+        type_keys(&mut rt, "hunter2");
+        assert_eq!(rt.state.server_pass_edit.text, "hunter2");
+
+        // Shift+Tab navigates back to Username and allows editing.
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: rune::Mods {
+                shift: true,
+                ..Default::default()
+            },
+        });
+        rt.frame(1.0 / 60.0);
+        type_keys(&mut rt, "!");
+        assert_eq!(rt.state.server_user_edit.text, "alice!");
+
+        // Secure fields must not expose plaintext in accessibility/element inspection.
+        let elements = rt.elements();
+        assert!(elements.iter().all(|e| {
+            e.text.as_deref() != Some("hunter2") && e.text.as_deref() != Some("cf_tok_secret")
+        }));
+    }
+
+    #[test]
+    fn settings_and_library_text_inputs_accept_typing_and_tab() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(AppState::default(), views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        // Library search field accepts click + typing.
+        click_key(&mut rt, "lib-search-input");
+        type_keys(&mut rt, "clutch");
+        assert_eq!(rt.state.library_search.text, "clutch");
+
+        // Settings search field accepts click + typing.
+        click_key(&mut rt, NavSection::Settings.key());
+        click_key(&mut rt, "settings-search");
+        type_keys(&mut rt, "codec");
+        assert_eq!(rt.state.settings_search.text, "codec");
+        assert!(rt.find("settings-search-group").is_some());
+
+        // Clear search and test Storage clips dir input.
+        click_key(&mut rt, "settings-clear-search");
+        click_key(&mut rt, crate::state::SettingsTab::Storage.key());
+        click_key(&mut rt, "settings-clips-dir");
+        rt.key(KeyEvent {
+            key: Key::Command('a'),
+            mods: rune::Mods::default(),
+        });
+        rt.frame(1.0 / 60.0);
+        rt.paste("/tmp/my-clips");
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.clips_dir_edit.text, "/tmp/my-clips");
+
+        // Settings Sharing tab: server URL + masked API token via Tab.
+        click_key(&mut rt, crate::state::SettingsTab::Sharing.key());
+        click_key(&mut rt, "settings-server-url");
+        rt.key(KeyEvent {
+            key: Key::Command('a'),
+            mods: rune::Mods::default(),
+        });
+        rt.frame(1.0 / 60.0);
+        type_keys(&mut rt, "https://clips.emkacz.dev");
+        assert_eq!(rt.state.server_url_edit.text, "https://clips.emkacz.dev");
+
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: rune::Mods::default(),
+        });
+        rt.frame(1.0 / 60.0);
+        rt.paste("tok_12345");
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.api_token_edit.text, "tok_12345");
+        assert!(
+            rt.elements()
+                .iter()
+                .all(|e| e.text.as_deref() != Some("tok_12345"))
+        );
+    }
 }
