@@ -13,14 +13,14 @@ Quick Start
    - Note: If Windows SmartScreen prompts on an unsigned local/CI build,
      click "More info" -> "Run anyway".
 
-Requirements & Optional Tools
------------------------------
+Requirements & Bundled Tools
+--------------------------
 - FFmpeg (`ffmpeg.exe` and `ffprobe.exe`):
   Required for clip trimming, media playback decoding, and thumbnail
-  generation. FFmpeg is not bundled in this portable archive.
-  Install FFmpeg (for example via `winget install Gyan.FFmpeg` or from
-  https://ffmpeg.org) and ensure `ffmpeg.exe` and `ffprobe.exe` are
-  available on your system PATH.
+  generation. `ffmpeg.exe` and `ffprobe.exe` are bundled in this portable
+  archive alongside `ClipForge.exe`, so no separate FFmpeg installation is
+  required. See `THIRD-PARTY-NOTICES.txt` for FFmpeg license terms and source
+  information.
 
 Known Windows Limitations
 -------------------------

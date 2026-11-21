@@ -1,0 +1,23 @@
+Third-Party Notices for ClipForge Windows Portable
+====================================================
+
+ClipForge itself is licensed under the MIT License (see `LICENSE`).
+
+This portable distribution bundles the following third-party software for
+private testing:
+
+FFmpeg (`ffmpeg.exe`, `ffprobe.exe`)
+------------------------------------
+- Project: FFmpeg (https://ffmpeg.org)
+- Distribution: Gyan.dev FFmpeg release essentials build for Windows
+  (https://www.gyan.dev/ffmpeg/builds/)
+- License: GNU General Public License (GPL) version 3 (or later), incorporating
+  components licensed under LGPLv2.1+ / GPLv2+ / GPLv3+.
+  See `FFMPEG-LICENSE.txt` (when included from the upstream FFmpeg package) or
+  https://www.gnu.org/licenses/gpl-3.0.html for the full license text.
+- Source Code:
+  Upstream FFmpeg source code is available at:
+  https://ffmpeg.org/download.html
+  Build configuration and source archives for the bundled Windows binaries are
+  available at:
+  https://www.gyan.dev/ffmpeg/builds/

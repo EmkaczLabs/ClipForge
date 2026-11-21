@@ -23,7 +23,7 @@ use clipforge_common::{
 use clipforge_library::{ClipListOptions, ClipOrigin, DirectoryScanner, SqliteClipStore};
 use clipforge_media::{
     DEFAULT_MAX_DECODE_DIM, ExportCancelToken, FfmpegMediaProcessor, MicTestEvent, MicTestHandle,
-    PlaybackState, PlayerEvent, VideoPlayerHandle, extract_timeline_thumbnails,
+    PlaybackState, PlayerEvent, VideoPlayerHandle, extract_timeline_thumbnails_with_binaries,
 };
 use rune::Waker;
 use tokio::process::Command;
@@ -296,8 +296,17 @@ impl WorkerHandle {
 
                 rt.block_on(async move {
                     let capture = Arc::new(GsrCaptureBackend::new());
-                    let media = Arc::new(FfmpegMediaProcessor::new());
-                    let (player, mut player_rx) = VideoPlayerHandle::spawn();
+                    let ffmpeg_bin =
+                        resolve_binary("ffmpeg").unwrap_or_else(|| PathBuf::from("ffmpeg"));
+                    let ffprobe_bin =
+                        resolve_binary("ffprobe").unwrap_or_else(|| PathBuf::from("ffprobe"));
+                    let media = Arc::new(FfmpegMediaProcessor::with_binaries(
+                        ffmpeg_bin.clone(),
+                        ffprobe_bin.clone(),
+                        4,
+                    ));
+                    let (player, mut player_rx) =
+                        VideoPlayerHandle::spawn_with_binaries(ffmpeg_bin, ffprobe_bin);
                     let (mic_test, mut mic_rx) = MicTestHandle::spawn();
                     let active_player_clip: Arc<Mutex<Option<(ClipId, rune::Pixels)>>> =
                         Arc::new(Mutex::new(None));
@@ -931,7 +940,20 @@ async fn handle_command(
             let thumb_waker = waker.clone();
             let active_ref = svc.active_player_clip.clone();
             tokio::spawn(async move {
-                if let Ok(frames) = extract_timeline_thumbnails(&path, 8, 160, 90).await {
+                let ffmpeg_bin =
+                    resolve_binary("ffmpeg").unwrap_or_else(|| PathBuf::from("ffmpeg"));
+                let ffprobe_bin =
+                    resolve_binary("ffprobe").unwrap_or_else(|| PathBuf::from("ffprobe"));
+                if let Ok(frames) = extract_timeline_thumbnails_with_binaries(
+                    &ffmpeg_bin,
+                    &ffprobe_bin,
+                    &path,
+                    8,
+                    160,
+                    90,
+                )
+                .await
+                {
                     let still_active = active_ref
                         .lock()
                         .ok()
@@ -1283,7 +1305,8 @@ async fn decode_thumbnail_rgba(
     let filter = format!(
         "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x161820ff"
     );
-    let output = Command::new("ffmpeg")
+    let ffmpeg_bin = resolve_binary("ffmpeg").unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let output = Command::new(&ffmpeg_bin)
         .arg("-v")
         .arg("error")
         .arg("-i")
@@ -1506,25 +1529,43 @@ async fn probe_dependencies() -> DependencyStatus {
 }
 
 async fn find_binary(name: &str) -> Option<String> {
+    resolve_binary(name).map(|p| p.display().to_string())
+}
+
+/// Resolves an external binary, checking the directory of the current executable
+/// before falling back to `PATH`.
+pub(crate) fn resolve_binary(name: &str) -> Option<PathBuf> {
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        && let Some(found) = resolve_binary_in_dir(&exe_dir, name)
+    {
+        return Some(found);
+    }
+
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
-        #[cfg(windows)]
-        let candidates = [
-            dir.join(format!("{name}.exe")),
-            dir.join(format!("{name}.cmd")),
-            dir.join(format!("{name}.bat")),
-            dir.join(name),
-        ];
-        #[cfg(not(windows))]
-        let candidates = [dir.join(name)];
-
-        for candidate in candidates {
-            if is_executable_binary(&candidate) {
-                return Some(candidate.display().to_string());
-            }
+        if let Some(found) = resolve_binary_in_dir(&dir, name) {
+            return Some(found);
         }
     }
     None
+}
+
+fn resolve_binary_in_dir(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let candidates = [
+        dir.join(format!("{name}.exe")),
+        dir.join(format!("{name}.cmd")),
+        dir.join(format!("{name}.bat")),
+        dir.join(name),
+    ];
+    #[cfg(not(windows))]
+    let candidates = [dir.join(name)];
+
+    candidates
+        .into_iter()
+        .find(|candidate| is_executable_binary(candidate))
 }
 
 fn is_executable_binary(path: &std::path::Path) -> bool {

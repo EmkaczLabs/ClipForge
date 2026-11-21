@@ -3,6 +3,7 @@ param(
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path,
     [string]$TargetDir = "",
     [string]$OutDir = "",
+    [string]$FfmpegDir = "",
     [string]$StageName = "ClipForge-Windows-x64-portable"
 )
 
@@ -27,7 +28,8 @@ if (-not $SourceExe) {
 
 $LicensePath = Join-Path $RepoRoot "LICENSE"
 $ReadmePath = Join-Path $PSScriptRoot "README.txt"
-foreach ($requiredInput in @($LicensePath, $ReadmePath)) {
+$NoticesPath = Join-Path $PSScriptRoot "THIRD-PARTY-NOTICES.txt"
+foreach ($requiredInput in @($LicensePath, $ReadmePath, $NoticesPath)) {
     if (-not (Test-Path -LiteralPath $requiredInput -PathType Leaf)) {
         throw "Required packaging input missing: $requiredInput"
     }
@@ -53,6 +55,87 @@ $StagedExe = Join-Path $StageDir "ClipForge.exe"
 Copy-Item -LiteralPath $SourceExe -Destination $StagedExe -Force
 Copy-Item -LiteralPath $LicensePath -Destination (Join-Path $StageDir "LICENSE") -Force
 Copy-Item -LiteralPath $ReadmePath -Destination (Join-Path $StageDir "README.txt") -Force
+Copy-Item -LiteralPath $NoticesPath -Destination (Join-Path $StageDir "THIRD-PARTY-NOTICES.txt") -Force
+
+function Resolve-FfmpegBinary {
+    param(
+        [Parameter(Mandatory = $true)][string]$BinaryName,
+        [string]$ExplicitDir = ""
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitDir)) {
+        $candidate = Join-Path $ExplicitDir $BinaryName
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+        throw "Could not find '$BinaryName' in -FfmpegDir '$ExplicitDir'."
+    }
+
+    $cmd = Get-Command $BinaryName -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source -PathType Leaf)) {
+        $resolved = (Resolve-Path -LiteralPath $cmd.Source).Path
+        # Avoid copying Chocolatey shims; resolve the actual binary from Chocolatey's lib directory.
+        $chocoRoot = $env:ChocolateyInstall
+        if ([string]::IsNullOrWhiteSpace($chocoRoot) -and $resolved -match '^(.*\\chocolatey)\\bin\\') {
+            $chocoRoot = $Matches[1]
+        }
+        if (-not [string]::IsNullOrWhiteSpace($chocoRoot)) {
+            $chocoBin = (Join-Path $chocoRoot "bin")
+            if ((Split-Path -Path $resolved -Parent).TrimEnd('\') -ieq $chocoBin.TrimEnd('\')) {
+                $chocoTools = Join-Path $chocoRoot "lib\ffmpeg\tools"
+                if (Test-Path -LiteralPath $chocoTools -PathType Container) {
+                    $realBin = Get-ChildItem -Path $chocoTools -Filter $BinaryName -Recurse -File -ErrorAction SilentlyContinue |
+                        Select-Object -First 1
+                    if ($realBin) {
+                        return $realBin.FullName
+                    }
+                }
+            }
+        }
+        return $resolved
+    }
+
+    throw "Could not locate '$BinaryName' on PATH. Pass -FfmpegDir or install FFmpeg."
+}
+
+$FfmpegBin = Resolve-FfmpegBinary -BinaryName "ffmpeg.exe" -ExplicitDir $FfmpegDir
+$FfprobeSearchDir = if (-not [string]::IsNullOrWhiteSpace($FfmpegDir)) { $FfmpegDir } else { "" }
+$FfprobeBin = Resolve-FfmpegBinary -BinaryName "ffprobe.exe" -ExplicitDir $FfprobeSearchDir
+
+Write-Host "Bundling FFmpeg: $FfmpegBin"
+Write-Host "Bundling FFprobe: $FfprobeBin"
+Copy-Item -LiteralPath $FfmpegBin -Destination (Join-Path $StageDir "ffmpeg.exe") -Force
+Copy-Item -LiteralPath $FfprobeBin -Destination (Join-Path $StageDir "ffprobe.exe") -Force
+
+# Copy upstream FFmpeg LICENSE/README from the installed package directory if present.
+$FfmpegBinDir = Split-Path -Path $FfmpegBin -Parent
+$FfmpegPkgRoot = Split-Path -Path $FfmpegBinDir -Parent
+$FfmpegSearchDirs = @($FfmpegBinDir, $FfmpegPkgRoot) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
+
+$CopiedFfmpegLicense = $false
+$CopiedFfmpegReadme = $false
+foreach ($dir in $FfmpegSearchDirs) {
+    if (-not $CopiedFfmpegLicense) {
+        foreach ($name in @("LICENSE.txt", "LICENSE")) {
+            $cand = Join-Path $dir $name
+            if (Test-Path -LiteralPath $cand -PathType Leaf) {
+                Copy-Item -LiteralPath $cand -Destination (Join-Path $StageDir "FFMPEG-LICENSE.txt") -Force
+                $CopiedFfmpegLicense = $true
+                break
+            }
+        }
+    }
+    if (-not $CopiedFfmpegReadme) {
+        foreach ($name in @("README.txt", "README")) {
+            $cand = Join-Path $dir $name
+            if (Test-Path -LiteralPath $cand -PathType Leaf) {
+                Copy-Item -LiteralPath $cand -Destination (Join-Path $StageDir "FFMPEG-README.txt") -Force
+                $CopiedFfmpegReadme = $true
+                break
+            }
+        }
+    }
+}
 
 # Inspect DLL dependencies if dumpbin is available, and bundle any non-system DLLs
 # present in TargetDir that ClipForge.exe directly depends on.
@@ -96,7 +179,14 @@ if ($Dumpbin) {
 }
 
 # Verify staged directory contents and ensure no secrets/credentials are bundled.
-$RequiredStagedFiles = @("ClipForge.exe", "README.txt", "LICENSE")
+$RequiredStagedFiles = @(
+    "ClipForge.exe",
+    "ffmpeg.exe",
+    "ffprobe.exe",
+    "LICENSE",
+    "README.txt",
+    "THIRD-PARTY-NOTICES.txt"
+)
 foreach ($fileName in $RequiredStagedFiles) {
     $filePath = Join-Path $StageDir $fileName
     if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
