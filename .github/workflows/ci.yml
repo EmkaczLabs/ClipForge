@@ -14,6 +14,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libasound2-dev \
+            libxkbcommon-dev \
+            ffmpeg
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -22,7 +30,35 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Cargo clippy workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Cargo check workspace
         run: cargo check --workspace
       - name: Run tests
         run: cargo test --workspace
+
+  windows-portable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Cargo check workspace
+        run: cargo check --workspace
+      - name: Run workspace tests
+        run: cargo test --workspace
+      - name: Build release binary
+        run: cargo build --release -p clipforge-desktop
+      - name: Package Windows portable bundle
+        shell: pwsh
+        run: ./packaging/windows/package-portable.ps1 -OutDir "${{ runner.temp }}/dist"
+      - name: Upload Windows portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipForge-Windows-x64-portable
+          path: |
+            ${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip
+            ${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip.sha256
+          if-no-files-found: error
