@@ -54,7 +54,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/clips", get(list_clips))
         .route(
             "/api/v1/clips/{id}",
-            get(get_share_info).delete(delete_clip),
+            get(get_share_info)
+                .patch(set_visibility)
+                .delete(delete_clip),
         )
         .route("/api/v1/clips/{id}/visibility", patch(set_visibility))
         // Share endpoints

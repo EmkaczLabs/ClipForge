@@ -318,7 +318,7 @@ async fn cloud_client_upload_range_visibility_and_delete_e2e() {
 
     // Switch visibility to private
     let updated = owner_client
-        .set_visibility(&share.share_id, ShareVisibility::Private)
+        .set_visibility(&clip_meta.id.to_string(), ShareVisibility::Private)
         .await
         .expect("set private");
     assert_eq!(updated.visibility, ShareVisibility::Private);
