@@ -362,19 +362,51 @@ impl From<ClipDto> for RemoteClipSummary {
 }
 
 /// `reqwest`-based [`CloudClient`] implementation for ClipForge Server (`/api/v1`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpCloudClient {
     client: reqwest::Client,
     base_url: String,
     token: Option<String>,
 }
 
+impl std::fmt::Debug for HttpCloudClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpCloudClient")
+            .field("base_url", &self.base_url)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+fn is_plaintext_non_localhost(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    let host_no_port = if host.starts_with('[') {
+        host.split(']')
+            .next()
+            .unwrap_or(host)
+            .trim_start_matches('[')
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    !matches!(host_no_port, "localhost" | "127.0.0.1" | "::1")
+}
+
 impl HttpCloudClient {
     /// Creates a new [`HttpCloudClient`] targeting `base_url` with an optional bearer token or API key.
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        if is_plaintext_non_localhost(&base_url) {
+            tracing::warn!(
+                base_url = %base_url,
+                "HttpCloudClient configured with plaintext http:// URL; bearer tokens will be sent unencrypted"
+            );
+        }
         Self {
             client: reqwest::Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url,
             token,
         }
     }

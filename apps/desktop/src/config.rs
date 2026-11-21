@@ -34,7 +34,7 @@ pub fn config_file_path() -> PathBuf {
     }
 }
 
-/// Returns the fallback `0600` user-only token file path (`credentials.json`).
+/// Returns the legacy fallback token file path (`credentials.json`) for cleanup purposes.
 pub fn token_file_path() -> PathBuf {
     let dir = config_dir();
     if dir == Path::new(".") {
@@ -59,8 +59,14 @@ pub fn load_app_config_from(path: &Path) -> AppConfig {
                 if let Some(legacy_token) = cfg.api_token.take()
                     && !legacy_token.trim().is_empty()
                 {
-                    if let Some(url) = cfg.server_url.as_deref().filter(|u| !u.trim().is_empty()) {
-                        let _ = store_api_token(url, legacy_token.trim());
+                    if let Some(url) = cfg.server_url.as_deref().filter(|u| !u.trim().is_empty())
+                        && let Err(err) = store_api_token(url, legacy_token.trim())
+                    {
+                        tracing::warn!(
+                            server = %url,
+                            %err,
+                            "Failed to migrate legacy api_token to OS secret storage; stripping plaintext token from config.json"
+                        );
                     }
                     let _ = save_app_config_to(path, &cfg);
                 }
@@ -99,7 +105,7 @@ pub fn save_app_config_to(path: &Path, config: &AppConfig) -> Result<()> {
 }
 
 /// Stores an API token for `server_url` using OS secret storage (`secret-tool` / Secret Service
-/// D-Bus) when available, falling back to a `0600` user-only token file.
+/// D-Bus). Fails explicitly rather than silently falling back to plaintext disk storage.
 pub fn store_api_token(server_url: &str, token: &str) -> Result<()> {
     let key = normalize_server_key(server_url);
     let clean_token = token.trim();
@@ -107,15 +113,25 @@ pub fn store_api_token(server_url: &str, token: &str) -> Result<()> {
         return Ok(());
     }
 
-    if try_secret_tool_store(&key, clean_token) {
-        let _ = delete_api_token_from_file(&token_file_path(), &key);
-        return Ok(());
+    match try_secret_tool_store(&key, clean_token) {
+        Ok(()) => {
+            let _ = delete_api_token_from_file(&token_file_path(), &key);
+            Ok(())
+        }
+        Err(reason) => {
+            tracing::warn!(
+                server = %key,
+                %reason,
+                "OS secret storage unavailable; refusing to persist API token in plaintext"
+            );
+            Err(ClipForgeError::Other(format!(
+                "OS secret storage (secret-tool / org.freedesktop.secrets) unavailable: {reason}. Token was not saved to disk."
+            )))
+        }
     }
-
-    store_api_token_in_file(&token_file_path(), &key, clean_token)
 }
 
-/// Loads the stored API token for `server_url` from OS secret storage or the `0600` fallback file.
+/// Loads the stored API token for `server_url` from OS secret storage.
 pub fn load_api_token(server_url: &str) -> Option<String> {
     let key = normalize_server_key(server_url);
     if key.is_empty() {
@@ -126,10 +142,19 @@ pub fn load_api_token(server_url: &str) -> Option<String> {
         return Some(tok);
     }
 
-    load_api_token_from_file(&token_file_path(), &key)
+    let legacy_path = token_file_path();
+    if read_token_map(&legacy_path).contains_key(&key) {
+        tracing::warn!(
+            server = %key,
+            path = ?legacy_path,
+            "Ignoring legacy plaintext credentials.json entry; please sign in again to store token in OS secret storage"
+        );
+    }
+    None
 }
 
-/// Deletes the stored API token for `server_url` from both OS secret storage and the fallback file.
+/// Deletes the stored API token for `server_url` from OS secret storage and cleans up any legacy
+/// `credentials.json` entry if present.
 pub fn delete_api_token(server_url: &str) -> Result<()> {
     let key = normalize_server_key(server_url);
     if key.is_empty() {
@@ -140,8 +165,8 @@ pub fn delete_api_token(server_url: &str) -> Result<()> {
     delete_api_token_from_file(&token_file_path(), &key)
 }
 
-fn try_secret_tool_store(server_key: &str, token: &str) -> bool {
-    let Ok(mut child) = Command::new("secret-tool")
+fn try_secret_tool_store(server_key: &str, token: &str) -> std::result::Result<(), String> {
+    let mut child = Command::new("secret-tool")
         .args([
             "store",
             "--label=ClipForge Cloud Token",
@@ -152,26 +177,42 @@ fn try_secret_tool_store(server_key: &str, token: &str) -> bool {
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-    else {
-        return false;
-    };
+        .map_err(|e| format!("failed to spawn secret-tool: {e}"))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(token.as_bytes());
+        stdin
+            .write_all(token.as_bytes())
+            .map_err(|e| format!("failed to write token to secret-tool stdin: {e}"))?;
     }
-    child.wait().is_ok_and(|s| s.success())
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("failed waiting for secret-tool: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err(format!("secret-tool exited with {}", output.status))
+        } else {
+            Err(format!("secret-tool failed: {stderr}"))
+        }
+    }
 }
 
 fn try_secret_tool_lookup(server_key: &str) -> Option<String> {
     let output = Command::new("secret-tool")
         .args(["lookup", "service", SECRET_SERVICE, "server", server_key])
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .ok()?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            tracing::warn!(server = %server_key, %stderr, "secret-tool lookup failed");
+        }
         return None;
     }
     let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -179,13 +220,22 @@ fn try_secret_tool_lookup(server_key: &str) -> Option<String> {
 }
 
 fn try_secret_tool_clear(server_key: &str) -> bool {
-    Command::new("secret-tool")
+    let Ok(output) = Command::new("secret-tool")
         .args(["clear", "service", SECRET_SERVICE, "server", server_key])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stderr(Stdio::piped())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            tracing::debug!(server = %server_key, %stderr, "secret-tool clear failed");
+        }
+    }
+    output.status.success()
 }
 
 fn read_token_map(path: &Path) -> BTreeMap<String, String> {
@@ -246,17 +296,6 @@ fn write_token_map(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-fn store_api_token_in_file(path: &Path, server_key: &str, token: &str) -> Result<()> {
-    let mut map = read_token_map(path);
-    map.insert(server_key.to_string(), token.to_string());
-    write_token_map(path, &map)
-}
-
-fn load_api_token_from_file(path: &Path, server_key: &str) -> Option<String> {
-    let map = read_token_map(path);
-    map.get(server_key).cloned().filter(|t| !t.is_empty())
-}
-
 fn delete_api_token_from_file(path: &Path, server_key: &str) -> Result<()> {
     let mut map = read_token_map(path);
     if map.remove(server_key).is_some() {
@@ -306,26 +345,24 @@ mod tests {
     }
 
     #[test]
-    fn fallback_token_file_uses_0600_permissions_and_roundtrips() {
+    fn legacy_token_file_cleanup_removes_entry_and_empty_file() {
         let dir = unique_temp_dir("clipforge-tok-test");
         let path = dir.join("credentials.json");
         let key = "https://clips.example.com";
 
-        store_api_token_in_file(&path, key, "cf_tok_12345").expect("store token");
-        assert_eq!(
-            load_api_token_from_file(&path, key).as_deref(),
-            Some("cf_tok_12345")
-        );
+        let mut map = BTreeMap::new();
+        map.insert(key.to_string(), "cf_tok_12345".to_string());
+        write_token_map(&path, &map).expect("write legacy token");
+        assert!(path.exists());
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "token file must be 0600 user-only");
+            assert_eq!(mode, 0o600, "legacy token file must be 0600 user-only");
         }
 
         delete_api_token_from_file(&path, key).expect("delete token");
-        assert!(load_api_token_from_file(&path, key).is_none());
         assert!(!path.exists());
 
         let _ = fs::remove_dir_all(&dir);
