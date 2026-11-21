@@ -1,6 +1,5 @@
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clipforge_common::{ClipForgeError, Result};
 use tokio::process::Command;
@@ -72,8 +71,13 @@ pub struct GsrCapabilities {
 /// Searches `PATH` for an executable `gpu-screen-recorder` binary.
 pub fn find_native_in_path() -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
+    let bin_name = if cfg!(windows) {
+        "gpu-screen-recorder.exe"
+    } else {
+        "gpu-screen-recorder"
+    };
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("gpu-screen-recorder");
+        let candidate = dir.join(bin_name);
         if is_executable_file(&candidate) {
             return Some(candidate);
         }
@@ -81,14 +85,25 @@ pub fn find_native_in_path() -> Option<PathBuf> {
     None
 }
 
-fn is_executable_file(path: &PathBuf) -> bool {
+fn is_executable_file(path: &Path) -> bool {
     match std::fs::metadata(path) {
-        Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
+        Ok(meta) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                meta.is_file() && (meta.permissions().mode() & 0o111 != 0)
+            }
+            #[cfg(not(unix))]
+            {
+                meta.is_file()
+            }
+        }
         Err(_) => false,
     }
 }
 
 /// Detects `gpu-screen-recorder` on the host (native `PATH` first, then Flatpak).
+#[cfg(target_os = "linux")]
 pub async fn detect_gsr() -> Result<GsrInstallation> {
     if let Some(bin) = find_native_in_path() {
         return Ok(GsrInstallation::Native(bin));
@@ -107,6 +122,15 @@ pub async fn detect_gsr() -> Result<GsrInstallation> {
 
     Err(ClipForgeError::CaptureUnavailable(
         GSR_INSTALL_HELP.to_string(),
+    ))
+}
+
+/// Detects `gpu-screen-recorder` on non-Linux hosts (always unavailable; WGC+WASAPI unimplemented).
+#[cfg(not(target_os = "linux"))]
+pub async fn detect_gsr() -> Result<GsrInstallation> {
+    Err(ClipForgeError::CaptureUnavailable(
+        "gpu-screen-recorder is Linux-only (WGC + WASAPI capture is unimplemented on Windows)."
+            .to_string(),
     ))
 }
 

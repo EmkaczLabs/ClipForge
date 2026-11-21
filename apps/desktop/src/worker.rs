@@ -128,6 +128,7 @@ pub enum WorkerCommand {
     PlayerSetMuted(bool),
     SetAudioTrack(Option<usize>),
     DiscoverCaptureSources,
+    ExportDiagnostics(crate::diagnostics::DiagnosticsReport),
     CheckServerHealth {
         server_url: String,
     },
@@ -631,7 +632,7 @@ async fn handle_command(
                 (waker)();
                 return;
             };
-            match Command::new("xdg-open").arg(parent).spawn() {
+            match open_with_system(parent.as_os_str(), true) {
                 Ok(_) => {
                     let _ = evt_tx.send(WorkerEvent::Banner(format!(
                         "Opened folder {}",
@@ -886,7 +887,7 @@ async fn handle_command(
                 (waker)();
                 return;
             }
-            match Command::new("xdg-open").arg(&path).spawn() {
+            match open_with_system(path.as_os_str(), false) {
                 Ok(_) => {
                     let _ = evt_tx.send(WorkerEvent::Banner(format!(
                         "Opened {} in system player",
@@ -1157,7 +1158,7 @@ async fn handle_command(
                 (waker)();
                 return;
             }
-            match Command::new("xdg-open").arg(&url).spawn() {
+            match open_with_system(std::ffi::OsStr::new(&url), false) {
                 Ok(_) => {
                     let _ = evt_tx.send(WorkerEvent::Banner(format!("Opened {url}")));
                 }
@@ -1202,11 +1203,50 @@ async fn handle_command(
             }
             (waker)();
         }
+        WorkerCommand::ExportDiagnostics(report) => {
+            let dir = crate::config::diagnostics_dir();
+            let msg = match crate::diagnostics::export_diagnostics_to_dir(&dir, &report) {
+                Ok(path) => format!("Diagnostics exported to {}", path.display()),
+                Err(err) => format!("Failed to export diagnostics: {err}"),
+            };
+            let _ = evt_tx.send(WorkerEvent::Banner(msg));
+            (waker)();
+        }
+    }
+}
+
+fn open_with_system(
+    target: &std::ffi::OsStr,
+    is_dir: bool,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(target_os = "windows")]
+    {
+        if is_dir {
+            std::process::Command::new("explorer").arg(target).spawn()
+        } else {
+            std::process::Command::new("cmd")
+                .args(["/C", "start", ""])
+                .arg(target)
+                .spawn()
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = is_dir;
+        std::process::Command::new("open").arg(target).spawn()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = is_dir;
+        std::process::Command::new("xdg-open").arg(target).spawn()
     }
 }
 
 async fn copy_text_to_clipboard(text: &str) -> bool {
     use tokio::io::AsyncWriteExt;
+    #[cfg(target_os = "windows")]
+    let candidates: [(&str, &[&str]); 1] = [("clip", &[])];
+    #[cfg(not(target_os = "windows"))]
     let candidates: [(&str, &[&str]); 3] = [
         ("wl-copy", &[]),
         ("xclip", &["-selection", "clipboard"]),
@@ -1466,14 +1506,42 @@ async fn probe_dependencies() -> DependencyStatus {
 }
 
 async fn find_binary(name: &str) -> Option<String> {
-    let output = Command::new("which").arg(name).output().await.ok()?;
-    if output.status.success() {
-        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !s.is_empty() {
-            return Some(s);
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        #[cfg(windows)]
+        let candidates = [
+            dir.join(format!("{name}.exe")),
+            dir.join(format!("{name}.cmd")),
+            dir.join(format!("{name}.bat")),
+            dir.join(name),
+        ];
+        #[cfg(not(windows))]
+        let candidates = [dir.join(name)];
+
+        for candidate in candidates {
+            if is_executable_binary(&candidate) {
+                return Some(candidate.display().to_string());
+            }
         }
     }
     None
+}
+
+fn is_executable_binary(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                meta.is_file() && (meta.permissions().mode() & 0o111 != 0)
+            }
+            #[cfg(not(unix))]
+            {
+                meta.is_file()
+            }
+        }
+        Err(_) => false,
+    }
 }
 
 async fn execute_start_replay_buffer(

@@ -2,29 +2,53 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
 use clipforge_common::{AppConfig, ClipForgeError, Result};
 
+#[cfg(target_os = "linux")]
 const SECRET_SERVICE: &str = "clipforge";
 
 fn config_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty()
+    #[cfg(target_os = "windows")]
     {
-        return PathBuf::from(xdg).join("clipforge");
+        if let Ok(appdata) = std::env::var("APPDATA")
+            && !appdata.is_empty()
+        {
+            return PathBuf::from(appdata).join("clipforge");
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE")
+            && !profile.is_empty()
+        {
+            return PathBuf::from(profile).join(".config").join("clipforge");
+        }
     }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
+    #[cfg(not(target_os = "windows"))]
     {
-        return PathBuf::from(home).join(".config").join("clipforge");
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+            && !xdg.is_empty()
+        {
+            return PathBuf::from(xdg).join("clipforge");
+        }
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
+        {
+            return PathBuf::from(home).join(".config").join("clipforge");
+        }
     }
     PathBuf::from(".")
 }
 
-/// Returns the default path to `config.json` following XDG conventions.
+/// Returns the directory used for sanitized diagnostic exports.
+pub fn diagnostics_dir() -> PathBuf {
+    config_dir().join("diagnostics")
+}
+
+/// Returns the default path to `config.json` following OS config conventions.
 pub fn config_file_path() -> PathBuf {
     let dir = config_dir();
     if dir == Path::new(".") {
@@ -165,6 +189,7 @@ pub fn delete_api_token(server_url: &str) -> Result<()> {
     delete_api_token_from_file(&token_file_path(), &key)
 }
 
+#[cfg(target_os = "linux")]
 fn try_secret_tool_store(server_key: &str, token: &str) -> std::result::Result<(), String> {
     let mut child = Command::new("secret-tool")
         .args([
@@ -201,6 +226,12 @@ fn try_secret_tool_store(server_key: &str, token: &str) -> std::result::Result<(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn try_secret_tool_store(_server_key: &str, _token: &str) -> std::result::Result<(), String> {
+    Err("Windows Credential Manager integration is not yet implemented".to_string())
+}
+
+#[cfg(target_os = "linux")]
 fn try_secret_tool_lookup(server_key: &str) -> Option<String> {
     let output = Command::new("secret-tool")
         .args(["lookup", "service", SECRET_SERVICE, "server", server_key])
@@ -219,6 +250,12 @@ fn try_secret_tool_lookup(server_key: &str) -> Option<String> {
     if val.is_empty() { None } else { Some(val) }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn try_secret_tool_lookup(_server_key: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn try_secret_tool_clear(server_key: &str) -> bool {
     let Ok(output) = Command::new("secret-tool")
         .args(["clear", "service", SECRET_SERVICE, "server", server_key])
@@ -236,6 +273,11 @@ fn try_secret_tool_clear(server_key: &str) -> bool {
         }
     }
     output.status.success()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_secret_tool_clear(_server_key: &str) -> bool {
+    false
 }
 
 fn read_token_map(path: &Path) -> BTreeMap<String, String> {

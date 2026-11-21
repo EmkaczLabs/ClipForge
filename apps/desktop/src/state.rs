@@ -2382,12 +2382,78 @@ impl AppState {
         }
     }
 
-    /// Opens an `http://` or `https://` URL in the default browser via `xdg-open`.
+    /// Opens an `http://` or `https://` URL in the default browser.
     pub fn open_url(&mut self, url: String) {
         if let Some(worker) = &self.worker {
             worker.send(WorkerCommand::OpenUrl(url));
         } else {
             self.status_banner = Some(format!("Open URL: {url}"));
+        }
+    }
+
+    /// Builds a sanitized diagnostic report (never containing tokens, passwords, or S3 keys).
+    pub fn build_diagnostics_report(&self) -> crate::diagnostics::DiagnosticsReport {
+        let display_session = if cfg!(target_os = "windows") {
+            "windows".to_string()
+        } else if self.is_wayland {
+            "wayland".to_string()
+        } else {
+            "x11".to_string()
+        };
+        let capture_backend = if cfg!(target_os = "linux") {
+            "gpu-screen-recorder".to_string()
+        } else {
+            "unimplemented (WGC+WASAPI pending)".to_string()
+        };
+        let audio_routing_summary = format!(
+            "{} source(s) configured",
+            self.config.capture.audio_sources.len()
+        );
+        let server_url_redacted = self
+            .config
+            .server_url
+            .as_deref()
+            .map(crate::diagnostics::redact_server_url)
+            .filter(|s| !s.is_empty());
+
+        crate::diagnostics::DiagnosticsReport {
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            display_session,
+            config_path: crate::config::config_file_path().display().to_string(),
+            clips_dir: self.config.clips_dir.display().to_string(),
+            capture_backend,
+            capture_status: format!("{:?}", self.capture_status),
+            hotkey_status: self.hotkey_status.label(),
+            dependencies: self.deps.clone(),
+            audio_routing_summary,
+            server_url_redacted,
+            api_token_configured: self
+                .config
+                .api_token
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty()),
+            generated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// Exports a sanitized diagnostic report via the background worker.
+    pub fn export_diagnostics(&mut self) {
+        let report = self.build_diagnostics_report();
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCommand::ExportDiagnostics(report));
+        } else {
+            let dir = crate::config::diagnostics_dir();
+            match crate::diagnostics::export_diagnostics_to_dir(&dir, &report) {
+                Ok(path) => {
+                    self.status_banner =
+                        Some(format!("Diagnostics exported to {}", path.display()));
+                }
+                Err(err) => {
+                    self.status_banner = Some(format!("Failed to export diagnostics: {err}"));
+                }
+            }
         }
     }
 

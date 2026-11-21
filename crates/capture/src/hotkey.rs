@@ -1,26 +1,52 @@
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::future::poll_fn;
+#[cfg(target_os = "linux")]
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
 use std::thread::{self, JoinHandle};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use clipforge_common::{ClipForgeError, Result};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
+use tokio::sync::oneshot;
+#[cfg(target_os = "linux")]
 use tracing::{debug, info, warn};
+#[cfg(target_os = "linux")]
 use x11rb::connection::Connection;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::Event;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{ConnectionExt, EventMask, GrabMode, ModMask, Window};
+#[cfg(target_os = "linux")]
 use zbus::export::futures_core::Stream;
+#[cfg(target_os = "linux")]
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
+const MOD_SHIFT: u16 = 1;
+const MOD_CONTROL: u16 = 1 << 2;
+const MOD_ALT: u16 = 1 << 3;
+const MOD_SUPER: u16 = 1 << 6;
+
+#[cfg(target_os = "linux")]
 const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
+#[cfg(target_os = "linux")]
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+#[cfg(target_os = "linux")]
 const GLOBAL_SHORTCUTS_IFACE: &str = "org.freedesktop.portal.GlobalShortcuts";
+#[cfg(target_os = "linux")]
 const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
+#[cfg(target_os = "linux")]
 const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
 
+#[cfg(target_os = "linux")]
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Logical action triggered by a global or focused-window hotkey.
@@ -126,10 +152,17 @@ pub fn select_hotkey_backend(
 
 /// Detects the hotkey backend for the current process environment.
 pub fn detect_hotkey_backend() -> HotkeyBackendKind {
-    let xdg = std::env::var("XDG_SESSION_TYPE").ok();
-    let wayland = std::env::var("WAYLAND_DISPLAY").ok();
-    let display = std::env::var("DISPLAY").ok();
-    select_hotkey_backend(xdg.as_deref(), wayland.as_deref(), display.as_deref())
+    #[cfg(target_os = "linux")]
+    {
+        let xdg = std::env::var("XDG_SESSION_TYPE").ok();
+        let wayland = std::env::var("WAYLAND_DISPLAY").ok();
+        let display = std::env::var("DISPLAY").ok();
+        select_hotkey_backend(xdg.as_deref(), wayland.as_deref(), display.as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        HotkeyBackendKind::FocusedOnly
+    }
 }
 
 /// Parsed hotkey specification (X11 modifier mask + X11 keysym + display string).
@@ -152,16 +185,16 @@ impl HotkeySpec {
     ) -> bool {
         let mut mods: u16 = 0;
         if ctrl {
-            mods |= u16::from(ModMask::CONTROL);
+            mods |= MOD_CONTROL;
         }
         if alt {
-            mods |= u16::from(ModMask::M1);
+            mods |= MOD_ALT;
         }
         if shift {
-            mods |= u16::from(ModMask::SHIFT);
+            mods |= MOD_SHIFT;
         }
         if super_key {
-            mods |= u16::from(ModMask::M4);
+            mods |= MOD_SUPER;
         }
         self.modifiers == mods && self.keysym == keysym
     }
@@ -169,16 +202,16 @@ impl HotkeySpec {
     /// Formats this binding as an XDG/GTK accelerator string for `GlobalShortcuts` `preferred_trigger`.
     pub fn to_xdg_trigger(&self) -> String {
         let mut out = String::new();
-        if self.modifiers & u16::from(ModMask::CONTROL) != 0 {
+        if self.modifiers & MOD_CONTROL != 0 {
             out.push_str("<Control>");
         }
-        if self.modifiers & u16::from(ModMask::M1) != 0 {
+        if self.modifiers & MOD_ALT != 0 {
             out.push_str("<Alt>");
         }
-        if self.modifiers & u16::from(ModMask::SHIFT) != 0 {
+        if self.modifiers & MOD_SHIFT != 0 {
             out.push_str("<Shift>");
         }
-        if self.modifiers & u16::from(ModMask::M4) != 0 {
+        if self.modifiers & MOD_SUPER != 0 {
             out.push_str("<Super>");
         }
         out.push_str(&keysym_to_xdg_key_name(self.keysym));
@@ -229,10 +262,10 @@ pub fn parse_hotkey(input: &str) -> Result<HotkeySpec> {
     let mut modifiers: u16 = 0;
     for &mod_str in &parts[..parts.len() - 1] {
         match mod_str.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => modifiers |= u16::from(ModMask::CONTROL),
-            "alt" | "mod1" => modifiers |= u16::from(ModMask::M1),
-            "shift" => modifiers |= u16::from(ModMask::SHIFT),
-            "super" | "meta" | "win" | "mod4" => modifiers |= u16::from(ModMask::M4),
+            "ctrl" | "control" => modifiers |= MOD_CONTROL,
+            "alt" | "mod1" => modifiers |= MOD_ALT,
+            "shift" => modifiers |= MOD_SHIFT,
+            "super" | "meta" | "win" | "mod4" => modifiers |= MOD_SUPER,
             other => {
                 return Err(ClipForgeError::InvalidInput(format!(
                     "unknown hotkey modifier '{other}' in '{trimmed}'"
@@ -289,7 +322,9 @@ fn parse_keysym(key: &str) -> Option<u32> {
 /// Manages global hotkeys via XDG Desktop Portal `GlobalShortcuts` on Wayland or `x11rb` on X11.
 pub struct HotkeyManager {
     stop_flag: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
     x11_handle: Option<JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
     portal_stop_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -298,7 +333,9 @@ impl HotkeyManager {
     pub fn idle() -> Self {
         Self {
             stop_flag: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "linux")]
             x11_handle: None,
+            #[cfg(target_os = "linux")]
             portal_stop_tx: None,
         }
     }
@@ -315,6 +352,7 @@ impl HotkeyManager {
     }
 
     /// Starts global hotkey registration for an explicit [`HotkeyBackendKind`].
+    #[cfg(target_os = "linux")]
     pub fn start_with_backend(
         backend: HotkeyBackendKind,
         bindings: Vec<(HotkeyAction, HotkeySpec)>,
@@ -352,7 +390,31 @@ impl HotkeyManager {
         }
     }
 
+    /// Starts global hotkey registration on non-Linux platforms (focused-window shortcuts only).
+    #[cfg(not(target_os = "linux"))]
+    pub fn start_with_backend(
+        _backend: HotkeyBackendKind,
+        bindings: Vec<(HotkeyAction, HotkeySpec)>,
+        _tx: mpsc::UnboundedSender<HotkeyAction>,
+        status_tx: mpsc::UnboundedSender<GlobalHotkeyStatus>,
+    ) -> Self {
+        if bindings.is_empty() {
+            let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                message: "at least one hotkey binding is required".to_string(),
+            });
+            return Self::idle();
+        }
+        let _ = status_tx.send(GlobalHotkeyStatus::FocusedWindowOnly {
+            reason: Some(
+                "global hotkeys are not yet implemented on Windows; focused-window shortcuts are active"
+                    .to_string(),
+            ),
+        });
+        Self::idle()
+    }
+
     /// Starts an async XDG Desktop Portal `GlobalShortcuts` listener on the current Tokio runtime.
+    #[cfg(target_os = "linux")]
     pub fn start_wayland_portal(
         bindings: Vec<(HotkeyAction, HotkeySpec)>,
         tx: mpsc::UnboundedSender<HotkeyAction>,
@@ -373,6 +435,7 @@ impl HotkeyManager {
     /// Registers the given `(HotkeyAction, HotkeySpec)` bindings on the active X11 display.
     ///
     /// Returns `ClipForgeError::CaptureUnavailable` if no X11 display is reachable.
+    #[cfg(target_os = "linux")]
     pub fn start_x11(
         bindings: Vec<(HotkeyAction, HotkeySpec)>,
         tx: mpsc::UnboundedSender<HotkeyAction>,
@@ -488,11 +551,14 @@ impl HotkeyManager {
     /// Stops the background hotkey listener (X11 thread or Wayland portal task).
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        if let Some(tx) = self.portal_stop_tx.take() {
-            let _ = tx.send(());
-        }
-        if let Some(handle) = self.x11_handle.take() {
-            let _ = handle.join();
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(tx) = self.portal_stop_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(handle) = self.x11_handle.take() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -503,346 +569,360 @@ impl Drop for HotkeyManager {
     }
 }
 
-async fn next_stream_item<S>(stream: &mut S) -> Option<S::Item>
-where
-    S: Stream + Unpin,
-{
-    poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)).await
-}
+#[cfg(target_os = "linux")]
+mod linux_impl {
+    use super::*;
 
-fn next_token(prefix: &str) -> String {
-    let seq = TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("clipforge_{prefix}_{}_{}", std::process::id(), seq)
-}
+    pub(super) async fn next_stream_item<S>(stream: &mut S) -> Option<S::Item>
+    where
+        S: Stream + Unpin,
+    {
+        poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)).await
+    }
 
-fn expected_request_path(conn: &zbus::Connection, handle_token: &str) -> Option<String> {
-    let unique = conn.unique_name()?;
-    let sender = unique.as_str().trim_start_matches(':').replace('.', "_");
-    Some(format!(
-        "/org/freedesktop/portal/desktop/request/{sender}/{handle_token}"
-    ))
-}
+    fn next_token(prefix: &str) -> String {
+        let seq = TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("clipforge_{prefix}_{}_{}", std::process::id(), seq)
+    }
 
-async fn run_wayland_portal_loop(
-    bindings: Vec<(HotkeyAction, HotkeySpec)>,
-    tx: mpsc::UnboundedSender<HotkeyAction>,
-    status_tx: mpsc::UnboundedSender<GlobalHotkeyStatus>,
-    mut stop_rx: oneshot::Receiver<()>,
-) {
-    let conn = match zbus::Connection::session().await {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(error = %err, "failed to connect to session D-Bus for GlobalShortcuts");
-            let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                message: format!("session D-Bus unavailable: {err}"),
-            });
-            return;
-        }
-    };
+    fn expected_request_path(conn: &zbus::Connection, handle_token: &str) -> Option<String> {
+        let unique = conn.unique_name()?;
+        let sender = unique.as_str().trim_start_matches(':').replace('.', "_");
+        Some(format!(
+            "/org/freedesktop/portal/desktop/request/{sender}/{handle_token}"
+        ))
+    }
 
-    let portal =
-        match zbus::Proxy::new(&conn, PORTAL_DEST, PORTAL_PATH, GLOBAL_SHORTCUTS_IFACE).await {
-            Ok(p) => p,
+    pub(super) async fn run_wayland_portal_loop(
+        bindings: Vec<(HotkeyAction, HotkeySpec)>,
+        tx: mpsc::UnboundedSender<HotkeyAction>,
+        status_tx: mpsc::UnboundedSender<GlobalHotkeyStatus>,
+        mut stop_rx: oneshot::Receiver<()>,
+    ) {
+        let conn = match zbus::Connection::session().await {
+            Ok(c) => c,
             Err(err) => {
-                warn!(error = %err, "failed to create GlobalShortcuts portal proxy");
+                warn!(error = %err, "failed to connect to session D-Bus for GlobalShortcuts");
                 let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                    message: format!("GlobalShortcuts portal proxy failed: {err}"),
+                    message: format!("session D-Bus unavailable: {err}"),
                 });
                 return;
             }
         };
 
-    // 1. CreateSession
-    let create_token = next_token("create");
-    let session_token = next_token("session");
-    let Some(create_req_path) = expected_request_path(&conn, &create_token) else {
-        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-            message: "D-Bus connection missing unique name".to_string(),
-        });
-        return;
-    };
-
-    let mut create_resp_stream =
-        match zbus::Proxy::new(&conn, PORTAL_DEST, create_req_path.as_str(), REQUEST_IFACE).await {
-            Ok(req_proxy) => match req_proxy.receive_signal("Response").await {
-                Ok(s) => s,
+        let portal =
+            match zbus::Proxy::new(&conn, PORTAL_DEST, PORTAL_PATH, GLOBAL_SHORTCUTS_IFACE).await {
+                Ok(p) => p,
                 Err(err) => {
+                    warn!(error = %err, "failed to create GlobalShortcuts portal proxy");
                     let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                        message: format!(
-                            "failed to subscribe to portal CreateSession response: {err}"
-                        ),
+                        message: format!("GlobalShortcuts portal proxy failed: {err}"),
                     });
                     return;
                 }
-            },
-            Err(err) => {
+            };
+
+        // 1. CreateSession
+        let create_token = next_token("create");
+        let session_token = next_token("session");
+        let Some(create_req_path) = expected_request_path(&conn, &create_token) else {
+            let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                message: "D-Bus connection missing unique name".to_string(),
+            });
+            return;
+        };
+
+        let mut create_resp_stream =
+            match zbus::Proxy::new(&conn, PORTAL_DEST, create_req_path.as_str(), REQUEST_IFACE)
+                .await
+            {
+                Ok(req_proxy) => match req_proxy.receive_signal("Response").await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                            message: format!(
+                                "failed to subscribe to portal CreateSession response: {err}"
+                            ),
+                        });
+                        return;
+                    }
+                },
+                Err(err) => {
+                    let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                        message: format!("failed to build portal Request proxy: {err}"),
+                    });
+                    return;
+                }
+            };
+
+        let mut create_opts: HashMap<&str, Value<'_>> = HashMap::new();
+        create_opts.insert("handle_token", Value::from(create_token.as_str()));
+        create_opts.insert("session_handle_token", Value::from(session_token.as_str()));
+
+        let returned_req: OwnedObjectPath =
+            match portal.call("CreateSession", &(create_opts,)).await {
+                Ok(p) => p,
+                Err(err) => {
+                    warn!(error = %err, "GlobalShortcuts CreateSession failed");
+                    let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                        message: format!("GlobalShortcuts CreateSession failed: {err}"),
+                    });
+                    return;
+                }
+            };
+        if returned_req.as_str() != create_req_path {
+            debug!(
+                expected = %create_req_path,
+                actual = %returned_req,
+                "portal CreateSession returned non-standard request path"
+            );
+        }
+
+        let create_msg = tokio::select! {
+            _ = &mut stop_rx => return,
+            msg = next_stream_item(&mut create_resp_stream) => msg,
+        };
+        let Some(create_msg) = create_msg else {
+            let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                message: "portal CreateSession response stream ended".to_string(),
+            });
+            return;
+        };
+
+        let (create_code, create_results): (u32, HashMap<String, OwnedValue>) =
+            match create_msg.body().deserialize() {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                        message: format!("invalid CreateSession response: {err}"),
+                    });
+                    return;
+                }
+            };
+
+        if create_code != 0 {
+            let status = if create_code == 1 {
+                GlobalHotkeyStatus::FocusedWindowOnly {
+                    reason: Some("Wayland portal session cancelled".to_string()),
+                }
+            } else {
+                GlobalHotkeyStatus::RegistrationError {
+                    message: format!("portal CreateSession rejected (code {create_code})"),
+                }
+            };
+            let _ = status_tx.send(status);
+            return;
+        }
+
+        let session_handle_str: String = match create_results
+            .get("session_handle")
+            .and_then(|v| v.downcast_ref::<&str>().ok())
+        {
+            Some(s) => s.to_string(),
+            None => {
                 let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                    message: format!("failed to build portal Request proxy: {err}"),
+                    message: "portal CreateSession did not return session_handle".to_string(),
                 });
                 return;
             }
         };
-
-    let mut create_opts: HashMap<&str, Value<'_>> = HashMap::new();
-    create_opts.insert("handle_token", Value::from(create_token.as_str()));
-    create_opts.insert("session_handle_token", Value::from(session_token.as_str()));
-
-    let returned_req: OwnedObjectPath = match portal.call("CreateSession", &(create_opts,)).await {
-        Ok(p) => p,
-        Err(err) => {
-            warn!(error = %err, "GlobalShortcuts CreateSession failed");
+        let Ok(session_path) = ObjectPath::try_from(session_handle_str.as_str()) else {
             let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                message: format!("GlobalShortcuts CreateSession failed: {err}"),
+                message: format!("invalid portal session_handle: {session_handle_str}"),
             });
             return;
-        }
-    };
-    if returned_req.as_str() != create_req_path {
-        debug!(
-            expected = %create_req_path,
-            actual = %returned_req,
-            "portal CreateSession returned non-standard request path"
-        );
-    }
+        };
+        let session_path_owned = OwnedObjectPath::from(session_path.to_owned());
 
-    let create_msg = tokio::select! {
-        _ = &mut stop_rx => return,
-        msg = next_stream_item(&mut create_resp_stream) => msg,
-    };
-    let Some(create_msg) = create_msg else {
-        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-            message: "portal CreateSession response stream ended".to_string(),
-        });
-        return;
-    };
-
-    let (create_code, create_results): (u32, HashMap<String, OwnedValue>) =
-        match create_msg.body().deserialize() {
-            Ok(v) => v,
+        // 2. Subscribe to Activated BEFORE BindShortcuts so no activations are missed.
+        let mut activated_stream = match portal.receive_signal("Activated").await {
+            Ok(s) => s,
             Err(err) => {
                 let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                    message: format!("invalid CreateSession response: {err}"),
+                    message: format!("failed to subscribe to GlobalShortcuts Activated: {err}"),
                 });
+                close_portal_session(&conn, &session_path_owned).await;
                 return;
             }
         };
 
-    if create_code != 0 {
-        let status = if create_code == 1 {
-            GlobalHotkeyStatus::FocusedWindowOnly {
-                reason: Some("Wayland portal session cancelled".to_string()),
-            }
-        } else {
-            GlobalHotkeyStatus::RegistrationError {
-                message: format!("portal CreateSession rejected (code {create_code})"),
-            }
-        };
-        let _ = status_tx.send(status);
-        return;
-    }
-
-    let session_handle_str: String = match create_results
-        .get("session_handle")
-        .and_then(|v| v.downcast_ref::<&str>().ok())
-    {
-        Some(s) => s.to_string(),
-        None => {
+        // 3. BindShortcuts (may prompt user in KDE/GNOME portal dialog)
+        let _ = status_tx.send(GlobalHotkeyStatus::PermissionPending);
+        let bind_token = next_token("bind");
+        let Some(bind_req_path) = expected_request_path(&conn, &bind_token) else {
             let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                message: "portal CreateSession did not return session_handle".to_string(),
-            });
-            return;
-        }
-    };
-    let Ok(session_path) = ObjectPath::try_from(session_handle_str.as_str()) else {
-        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-            message: format!("invalid portal session_handle: {session_handle_str}"),
-        });
-        return;
-    };
-    let session_path_owned = OwnedObjectPath::from(session_path.to_owned());
-
-    // 2. Subscribe to Activated BEFORE BindShortcuts so no activations are missed.
-    let mut activated_stream = match portal.receive_signal("Activated").await {
-        Ok(s) => s,
-        Err(err) => {
-            let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                message: format!("failed to subscribe to GlobalShortcuts Activated: {err}"),
+                message: "D-Bus connection missing unique name".to_string(),
             });
             close_portal_session(&conn, &session_path_owned).await;
             return;
-        }
-    };
+        };
 
-    // 3. BindShortcuts (may prompt user in KDE/GNOME portal dialog)
-    let _ = status_tx.send(GlobalHotkeyStatus::PermissionPending);
-    let bind_token = next_token("bind");
-    let Some(bind_req_path) = expected_request_path(&conn, &bind_token) else {
-        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-            message: "D-Bus connection missing unique name".to_string(),
-        });
-        close_portal_session(&conn, &session_path_owned).await;
-        return;
-    };
-
-    let mut bind_resp_stream =
-        match zbus::Proxy::new(&conn, PORTAL_DEST, bind_req_path.as_str(), REQUEST_IFACE).await {
-            Ok(req_proxy) => match req_proxy.receive_signal("Response").await {
-                Ok(s) => s,
+        let mut bind_resp_stream =
+            match zbus::Proxy::new(&conn, PORTAL_DEST, bind_req_path.as_str(), REQUEST_IFACE).await
+            {
+                Ok(req_proxy) => match req_proxy.receive_signal("Response").await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                            message: format!(
+                                "failed to subscribe to portal BindShortcuts response: {err}"
+                            ),
+                        });
+                        close_portal_session(&conn, &session_path_owned).await;
+                        return;
+                    }
+                },
                 Err(err) => {
                     let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
                         message: format!(
-                            "failed to subscribe to portal BindShortcuts response: {err}"
+                            "failed to build portal BindShortcuts Request proxy: {err}"
                         ),
                     });
                     close_portal_session(&conn, &session_path_owned).await;
                     return;
                 }
-            },
-            Err(err) => {
-                let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                    message: format!("failed to build portal BindShortcuts Request proxy: {err}"),
-                });
-                close_portal_session(&conn, &session_path_owned).await;
-                return;
-            }
-        };
+            };
 
-    let trigger_strings: Vec<(HotkeyAction, String)> = bindings
-        .iter()
-        .map(|(action, spec)| (*action, spec.to_xdg_trigger()))
-        .collect();
-    let shortcuts_payload: Vec<(&str, HashMap<&str, Value<'_>>)> = trigger_strings
-        .iter()
-        .map(|(action, trigger)| {
-            let mut props: HashMap<&str, Value<'_>> = HashMap::new();
-            props.insert("description", Value::from(action.description()));
-            props.insert("preferred_trigger", Value::from(trigger.as_str()));
-            (action.portal_id(), props)
-        })
-        .collect();
+        let trigger_strings: Vec<(HotkeyAction, String)> = bindings
+            .iter()
+            .map(|(action, spec)| (*action, spec.to_xdg_trigger()))
+            .collect();
+        let shortcuts_payload: Vec<(&str, HashMap<&str, Value<'_>>)> = trigger_strings
+            .iter()
+            .map(|(action, trigger)| {
+                let mut props: HashMap<&str, Value<'_>> = HashMap::new();
+                props.insert("description", Value::from(action.description()));
+                props.insert("preferred_trigger", Value::from(trigger.as_str()));
+                (action.portal_id(), props)
+            })
+            .collect();
 
-    let mut bind_opts: HashMap<&str, Value<'_>> = HashMap::new();
-    bind_opts.insert("handle_token", Value::from(bind_token.as_str()));
+        let mut bind_opts: HashMap<&str, Value<'_>> = HashMap::new();
+        bind_opts.insert("handle_token", Value::from(bind_token.as_str()));
 
-    if let Err(err) = portal
-        .call::<_, _, OwnedObjectPath>(
-            "BindShortcuts",
-            &(&session_path_owned, shortcuts_payload, "", bind_opts),
-        )
-        .await
-    {
-        warn!(error = %err, "GlobalShortcuts BindShortcuts failed");
-        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-            message: format!("GlobalShortcuts BindShortcuts failed: {err}"),
-        });
-        close_portal_session(&conn, &session_path_owned).await;
-        return;
-    }
-
-    let bind_msg = tokio::select! {
-        _ = &mut stop_rx => {
+        if let Err(err) = portal
+            .call::<_, _, OwnedObjectPath>(
+                "BindShortcuts",
+                &(&session_path_owned, shortcuts_payload, "", bind_opts),
+            )
+            .await
+        {
+            warn!(error = %err, "GlobalShortcuts BindShortcuts failed");
+            let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                message: format!("GlobalShortcuts BindShortcuts failed: {err}"),
+            });
             close_portal_session(&conn, &session_path_owned).await;
             return;
         }
-        msg = next_stream_item(&mut bind_resp_stream) => msg,
-    };
-    let Some(bind_msg) = bind_msg else {
-        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-            message: "portal BindShortcuts response stream ended".to_string(),
-        });
-        close_portal_session(&conn, &session_path_owned).await;
-        return;
-    };
 
-    let (bind_code, _bind_results): (u32, HashMap<String, OwnedValue>) =
-        match bind_msg.body().deserialize() {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
-                    message: format!("invalid BindShortcuts response: {err}"),
-                });
+        let bind_msg = tokio::select! {
+            _ = &mut stop_rx => {
                 close_portal_session(&conn, &session_path_owned).await;
                 return;
             }
+            msg = next_stream_item(&mut bind_resp_stream) => msg,
+        };
+        let Some(bind_msg) = bind_msg else {
+            let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                message: "portal BindShortcuts response stream ended".to_string(),
+            });
+            close_portal_session(&conn, &session_path_owned).await;
+            return;
         };
 
-    if bind_code != 0 {
-        let status = if bind_code == 1 {
-            GlobalHotkeyStatus::FocusedWindowOnly {
-                reason: Some("Wayland portal permission cancelled".to_string()),
-            }
-        } else {
-            GlobalHotkeyStatus::RegistrationError {
-                message: format!("portal BindShortcuts rejected (code {bind_code})"),
-            }
-        };
-        let _ = status_tx.send(status);
-        close_portal_session(&conn, &session_path_owned).await;
-        return;
-    }
-
-    info!(session = %session_path_owned, "Wayland GlobalShortcuts portal session active");
-    let _ = status_tx.send(GlobalHotkeyStatus::WaylandPortalActive);
-
-    // 4. Listen for Activated signals until stopped.
-    loop {
-        tokio::select! {
-            _ = &mut stop_rx => {
-                close_portal_session(&conn, &session_path_owned).await;
-                break;
-            }
-            maybe_msg = next_stream_item(&mut activated_stream) => {
-                let Some(msg) = maybe_msg else {
-                    warn!("GlobalShortcuts Activated signal stream ended");
-                    let _ = status_tx.send(GlobalHotkeyStatus::FocusedWindowOnly {
-                        reason: Some("Wayland portal signal stream closed".to_string()),
+        let (bind_code, _bind_results): (u32, HashMap<String, OwnedValue>) =
+            match bind_msg.body().deserialize() {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                        message: format!("invalid BindShortcuts response: {err}"),
                     });
+                    close_portal_session(&conn, &session_path_owned).await;
+                    return;
+                }
+            };
+
+        if bind_code != 0 {
+            let status = if bind_code == 1 {
+                GlobalHotkeyStatus::FocusedWindowOnly {
+                    reason: Some("Wayland portal permission cancelled".to_string()),
+                }
+            } else {
+                GlobalHotkeyStatus::RegistrationError {
+                    message: format!("portal BindShortcuts rejected (code {bind_code})"),
+                }
+            };
+            let _ = status_tx.send(status);
+            close_portal_session(&conn, &session_path_owned).await;
+            return;
+        }
+
+        info!(session = %session_path_owned, "Wayland GlobalShortcuts portal session active");
+        let _ = status_tx.send(GlobalHotkeyStatus::WaylandPortalActive);
+
+        // 4. Listen for Activated signals until stopped.
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => {
+                    close_portal_session(&conn, &session_path_owned).await;
                     break;
-                };
-                match msg.body().deserialize::<(OwnedObjectPath, String, u64, HashMap<String, OwnedValue>)>() {
-                    Ok((sig_session, shortcut_id, _timestamp, _opts)) => {
-                        if sig_session.as_str() == session_path_owned.as_str()
-                            && let Some(action) = HotkeyAction::from_portal_id(&shortcut_id)
-                        {
-                            debug!(%shortcut_id, ?action, "Wayland GlobalShortcuts Activated");
-                            if tx.send(action).is_err() {
-                                close_portal_session(&conn, &session_path_owned).await;
-                                break;
+                }
+                maybe_msg = next_stream_item(&mut activated_stream) => {
+                    let Some(msg) = maybe_msg else {
+                        warn!("GlobalShortcuts Activated signal stream ended");
+                        let _ = status_tx.send(GlobalHotkeyStatus::FocusedWindowOnly {
+                            reason: Some("Wayland portal signal stream closed".to_string()),
+                        });
+                        break;
+                    };
+                    match msg.body().deserialize::<(OwnedObjectPath, String, u64, HashMap<String, OwnedValue>)>() {
+                        Ok((sig_session, shortcut_id, _timestamp, _opts)) => {
+                            if sig_session.as_str() == session_path_owned.as_str()
+                                && let Some(action) = HotkeyAction::from_portal_id(&shortcut_id)
+                            {
+                                debug!(%shortcut_id, ?action, "Wayland GlobalShortcuts Activated");
+                                if tx.send(action).is_err() {
+                                    close_portal_session(&conn, &session_path_owned).await;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "failed to deserialize GlobalShortcuts Activated signal");
+                        Err(err) => {
+                            warn!(error = %err, "failed to deserialize GlobalShortcuts Activated signal");
+                        }
                     }
                 }
             }
         }
     }
-}
 
-async fn close_portal_session(conn: &zbus::Connection, session_path: &OwnedObjectPath) {
-    if let Ok(proxy) =
-        zbus::Proxy::new(conn, PORTAL_DEST, session_path.as_str(), SESSION_IFACE).await
-    {
-        let _ = proxy.call::<_, _, ()>("Close", &()).await;
-    }
-}
-
-fn find_keycode(
-    keysyms: &[u32],
-    syms_per_code: usize,
-    min_keycode: u8,
-    target_keysym: u32,
-) -> Option<u8> {
-    for (idx, chunk) in keysyms.chunks_exact(syms_per_code).enumerate() {
-        if chunk.first().copied() == Some(target_keysym)
-            || chunk.get(1).copied() == Some(target_keysym)
+    async fn close_portal_session(conn: &zbus::Connection, session_path: &OwnedObjectPath) {
+        if let Ok(proxy) =
+            zbus::Proxy::new(conn, PORTAL_DEST, session_path.as_str(), SESSION_IFACE).await
         {
-            return u8::try_from(usize::from(min_keycode) + idx).ok();
+            let _ = proxy.call::<_, _, ()>("Close", &()).await;
         }
     }
-    None
-}
+
+    pub(super) fn find_keycode(
+        keysyms: &[u32],
+        syms_per_code: usize,
+        min_keycode: u8,
+        target_keysym: u32,
+    ) -> Option<u8> {
+        for (idx, chunk) in keysyms.chunks_exact(syms_per_code).enumerate() {
+            if chunk.first().copied() == Some(target_keysym)
+                || chunk.get(1).copied() == Some(target_keysym)
+            {
+                return u8::try_from(usize::from(min_keycode) + idx).ok();
+            }
+        }
+        None
+    }
+} // mod linux_impl
+
+#[cfg(target_os = "linux")]
+use linux_impl::{find_keycode, run_wayland_portal_loop};
 
 #[cfg(test)]
 mod tests {
@@ -851,20 +931,22 @@ mod tests {
     #[test]
     fn parse_hotkey_valid_combinations() {
         let f9 = parse_hotkey("Ctrl+Alt+F9").expect("valid");
-        assert_eq!(
-            f9.modifiers,
-            u16::from(ModMask::CONTROL) | u16::from(ModMask::M1)
-        );
+        assert_eq!(f9.modifiers, MOD_CONTROL | MOD_ALT);
         assert_eq!(f9.keysym, 0xFFBE + 8);
         assert_eq!(f9.to_xdg_trigger(), "<Control><Alt>F9");
 
         let letter = parse_hotkey("Shift+Super+R").expect("valid");
-        assert_eq!(
-            letter.modifiers,
-            u16::from(ModMask::SHIFT) | u16::from(ModMask::M4)
-        );
+        assert_eq!(letter.modifiers, MOD_SHIFT | MOD_SUPER);
         assert_eq!(letter.keysym, 'r' as u32);
         assert_eq!(letter.to_xdg_trigger(), "<Shift><Super>r");
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(MOD_CONTROL, u16::from(ModMask::CONTROL));
+            assert_eq!(MOD_ALT, u16::from(ModMask::M1));
+            assert_eq!(MOD_SHIFT, u16::from(ModMask::SHIFT));
+            assert_eq!(MOD_SUPER, u16::from(ModMask::M4));
+        }
 
         let single = parse_hotkey("F12").expect("valid");
         assert_eq!(single.modifiers, 0);
@@ -982,6 +1064,7 @@ mod tests {
         assert!(!GlobalHotkeyStatus::PermissionPending.is_global_active());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live Wayland session with org.freedesktop.portal.GlobalShortcuts"]
     async fn live_wayland_portal_creates_session_and_attempts_bind() {

@@ -4,6 +4,7 @@
 
 mod components;
 mod config;
+mod diagnostics;
 mod state;
 mod theme;
 mod views;
@@ -1117,5 +1118,35 @@ mod tests {
         click_key(&mut rt, "insp-delete-btn");
         assert_eq!(rt.state.confirm_remote_delete, Some(clip_id));
         assert!(rt.find("insp-delete-confirm").is_some());
+    }
+
+    #[test]
+    fn windows_compatible_diagnostics_and_about_smoke_test() {
+        let st = AppState {
+            config: clipforge_common::AppConfig {
+                server_url: Some(
+                    "https://alice:topsecret@clips.emkacz.dev/api?token=cf_pat_leak".to_string(),
+                ),
+                api_token: Some("cf_pat_super_secret_token".to_string()),
+                ..clipforge_common::AppConfig::default()
+            },
+            ..AppState::default()
+        };
+
+        let report = st.build_diagnostics_report();
+        let json = report.to_pretty_json().expect("serialize diagnostics");
+        assert!(json.contains("\"app_version\""));
+        assert!(json.contains("\"api_token_configured\": true"));
+        assert!(!json.contains("topsecret"));
+        assert!(!json.contains("cf_pat_leak"));
+        assert!(!json.contains("cf_pat_super_secret_token"));
+
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(st, views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        click_key(&mut rt, NavSection::Settings.key());
+        click_key(&mut rt, crate::state::SettingsTab::About.key());
+        assert!(rt.find("export-diagnostics-btn").is_some());
     }
 }

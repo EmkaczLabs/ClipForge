@@ -1,24 +1,38 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(target_os = "linux")]
 use chrono::Utc;
 use clipforge_common::{
     CaptureBackend, CaptureConfig, CaptureEvent, CaptureStatus, ClipForgeError, Result,
 };
+#[cfg(target_os = "linux")]
 use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(target_os = "linux")]
 use tokio::process::Child;
-use tokio::sync::{Mutex, broadcast, oneshot};
+#[cfg(target_os = "linux")]
+use tokio::sync::oneshot;
+use tokio::sync::{Mutex, broadcast};
+#[cfg(target_os = "linux")]
 use tracing::{debug, error, info, warn};
 
+#[cfg(target_os = "linux")]
 use crate::args::{build_recording_args, build_replay_args, container_flag};
+#[cfg(target_os = "linux")]
 use crate::audio::resolve_audio_routing;
-use crate::discovery::{GsrInstallation, detect_gsr};
+use crate::discovery::GsrInstallation;
+#[cfg(target_os = "linux")]
+use crate::discovery::detect_gsr;
 
+#[cfg(target_os = "linux")]
 const SAVE_REPLAY_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(target_os = "linux")]
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct ActiveProcess {
     child: Child,
@@ -34,9 +48,11 @@ struct ActiveProcess {
 /// [`CaptureBackend`] implementation backed by `gpu-screen-recorder`.
 pub struct GsrCaptureBackend {
     status: Arc<Mutex<CaptureStatus>>,
+    #[cfg(target_os = "linux")]
     process: Arc<Mutex<Option<ActiveProcess>>>,
     events: broadcast::Sender<CaptureEvent>,
     /// Optional override for the GSR installation (useful for testing).
+    #[allow(dead_code)]
     install_override: Option<GsrInstallation>,
 }
 
@@ -52,6 +68,7 @@ impl GsrCaptureBackend {
         let (events, _) = broadcast::channel(64);
         Self {
             status: Arc::new(Mutex::new(CaptureStatus::Idle)),
+            #[cfg(target_os = "linux")]
             process: Arc::new(Mutex::new(None)),
             events,
             install_override: None,
@@ -63,12 +80,14 @@ impl GsrCaptureBackend {
         let (events, _) = broadcast::channel(64);
         Self {
             status: Arc::new(Mutex::new(CaptureStatus::Idle)),
+            #[cfg(target_os = "linux")]
             process: Arc::new(Mutex::new(None)),
             events,
             install_override: Some(install),
         }
     }
 
+    #[cfg(target_os = "linux")]
     async fn resolve_install(&self) -> Result<GsrInstallation> {
         match &self.install_override {
             Some(install) => Ok(install.clone()),
@@ -82,6 +101,7 @@ impl GsrCaptureBackend {
     }
 
     /// Toggles pause/resume (`SIGUSR2`) when a regular recording is active.
+    #[cfg(target_os = "linux")]
     pub async fn toggle_pause(&self) -> Result<bool> {
         let pid = {
             let guard = self.process.lock().await;
@@ -120,6 +140,15 @@ impl GsrCaptureBackend {
         ))
     }
 
+    #[cfg(not(target_os = "linux"))]
+    pub async fn toggle_pause(&self) -> Result<bool> {
+        Err(ClipForgeError::CaptureUnavailable(
+            "gpu-screen-recorder is Linux-only; WGC + WASAPI capture is unimplemented on Windows"
+                .to_string(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
     async fn ensure_idle(&self) -> Result<()> {
         let guard = self.process.lock().await;
         if guard.is_some() {
@@ -131,6 +160,49 @@ impl GsrCaptureBackend {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+#[async_trait]
+impl CaptureBackend for GsrCaptureBackend {
+    async fn is_available(&self) -> bool {
+        false
+    }
+
+    async fn start_replay_buffer(&self, _config: &CaptureConfig) -> Result<()> {
+        Err(ClipForgeError::CaptureUnavailable(
+            "gpu-screen-recorder is Linux-only; WGC + WASAPI capture is unimplemented on Windows"
+                .to_string(),
+        ))
+    }
+
+    async fn save_replay(&self) -> Result<PathBuf> {
+        Err(ClipForgeError::CaptureUnavailable(
+            "gpu-screen-recorder is Linux-only; WGC + WASAPI capture is unimplemented on Windows"
+                .to_string(),
+        ))
+    }
+
+    async fn start_recording(&self, _config: &CaptureConfig) -> Result<()> {
+        Err(ClipForgeError::CaptureUnavailable(
+            "gpu-screen-recorder is Linux-only; WGC + WASAPI capture is unimplemented on Windows"
+                .to_string(),
+        ))
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.set_status(CaptureStatus::Idle).await;
+        Ok(())
+    }
+
+    async fn status(&self) -> CaptureStatus {
+        self.status.lock().await.clone()
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<CaptureEvent> {
+        self.events.subscribe()
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[async_trait]
 impl CaptureBackend for GsrCaptureBackend {
     async fn is_available(&self) -> bool {
@@ -375,6 +447,7 @@ impl CaptureBackend for GsrCaptureBackend {
 }
 
 /// Sends a POSIX signal exclusively to `pid` (never broadcasts to other GSR instances).
+#[cfg(target_os = "linux")]
 pub(crate) fn send_signal(pid: u32, signal: i32) -> Result<()> {
     let raw_pid = i32::try_from(pid)
         .map_err(|_| ClipForgeError::CaptureFailed(format!("PID {pid} overflows i32")))?;
@@ -386,6 +459,7 @@ pub(crate) fn send_signal(pid: u32, signal: i32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn create_save_hook_script() -> Result<(tempfile::TempDir, PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -425,6 +499,7 @@ fn parse_saved_path_line_with_hook(line: &str, hook_only: bool) -> Option<PathBu
     None
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_stream_monitors(
     pid: u32,
     has_save_hook: bool,
@@ -524,6 +599,7 @@ fn spawn_stream_monitors(
     });
 }
 
+#[cfg(target_os = "linux")]
 async fn snapshot_dir_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
@@ -534,6 +610,7 @@ async fn snapshot_dir_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+#[cfg(target_os = "linux")]
 async fn find_new_file(dir: &Path, before: &[PathBuf]) -> Option<PathBuf> {
     let mut rd = tokio::fs::read_dir(dir).await.ok()?;
     while let Ok(Some(entry)) = rd.next_entry().await {
@@ -567,6 +644,7 @@ mod tests {
         assert_eq!(parse_saved_path_line("info: encoding started"), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn missing_binary_returns_capture_unavailable() {
         let backend = GsrCaptureBackend::with_installation(GsrInstallation::Native(PathBuf::from(
@@ -581,6 +659,17 @@ mod tests {
         assert!(matches!(err, ClipForgeError::CaptureFailed(_)));
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn non_linux_backend_reports_unavailable_truthfully() {
+        let backend = GsrCaptureBackend::new();
+        assert!(!backend.is_available().await);
+        let cfg = CaptureConfig::default();
+        let err = backend.start_replay_buffer(&cfg).await.unwrap_err();
+        assert!(matches!(err, ClipForgeError::CaptureUnavailable(_)));
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn save_replay_when_idle_fails_cleanly() {
         let backend = GsrCaptureBackend::new();
@@ -596,6 +685,7 @@ mod tests {
         assert_eq!(backend.status().await, CaptureStatus::Idle);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn mock_gsr_replay_save_and_clean_stop() {
         use std::os::unix::fs::PermissionsExt;
@@ -666,6 +756,7 @@ done
         assert_eq!(backend.status().await, CaptureStatus::Idle);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn mock_gsr_deduplicates_raw_and_hook_paths_and_supports_repeated_saves() {
         use std::os::unix::fs::PermissionsExt;
@@ -736,6 +827,7 @@ done
         backend.stop().await.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn mock_gsr_unexpected_exit_reports_stderr_and_allows_recovery() {
         use std::os::unix::fs::PermissionsExt;
@@ -791,6 +883,7 @@ exit 2
         assert_eq!(backend.status().await, CaptureStatus::Idle);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live gpu-screen-recorder and display session"]
     async fn live_gsr_replay_save_repeated_and_stop() {

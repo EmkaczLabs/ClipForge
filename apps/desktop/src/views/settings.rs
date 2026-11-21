@@ -32,13 +32,23 @@ impl SettingRowSpec {
 
 fn compact_config_path() -> String {
     let path = config_file_path();
-    if let Ok(home) = std::env::var("HOME")
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
         && !home.is_empty()
         && let Ok(rel) = path.strip_prefix(&home)
     {
         return format!("~/{}", rel.display());
     }
     path.display().to_string()
+}
+
+fn display_session_label(is_wayland: bool) -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows"
+    } else if is_wayland {
+        "Wayland"
+    } else {
+        "X11"
+    }
 }
 
 pub fn view(p: &Palette, s: &AppState) -> El {
@@ -54,7 +64,7 @@ pub fn view(p: &Palette, s: &AppState) -> El {
 
 fn category_rail(p: &Palette, s: &AppState) -> El {
     let all_deps_ok = s.deps.gsr_available && s.deps.ffmpeg_available && s.deps.ffprobe_available;
-    let session_label = if s.is_wayland { "Wayland" } else { "X11" };
+    let session_label = display_session_label(s.is_wayland);
 
     panel(p, "settings-nav-rail")
         .w(232.0)
@@ -1484,6 +1494,27 @@ fn sharing_rows(p: &Palette, s: &AppState) -> Vec<SettingRowSpec> {
 fn about_tab(p: &Palette, s: &AppState) -> El {
     let sys_card = card(p, "settings-about-sys-card")
         .gap(space::XS)
+        .child(
+            row()
+                .key("about-hdr-row")
+                .w_full()
+                .justify_between()
+                .center_y()
+                .child(section_header(
+                    p,
+                    "about-hdr",
+                    "System Information",
+                    "Runtime environment and sanitized diagnostics export",
+                ))
+                .child(btn_secondary(
+                    p,
+                    "export-diagnostics-btn",
+                    "Export Diagnostics",
+                    |st| {
+                        st.export_diagnostics();
+                    },
+                )),
+        )
         .child(kv_row(
             p,
             "about-version",
@@ -1494,7 +1525,7 @@ fn about_tab(p: &Palette, s: &AppState) -> El {
             p,
             "about-session",
             "Display Session",
-            if s.is_wayland { "Wayland" } else { "X11" }.to_string(),
+            display_session_label(s.is_wayland).to_string(),
         ))
         .child(kv_row(
             p,
@@ -1502,6 +1533,17 @@ fn about_tab(p: &Palette, s: &AppState) -> El {
             "Config File",
             config_file_path().display().to_string(),
         ));
+
+    let gsr_guidance = if cfg!(target_os = "windows") {
+        "Linux-only (WGC + WASAPI capture is unimplemented on Windows)"
+    } else {
+        "Install via Flatpak (com.dec05eba.gpu_screen_recorder) or distro package"
+    };
+    let ffmpeg_guidance = if cfg!(target_os = "windows") {
+        "Install FFmpeg and add ffmpeg.exe to PATH"
+    } else {
+        "sudo apt install ffmpeg"
+    };
 
     let deps_card = card(p, "settings-deps-card")
         .child(
@@ -1527,14 +1569,14 @@ fn about_tab(p: &Palette, s: &AppState) -> El {
             "dep-gsr",
             "gpu-screen-recorder",
             s.deps.gsr_available,
-            "Install via Flatpak (com.dec05eba.gpu_screen_recorder) or distro package",
+            gsr_guidance,
         ))
         .child(dep_row(
             p,
             "dep-ffmpeg",
             "ffmpeg",
             s.deps.ffmpeg_available,
-            "sudo apt install ffmpeg",
+            ffmpeg_guidance,
         ))
         .child(dep_row(
             p,
