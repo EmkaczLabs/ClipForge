@@ -86,7 +86,7 @@ pub enum WorkerCommand {
     },
     CancelUpload(ClipId),
     SetShareVisibility {
-        share_id: String,
+        clip_id: ClipId,
         visibility: ShareVisibility,
         server_url: Option<String>,
         api_token: Option<String>,
@@ -144,7 +144,7 @@ pub enum WorkerCommand {
         api_token: Option<String>,
     },
     DeleteRemoteShare {
-        share_id: String,
+        clip_id: ClipId,
         server_url: String,
         api_token: Option<String>,
     },
@@ -186,7 +186,7 @@ pub enum WorkerEvent {
         clip_id: ClipId,
     },
     VisibilityUpdated {
-        share_id: String,
+        clip_id: ClipId,
         result: std::result::Result<RemoteClipSummary, String>,
     },
     ShareCreated {
@@ -245,7 +245,7 @@ pub enum WorkerEvent {
     },
     RemoteSharesLoaded(std::result::Result<Vec<RemoteClipSummary>, String>),
     RemoteShareDeleted {
-        share_id: String,
+        clip_id: ClipId,
         result: std::result::Result<(), String>,
     },
     MicTest(MicTestEvent),
@@ -793,14 +793,14 @@ async fn handle_command(
             (waker)();
         }
         WorkerCommand::SetShareVisibility {
-            share_id,
+            clip_id,
             visibility,
             server_url,
             api_token,
         } => {
             let Some(url) = server_url.filter(|u| !u.trim().is_empty()) else {
                 let _ = evt_tx.send(WorkerEvent::VisibilityUpdated {
-                    share_id,
+                    clip_id,
                     result: Err("Server URL is not configured in Settings".to_string()),
                 });
                 (waker)();
@@ -808,11 +808,11 @@ async fn handle_command(
             };
             let client = HttpCloudClient::new(url, api_token);
             let res = client
-                .set_visibility(&share_id, visibility)
+                .set_visibility(&clip_id.to_string(), visibility)
                 .await
                 .map_err(|e| e.to_string());
             let _ = evt_tx.send(WorkerEvent::VisibilityUpdated {
-                share_id,
+                clip_id,
                 result: res,
             });
             (waker)();
@@ -1114,18 +1114,15 @@ async fn handle_command(
             (waker)();
         }
         WorkerCommand::DeleteRemoteShare {
-            share_id,
+            clip_id,
             server_url,
             api_token,
         } => {
             let client = HttpCloudClient::new(server_url, api_token);
-            let res = match client.delete_clip(&share_id).await {
-                Ok(()) => Ok(()),
-                Err(_) => client
-                    .delete_share(&share_id)
-                    .await
-                    .map_err(|e| e.to_string()),
-            };
+            let res = client
+                .delete_clip(&clip_id.to_string())
+                .await
+                .map_err(|e| e.to_string());
             if res.is_ok() {
                 let quota = client.quota().await.ok();
                 let current_user = client.current_user().await.ok();
@@ -1137,7 +1134,7 @@ async fn handle_command(
                 });
             }
             let _ = evt_tx.send(WorkerEvent::RemoteShareDeleted {
-                share_id,
+                clip_id,
                 result: res,
             });
             (waker)();

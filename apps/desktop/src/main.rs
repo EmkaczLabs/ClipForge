@@ -939,4 +939,183 @@ mod tests {
                 .all(|e| e.text.as_deref() != Some("tok_12345"))
         );
     }
+
+    #[test]
+    fn uploads_visibility_update_requires_server_confirmation_and_persists_on_refresh() {
+        use chrono::Utc;
+        use clipforge_cloud_client::{RemoteClipSummary, ShareVisibility};
+        use clipforge_common::{ClipId, CloudShareInfo};
+
+        let clip_id = ClipId::new();
+        let now = Utc::now();
+        let initial_summary = RemoteClipSummary {
+            share_id: "shr_tok".to_string(),
+            url: "https://clips.example.com/c/shr_tok".to_string(),
+            uploaded_at: now,
+            expires_at: None,
+            clip_id,
+            title: "Clutch".to_string(),
+            visibility: ShareVisibility::Public,
+            size_bytes: 1024,
+        };
+
+        let mut st = AppState {
+            server_connected: true,
+            ..Default::default()
+        };
+        st.uploads.clear();
+        st.remote_shares.clear();
+        st.remote_shares.push(initial_summary.clone());
+        st.uploads.push(crate::state::UploadEntry {
+            clip_id,
+            title: "Clutch".to_string(),
+            game_name: "Valorant".to_string(),
+            status: crate::state::UploadStatus::Completed,
+            share: Some(CloudShareInfo::from(initial_summary.clone())),
+            is_public: true,
+        });
+
+        // Failed server update preserves existing visibility and surfaces error.
+        st.apply_worker_event(crate::worker::WorkerEvent::VisibilityUpdated {
+            clip_id,
+            result: Err("forbidden".to_string()),
+        });
+        assert!(st.uploads[0].is_public);
+        assert_eq!(st.remote_shares[0].visibility, ShareVisibility::Public);
+        assert_eq!(st.server_error.as_deref(), Some("forbidden"));
+        assert!(
+            st.status_banner
+                .as_deref()
+                .is_some_and(|b| b.contains("Visibility update failed"))
+        );
+
+        // Confirmed server update updates both remote_shares and uploads.
+        let mut updated = initial_summary;
+        updated.visibility = ShareVisibility::Private;
+        st.apply_worker_event(crate::worker::WorkerEvent::VisibilityUpdated {
+            clip_id,
+            result: Ok(updated.clone()),
+        });
+        assert!(!st.uploads[0].is_public);
+        assert_eq!(st.remote_shares[0].visibility, ShareVisibility::Private);
+        assert!(st.server_error.is_none());
+
+        // Refreshing from server keeps the confirmed visibility.
+        st.apply_worker_event(crate::worker::WorkerEvent::RemoteSharesLoaded(Ok(vec![
+            updated,
+        ])));
+        assert!(!st.uploads[0].is_public);
+        assert_eq!(st.remote_shares[0].visibility, ShareVisibility::Private);
+    }
+
+    #[test]
+    fn uploads_remote_delete_preserves_clip_on_error_and_removes_on_confirmed_ok() {
+        use chrono::Utc;
+        use clipforge_cloud_client::{RemoteClipSummary, ShareVisibility};
+        use clipforge_common::{ClipId, CloudShareInfo};
+
+        let clip_id = ClipId::new();
+        let now = Utc::now();
+        let summary = RemoteClipSummary {
+            share_id: "shr_tok".to_string(),
+            url: "https://clips.example.com/c/shr_tok".to_string(),
+            uploaded_at: now,
+            expires_at: None,
+            clip_id,
+            title: "Ace".to_string(),
+            visibility: ShareVisibility::Public,
+            size_bytes: 2048,
+        };
+
+        let mut st = AppState {
+            server_connected: true,
+            ..Default::default()
+        };
+        st.uploads.clear();
+        st.remote_shares.clear();
+        st.selected_upload_id = Some(clip_id);
+        st.remote_shares.push(summary.clone());
+        st.uploads.push(crate::state::UploadEntry {
+            clip_id,
+            title: "Ace".to_string(),
+            game_name: "CS2".to_string(),
+            status: crate::state::UploadStatus::Completed,
+            share: Some(CloudShareInfo::from(summary)),
+            is_public: true,
+        });
+
+        st.request_delete_remote_share(clip_id);
+        assert_eq!(st.confirm_remote_delete, Some(clip_id));
+
+        // Server error preserves the clip in both remote_shares and uploads.
+        st.apply_worker_event(crate::worker::WorkerEvent::RemoteShareDeleted {
+            clip_id,
+            result: Err("s3 delete failed".to_string()),
+        });
+        assert_eq!(st.remote_shares.len(), 1);
+        assert_eq!(st.uploads.len(), 1);
+        assert_eq!(st.confirm_remote_delete, None);
+        assert_eq!(st.server_error.as_deref(), Some("s3 delete failed"));
+        assert!(
+            st.status_banner
+                .as_deref()
+                .is_some_and(|b| b.contains("Remote delete failed"))
+        );
+
+        // Confirmed server Ok removes the clip and clears selection.
+        st.apply_worker_event(crate::worker::WorkerEvent::RemoteShareDeleted {
+            clip_id,
+            result: Ok(()),
+        });
+        assert!(st.remote_shares.is_empty());
+        assert!(st.uploads.is_empty());
+        assert_eq!(st.selected_upload_id, None);
+        assert!(st.server_error.is_none());
+    }
+
+    #[test]
+    fn uploads_refreshed_unshared_remote_clip_retains_delete_and_visibility_actions() {
+        use chrono::Utc;
+        use clipforge_cloud_client::{RemoteClipSummary, ShareVisibility};
+        use clipforge_common::ClipId;
+
+        let clip_id = ClipId::new();
+        let mut st = AppState {
+            nav: NavSection::Uploads,
+            server_connected: true,
+            selected_upload_id: Some(clip_id),
+            ..Default::default()
+        };
+        st.config.server_url = Some("https://clips.example.com".to_string());
+
+        // Simulate a refreshed remote clip whose share link was revoked (share_id is empty).
+        st.apply_worker_event(crate::worker::WorkerEvent::RemoteSharesLoaded(Ok(vec![
+            RemoteClipSummary {
+                share_id: String::new(),
+                url: String::new(),
+                uploaded_at: Utc::now(),
+                expires_at: None,
+                clip_id,
+                title: "Restored Remote Clip".to_string(),
+                visibility: ShareVisibility::Private,
+                size_bytes: 4096,
+            },
+        ])));
+
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(st, views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        assert!(
+            rt.find("insp-delete-btn").is_some(),
+            "Delete from Server button must remain available for unshared/refreshed remote clips"
+        );
+        assert!(rt.find("insp-vis-public").is_some());
+        assert!(rt.find("insp-vis-private").is_some());
+        assert!(rt.find("insp-create-link").is_some());
+
+        click_key(&mut rt, "insp-delete-btn");
+        assert_eq!(rt.state.confirm_remote_delete, Some(clip_id));
+        assert!(rt.find("insp-delete-confirm").is_some());
+    }
 }

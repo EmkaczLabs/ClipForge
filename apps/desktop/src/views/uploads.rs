@@ -12,7 +12,6 @@ use crate::state::{
     AppState, NavSection, UploadEntry, UploadStatus, format_bytes, format_duration_ms,
 };
 use crate::theme::{Palette, radius, snappy_spring, space, typography};
-use crate::worker::WorkerCommand;
 
 /// Renders the Shared & Cloud workspace in either Disconnected or Connected mode.
 pub fn view(p: &Palette, s: &AppState) -> El {
@@ -442,10 +441,10 @@ impl<'a> SharedGridItem<'a> {
     }
 
     fn is_public(&self) -> bool {
-        if let Some(u) = self.upload {
-            u.is_public
-        } else if let Some(r) = self.remote {
+        if let Some(r) = self.remote {
             r.visibility == ShareVisibility::Public
+        } else if let Some(u) = self.upload {
+            u.is_public
         } else {
             false
         }
@@ -1352,41 +1351,43 @@ fn inspector_sidebar(p: &Palette, s: &AppState, item: &SharedGridItem<'_>) -> El
         None
     };
 
-    let visibility_section = share_id.as_ref().map(|sid| {
-        let sid_pub = sid.clone();
-        let sid_priv = sid.clone();
-        col()
-            .key("insp-vis-section")
-            .w_full()
-            .gap(space::XS)
-            .child(
-                text("Visibility")
-                    .font(typography::LABEL)
-                    .color(p.text_secondary),
-            )
-            .child(
-                row()
-                    .key("insp-vis-pills")
-                    .w_full()
-                    .gap(space::SM)
-                    .child(
-                        pill_option(p, "insp-vis-public", "Public", is_public, move |st| {
-                            set_visibility(st, clip_id, &sid_pub, true);
-                        })
-                        .grow(1.0),
-                    )
-                    .child(
-                        pill_option(p, "insp-vis-private", "Private", !is_public, move |st| {
-                            set_visibility(st, clip_id, &sid_priv, false);
-                        })
-                        .grow(1.0),
-                    ),
-            )
-    });
+    let visibility_section = if is_uploaded {
+        Some(
+            col()
+                .key("insp-vis-section")
+                .w_full()
+                .gap(space::XS)
+                .child(
+                    text("Visibility")
+                        .font(typography::LABEL)
+                        .color(p.text_secondary),
+                )
+                .child(
+                    row()
+                        .key("insp-vis-pills")
+                        .w_full()
+                        .gap(space::SM)
+                        .child(
+                            pill_option(p, "insp-vis-public", "Public", is_public, move |st| {
+                                st.set_clip_visibility(clip_id, true);
+                            })
+                            .grow(1.0),
+                        )
+                        .child(
+                            pill_option(p, "insp-vis-private", "Private", !is_public, move |st| {
+                                st.set_clip_visibility(clip_id, false);
+                            })
+                            .grow(1.0),
+                        ),
+                ),
+        )
+    } else {
+        None
+    };
 
-    let delete_section = share_id.map(|sid| {
-        let confirming = s.confirm_remote_delete.as_deref() == Some(sid.as_str());
-        if confirming {
+    let delete_section = if is_uploaded {
+        let confirming = s.confirm_remote_delete == Some(clip_id);
+        Some(if confirming {
             col()
                 .key("insp-delete-confirm")
                 .w_full()
@@ -1420,11 +1421,13 @@ fn inspector_sidebar(p: &Palette, s: &AppState, item: &SharedGridItem<'_>) -> El
                 )
         } else {
             btn_danger(p, "insp-delete-btn", "Delete from Server", move |st| {
-                st.request_delete_remote_share(sid.clone());
+                st.request_delete_remote_share(clip_id);
             })
             .w_full()
-        }
-    });
+        })
+    } else {
+        None
+    };
 
     panel(p, "upload-inspector")
         .w(320.0)
@@ -1507,34 +1510,4 @@ fn inspector_sidebar(p: &Palette, s: &AppState, item: &SharedGridItem<'_>) -> El
                 .children(visibility_section)
                 .children(delete_section),
         )
-}
-
-fn set_visibility(st: &mut AppState, clip_id: ClipId, share_id: &str, make_public: bool) {
-    let target_vis = if make_public {
-        ShareVisibility::Public
-    } else {
-        ShareVisibility::Private
-    };
-
-    if let Some(u) = st.uploads.iter().find(|u| u.clip_id == clip_id) {
-        if u.is_public != make_public {
-            st.toggle_share_visibility(clip_id);
-        }
-        if let Some(r) = st.remote_shares.iter_mut().find(|r| r.share_id == share_id) {
-            r.visibility = target_vis;
-        }
-        return;
-    }
-
-    if let Some(r) = st.remote_shares.iter_mut().find(|r| r.share_id == share_id) {
-        r.visibility = target_vis;
-    }
-    if let Some(worker) = &st.worker {
-        worker.send(WorkerCommand::SetShareVisibility {
-            share_id: share_id.to_string(),
-            visibility: target_vis,
-            server_url: st.config.server_url.clone(),
-            api_token: st.config.api_token.clone(),
-        });
-    }
 }

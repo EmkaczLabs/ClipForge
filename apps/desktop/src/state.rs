@@ -354,7 +354,7 @@ pub struct AppState {
     pub server_user_edit: rune::TextEdit,
     #[allow(dead_code)]
     pub server_pass_edit: rune::TextEdit,
-    pub confirm_remote_delete: Option<String>,
+    pub confirm_remote_delete: Option<ClipId>,
     pub hotkeys: HotkeyConfig,
     pub hotkey_status: GlobalHotkeyStatus,
     #[allow(dead_code)]
@@ -1492,23 +1492,18 @@ impl AppState {
         self.nav = NavSection::Uploads;
     }
 
-    /// Toggles public/private visibility for an uploaded share.
-    pub fn toggle_share_visibility(&mut self, clip_id: ClipId) {
-        let mut next_vis = None;
-        let mut share_id = None;
-        if let Some(u) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {
-            u.is_public = !u.is_public;
-            next_vis = Some(if u.is_public {
-                ShareVisibility::Public
-            } else {
-                ShareVisibility::Private
-            });
-            share_id = u.share.as_ref().map(|s| s.share_id.clone());
-        }
-        if let (Some(worker), Some(sid), Some(vis)) = (&self.worker, share_id, next_vis) {
+    /// Sets public/private visibility for a remote clip (confirmed by server response).
+    pub fn set_clip_visibility(&mut self, clip_id: ClipId, make_public: bool) {
+        let target_vis = if make_public {
+            ShareVisibility::Public
+        } else {
+            ShareVisibility::Private
+        };
+        if let Some(worker) = &self.worker {
+            self.status_banner = Some("Updating clip visibility...".to_string());
             worker.send(WorkerCommand::SetShareVisibility {
-                share_id: sid,
-                visibility: vis,
+                clip_id,
+                visibility: target_vis,
                 server_url: self.config.server_url.clone(),
                 api_token: self.config.api_token.clone(),
             });
@@ -1539,401 +1534,435 @@ impl AppState {
 
         for ev in events {
             changed = true;
-            match ev {
-                WorkerEvent::DependenciesProbed(deps) => {
-                    self.deps = deps;
-                }
-                WorkerEvent::LibraryLoaded {
-                    clips,
-                    trashed_clips,
-                    favorites,
-                    origins,
-                    trashed_at,
-                } => {
-                    if !clips.is_empty() || !trashed_clips.is_empty() || !self.using_sample_clips {
-                        self.using_sample_clips = false;
-                        self.clips = clips;
-                        self.trashed_clips = trashed_clips;
-                        self.favorite_ids = favorites;
-                        self.clip_origins = origins;
-                        self.trashed_at = trashed_at;
-                        self.uploads.retain(|u| {
-                            u.share
-                                .as_ref()
-                                .is_none_or(|sh| sh.share_id != "shr_mirage_01")
-                        });
-                        let active_ids: HashSet<ClipId> = self
-                            .clips
-                            .iter()
-                            .chain(self.trashed_clips.iter())
-                            .map(|c| c.id)
-                            .collect();
-                        self.selected_clip_ids.retain(|id| active_ids.contains(id));
-
-                        let selected_valid = self
-                            .editor
-                            .selected_clip_id
-                            .is_some_and(|id| self.clips.iter().any(|c| c.id == id));
-                        if !selected_valid {
-                            if let Some(first) = self.clips.first() {
-                                self.editor.selected_clip_id = Some(first.id);
-                                self.editor.trim_start_ms = 0;
-                                self.editor.trim_end_ms = first.duration_ms;
-                            } else {
-                                self.editor.selected_clip_id = None;
-                                self.editor.playing = false;
-                                self.editor.has_video_frame = false;
-                            }
-                        }
-                        if let Some(worker) = &self.worker {
-                            for clip in self.clips.iter().chain(self.trashed_clips.iter()) {
-                                if !self.library_thumbs.contains_key(&clip.id)
-                                    && let Some(thumb_path) = &clip.thumbnail_path
-                                    && thumb_path.is_file()
-                                {
-                                    let pixels = rune::Pixels::new();
-                                    self.library_thumbs.insert(clip.id, pixels.clone());
-                                    worker.send(WorkerCommand::LoadThumbnail {
-                                        path: thumb_path.clone(),
-                                        pixels,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                WorkerEvent::CaptureStatusChanged(status) => {
-                    if matches!(
-                        status,
-                        CaptureStatus::Idle | CaptureStatus::ReplayBuffering { .. }
-                    ) {
-                        self.audio_config_dirty_while_active = false;
-                    }
-                    self.capture_status = status;
-                }
-                WorkerEvent::HotkeyStatusChanged(status) => {
-                    self.hotkey_status = status;
-                }
-                WorkerEvent::CaptureEventReceived(cap_ev) => match cap_ev {
-                    CaptureEvent::StatusChanged(status) => {
-                        self.capture_status = status;
-                    }
-                    CaptureEvent::ReplaySaved { path, .. }
-                    | CaptureEvent::RecordingFinished { path, .. } => {
-                        self.status_banner = Some(format!("Captured: {}", path.display()));
-                        if let Some(worker) = &self.worker {
-                            worker.send(WorkerCommand::ScanLibrary(self.config.clone()));
-                        }
-                    }
-                    CaptureEvent::Warning(msg) | CaptureEvent::Error(msg) => {
-                        self.status_banner = Some(msg);
-                    }
-                },
-                WorkerEvent::ConfigSaved(Ok(path)) => {
-                    self.status_banner = Some(format!("Saved config to {}", path.display()));
-                }
-                WorkerEvent::ConfigSaved(Err(err)) => {
-                    self.status_banner = Some(format!("Failed to save config: {err}"));
-                }
-                WorkerEvent::TrimProgress(progress) => {
-                    if self.editor.exporting {
-                        self.editor.export_progress = Some(progress.clamp(0.0, 1.0));
-                    }
-                }
-                WorkerEvent::TrimCompleted(Ok(path)) => {
-                    self.editor.exporting = false;
-                    self.editor.export_progress = None;
-                    self.editor.export_error = None;
-                    self.editor.last_export_path = Some(path.clone());
-                    self.status_banner = Some(format!("Trimmed clip exported: {}", path.display()));
-                }
-                WorkerEvent::TrimCompleted(Err(err)) => {
-                    self.editor.exporting = false;
-                    self.editor.export_progress = None;
-                    if err.to_ascii_lowercase().contains("cancel") {
-                        self.editor.export_error = None;
-                        self.status_banner = Some("Trim export cancelled".to_string());
-                    } else {
-                        self.editor.export_error = Some(err.clone());
-                        self.status_banner = Some(format!("Trim failed: {err}"));
-                    }
-                }
-                WorkerEvent::PlayerFrameDelivered {
-                    clip_id,
-                    width,
-                    height,
-                    pts_ms,
-                } => {
-                    if self.editor.selected_clip_id == Some(clip_id) {
-                        self.editor.has_video_frame = true;
-                        self.editor.video_width = width;
-                        self.editor.video_height = height;
-                        self.editor.playhead_ms = pts_ms;
-                    }
-                }
-                WorkerEvent::PlayerStateChanged { clip_id, playing } => {
-                    if self.editor.selected_clip_id == Some(clip_id) {
-                        self.editor.playing = playing;
-                    }
-                }
-                WorkerEvent::PlayerPosition { clip_id, pts_ms } => {
-                    if self.editor.selected_clip_id == Some(clip_id) {
-                        self.editor.playhead_ms = pts_ms;
-                    }
-                }
-                WorkerEvent::PlayerAudioStatus {
-                    clip_id,
-                    has_audio,
-                    error,
-                } => {
-                    if self.editor.selected_clip_id == Some(clip_id) {
-                        self.editor.has_audio = has_audio;
-                        self.editor.audio_error = error;
-                    }
-                }
-                WorkerEvent::PlayerError { clip_id, message } => {
-                    if self.editor.selected_clip_id == Some(clip_id) {
-                        self.editor.playing = false;
-                        self.editor.decoder_error = Some(message);
-                    }
-                }
-                WorkerEvent::TimelineThumbsLoaded { clip_id, thumbs } => {
-                    if self.editor.selected_clip_id == Some(clip_id) {
-                        self.editor.timeline_thumbs = thumbs;
-                    }
-                }
-                WorkerEvent::UploadProgress {
-                    clip_id,
-                    progress_pct,
-                } => {
-                    if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
-                        && !matches!(
-                            entry.status,
-                            UploadStatus::Cancelled | UploadStatus::Completed
-                        )
-                    {
-                        entry.status = UploadStatus::Uploading { progress_pct };
-                    }
-                }
-                WorkerEvent::UploadCancelled { clip_id } => {
-                    if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
-                        && !matches!(entry.status, UploadStatus::Completed)
-                    {
-                        entry.status = UploadStatus::Cancelled;
-                        self.status_banner = Some("Upload cancelled (local clip kept)".to_string());
-                    }
-                }
-                WorkerEvent::UploadCompleted { clip_id, result } => {
-                    if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {
-                        match result {
-                            Ok(summary) => {
-                                entry.status = UploadStatus::Completed;
-                                entry.is_public = summary.visibility == ShareVisibility::Public;
-                                entry.share = Some(summary.clone().into());
-                                if !self
-                                    .remote_shares
-                                    .iter()
-                                    .any(|r| r.clip_id == summary.clip_id)
-                                {
-                                    self.remote_shares.insert(0, summary);
-                                }
-                                self.status_banner = Some("Clip uploaded successfully".to_string());
-                            }
-                            Err(err) => {
-                                entry.status = UploadStatus::Failed(err.clone());
-                                self.status_banner = Some(format!("Upload failed: {err}"));
-                            }
-                        }
-                    }
-                }
-                WorkerEvent::VisibilityUpdated { share_id, result } => {
-                    if let Err(err) = result {
-                        self.status_banner =
-                            Some(format!("Visibility update failed for {share_id}: {err}"));
-                    }
-                }
-                WorkerEvent::ShareCreated { clip_id, result } => match result {
-                    Ok(resp) => {
-                        let info = CloudShareInfo {
-                            share_id: resp.share_id.clone(),
-                            url: resp.url.clone(),
-                            uploaded_at: resp.created_at,
-                            expires_at: resp.expires_at,
-                        };
-                        if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
-                        {
-                            entry.share = Some(info.clone());
-                            entry.is_public = resp.visibility == ShareVisibility::Public;
-                        }
-                        if let Some(remote) =
-                            self.remote_shares.iter_mut().find(|r| r.clip_id == clip_id)
-                        {
-                            remote.share_id = resp.share_id;
-                            remote.url = resp.url;
-                            remote.visibility = resp.visibility;
-                            remote.expires_at = resp.expires_at;
-                        }
-                        self.status_banner = Some("Share link created".to_string());
-                    }
-                    Err(err) => {
-                        self.server_error = Some(err.clone());
-                        self.status_banner = Some(format!("Create share failed: {err}"));
-                    }
-                },
-                WorkerEvent::ShareRevoked {
-                    clip_id,
-                    share_id,
-                    result,
-                } => match result {
-                    Ok(()) => {
-                        if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
-                        {
-                            entry.share = None;
-                            entry.is_public = false;
-                        }
-                        if let Some(remote) = self
-                            .remote_shares
-                            .iter_mut()
-                            .find(|r| r.clip_id == clip_id || r.share_id == share_id)
-                        {
-                            remote.share_id.clear();
-                            remote.url.clear();
-                            remote.visibility = ShareVisibility::Private;
-                        }
-                        self.status_banner = Some("Share link revoked".to_string());
-                    }
-                    Err(err) => {
-                        self.server_error = Some(err.clone());
-                        self.status_banner = Some(format!("Revoke share failed: {err}"));
-                    }
-                },
-                WorkerEvent::CaptureSourcesDiscovered {
-                    monitors,
-                    audio_devices,
-                    app_audio,
-                } => {
-                    self.available_monitors = monitors;
-                    self.available_audio_devices = audio_devices;
-                    self.available_app_audio = app_audio;
-                }
-                WorkerEvent::ServerHealthChecked {
-                    ok,
-                    error,
-                    server_info,
-                } => {
-                    self.server_health_ok = Some(ok);
-                    self.server_error = error;
-                    if let Some(info) = server_info {
-                        self.server_info = Some(info);
-                    }
-                }
-                WorkerEvent::ServerMetadataLoaded {
-                    server_info,
-                    current_user,
-                    quota,
-                } => {
-                    if let Some(info) = server_info {
-                        self.server_info = Some(info);
-                    }
-                    if let Some(user) = current_user {
-                        self.current_user = Some(user);
-                    }
-                    if let Some(q) = quota {
-                        self.quota = Some(q);
-                    }
-                }
-                WorkerEvent::ServerConnected(res) => match res {
-                    Ok((url, token)) => {
-                        self.config.server_url = Some(url.clone());
-                        if let Some(tok) = token {
-                            self.config.api_token = Some(tok.clone());
-                            self.api_token_edit = rune::TextEdit::new(tok);
-                        }
-                        self.server_url_edit = rune::TextEdit::new(url.clone());
-                        self.server_connected = true;
-                        self.server_health_ok = Some(true);
-                        self.server_error = None;
-                        self.save_config();
-                        self.refresh_remote_shares();
-                        self.status_banner = Some(format!("Connected to {url}"));
-                    }
-                    Err(err) => {
-                        self.server_connected = false;
-                        self.server_health_ok = Some(false);
-                        self.server_error = Some(err.clone());
-                        self.status_banner = Some(format!("Server connection failed: {err}"));
-                    }
-                },
-                WorkerEvent::RemoteSharesLoaded(res) => match res {
-                    Ok(list) => {
-                        self.remote_shares = list;
-                        self.server_error = None;
-                    }
-                    Err(err) => {
-                        self.server_error = Some(err);
-                    }
-                },
-                WorkerEvent::RemoteShareDeleted { share_id, result } => {
-                    self.confirm_remote_delete = None;
-                    match result {
-                        Ok(()) => {
-                            self.remote_shares.retain(|s| s.share_id != share_id);
-                            self.uploads.retain(|u| {
-                                u.share.as_ref().is_none_or(|sh| sh.share_id != share_id)
-                            });
-                            self.status_banner = Some(format!("Deleted remote share {share_id}"));
-                        }
-                        Err(err) => {
-                            self.server_error = Some(err.clone());
-                            self.status_banner = Some(format!("Remote delete failed: {err}"));
-                        }
-                    }
-                }
-                WorkerEvent::MicTest(ev) => match ev {
-                    MicTestEvent::PhaseChanged(phase) => {
-                        self.mic_test.phase = phase;
-                        if matches!(phase, MicTestPhase::Recording) {
-                            self.mic_test.error = None;
-                        }
-                    }
-                    MicTestEvent::Level {
-                        rms_dbfs,
-                        peak_dbfs,
-                        elapsed_ms,
-                    } => {
-                        self.mic_test.rms_dbfs = rms_dbfs;
-                        self.mic_test.peak_dbfs = peak_dbfs;
-                        self.mic_test.elapsed_ms = elapsed_ms;
-                    }
-                    MicTestEvent::Recorded { summary } => {
-                        self.mic_test.rms_dbfs = summary.rms_dbfs;
-                        self.mic_test.peak_dbfs = summary.peak_dbfs;
-                        self.mic_test.feedback = Some(summary.feedback);
-                        self.mic_test.error = None;
-                        self.mic_test.diagnostic_summary = Some(summary);
-                    }
-                    MicTestEvent::PlaybackFinished => {
-                        self.mic_test.phase = MicTestPhase::Completed;
-                    }
-                    MicTestEvent::Error {
-                        feedback,
-                        message,
-                        summary,
-                    } => {
-                        self.mic_test.phase = MicTestPhase::Error;
-                        self.mic_test.feedback = Some(feedback);
-                        self.mic_test.error = Some(message);
-                        if summary.is_some() {
-                            self.mic_test.diagnostic_summary = summary;
-                        }
-                    }
-                },
-                WorkerEvent::Banner(msg) => {
-                    self.status_banner = Some(msg);
-                }
-            }
+            self.apply_worker_event(ev);
         }
         changed
+    }
+
+    /// Applies a single [`WorkerEvent`] to application state.
+    pub fn apply_worker_event(&mut self, ev: WorkerEvent) {
+        match ev {
+            WorkerEvent::DependenciesProbed(deps) => {
+                self.deps = deps;
+            }
+            WorkerEvent::LibraryLoaded {
+                clips,
+                trashed_clips,
+                favorites,
+                origins,
+                trashed_at,
+            } => {
+                if !clips.is_empty() || !trashed_clips.is_empty() || !self.using_sample_clips {
+                    self.using_sample_clips = false;
+                    self.clips = clips;
+                    self.trashed_clips = trashed_clips;
+                    self.favorite_ids = favorites;
+                    self.clip_origins = origins;
+                    self.trashed_at = trashed_at;
+                    self.uploads.retain(|u| {
+                        u.share
+                            .as_ref()
+                            .is_none_or(|sh| sh.share_id != "shr_mirage_01")
+                    });
+                    let active_ids: HashSet<ClipId> = self
+                        .clips
+                        .iter()
+                        .chain(self.trashed_clips.iter())
+                        .map(|c| c.id)
+                        .collect();
+                    self.selected_clip_ids.retain(|id| active_ids.contains(id));
+
+                    let selected_valid = self
+                        .editor
+                        .selected_clip_id
+                        .is_some_and(|id| self.clips.iter().any(|c| c.id == id));
+                    if !selected_valid {
+                        if let Some(first) = self.clips.first() {
+                            self.editor.selected_clip_id = Some(first.id);
+                            self.editor.trim_start_ms = 0;
+                            self.editor.trim_end_ms = first.duration_ms;
+                        } else {
+                            self.editor.selected_clip_id = None;
+                            self.editor.playing = false;
+                            self.editor.has_video_frame = false;
+                        }
+                    }
+                    if let Some(worker) = &self.worker {
+                        for clip in self.clips.iter().chain(self.trashed_clips.iter()) {
+                            if !self.library_thumbs.contains_key(&clip.id)
+                                && let Some(thumb_path) = &clip.thumbnail_path
+                                && thumb_path.is_file()
+                            {
+                                let pixels = rune::Pixels::new();
+                                self.library_thumbs.insert(clip.id, pixels.clone());
+                                worker.send(WorkerCommand::LoadThumbnail {
+                                    path: thumb_path.clone(),
+                                    pixels,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            WorkerEvent::CaptureStatusChanged(status) => {
+                if matches!(
+                    status,
+                    CaptureStatus::Idle | CaptureStatus::ReplayBuffering { .. }
+                ) {
+                    self.audio_config_dirty_while_active = false;
+                }
+                self.capture_status = status;
+            }
+            WorkerEvent::HotkeyStatusChanged(status) => {
+                self.hotkey_status = status;
+            }
+            WorkerEvent::CaptureEventReceived(cap_ev) => match cap_ev {
+                CaptureEvent::StatusChanged(status) => {
+                    self.capture_status = status;
+                }
+                CaptureEvent::ReplaySaved { path, .. }
+                | CaptureEvent::RecordingFinished { path, .. } => {
+                    self.status_banner = Some(format!("Captured: {}", path.display()));
+                    if let Some(worker) = &self.worker {
+                        worker.send(WorkerCommand::ScanLibrary(self.config.clone()));
+                    }
+                }
+                CaptureEvent::Warning(msg) | CaptureEvent::Error(msg) => {
+                    self.status_banner = Some(msg);
+                }
+            },
+            WorkerEvent::ConfigSaved(Ok(path)) => {
+                self.status_banner = Some(format!("Saved config to {}", path.display()));
+            }
+            WorkerEvent::ConfigSaved(Err(err)) => {
+                self.status_banner = Some(format!("Failed to save config: {err}"));
+            }
+            WorkerEvent::TrimProgress(progress) => {
+                if self.editor.exporting {
+                    self.editor.export_progress = Some(progress.clamp(0.0, 1.0));
+                }
+            }
+            WorkerEvent::TrimCompleted(Ok(path)) => {
+                self.editor.exporting = false;
+                self.editor.export_progress = None;
+                self.editor.export_error = None;
+                self.editor.last_export_path = Some(path.clone());
+                self.status_banner = Some(format!("Trimmed clip exported: {}", path.display()));
+            }
+            WorkerEvent::TrimCompleted(Err(err)) => {
+                self.editor.exporting = false;
+                self.editor.export_progress = None;
+                if err.to_ascii_lowercase().contains("cancel") {
+                    self.editor.export_error = None;
+                    self.status_banner = Some("Trim export cancelled".to_string());
+                } else {
+                    self.editor.export_error = Some(err.clone());
+                    self.status_banner = Some(format!("Trim failed: {err}"));
+                }
+            }
+            WorkerEvent::PlayerFrameDelivered {
+                clip_id,
+                width,
+                height,
+                pts_ms,
+            } => {
+                if self.editor.selected_clip_id == Some(clip_id) {
+                    self.editor.has_video_frame = true;
+                    self.editor.video_width = width;
+                    self.editor.video_height = height;
+                    self.editor.playhead_ms = pts_ms;
+                }
+            }
+            WorkerEvent::PlayerStateChanged { clip_id, playing } => {
+                if self.editor.selected_clip_id == Some(clip_id) {
+                    self.editor.playing = playing;
+                }
+            }
+            WorkerEvent::PlayerPosition { clip_id, pts_ms } => {
+                if self.editor.selected_clip_id == Some(clip_id) {
+                    self.editor.playhead_ms = pts_ms;
+                }
+            }
+            WorkerEvent::PlayerAudioStatus {
+                clip_id,
+                has_audio,
+                error,
+            } => {
+                if self.editor.selected_clip_id == Some(clip_id) {
+                    self.editor.has_audio = has_audio;
+                    self.editor.audio_error = error;
+                }
+            }
+            WorkerEvent::PlayerError { clip_id, message } => {
+                if self.editor.selected_clip_id == Some(clip_id) {
+                    self.editor.playing = false;
+                    self.editor.decoder_error = Some(message);
+                }
+            }
+            WorkerEvent::TimelineThumbsLoaded { clip_id, thumbs } => {
+                if self.editor.selected_clip_id == Some(clip_id) {
+                    self.editor.timeline_thumbs = thumbs;
+                }
+            }
+            WorkerEvent::UploadProgress {
+                clip_id,
+                progress_pct,
+            } => {
+                if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
+                    && !matches!(
+                        entry.status,
+                        UploadStatus::Cancelled | UploadStatus::Completed
+                    )
+                {
+                    entry.status = UploadStatus::Uploading { progress_pct };
+                }
+            }
+            WorkerEvent::UploadCancelled { clip_id } => {
+                if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id)
+                    && !matches!(entry.status, UploadStatus::Completed)
+                {
+                    entry.status = UploadStatus::Cancelled;
+                    self.status_banner = Some("Upload cancelled (local clip kept)".to_string());
+                }
+            }
+            WorkerEvent::UploadCompleted { clip_id, result } => {
+                if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {
+                    match result {
+                        Ok(summary) => {
+                            entry.status = UploadStatus::Completed;
+                            entry.is_public = summary.visibility == ShareVisibility::Public;
+                            entry.share = Some(summary.clone().into());
+                            if !self
+                                .remote_shares
+                                .iter()
+                                .any(|r| r.clip_id == summary.clip_id)
+                            {
+                                self.remote_shares.insert(0, summary);
+                            }
+                            self.status_banner = Some("Clip uploaded successfully".to_string());
+                        }
+                        Err(err) => {
+                            entry.status = UploadStatus::Failed(err.clone());
+                            self.status_banner = Some(format!("Upload failed: {err}"));
+                        }
+                    }
+                }
+            }
+            WorkerEvent::VisibilityUpdated { clip_id, result } => match result {
+                Ok(summary) => {
+                    let is_pub = summary.visibility == ShareVisibility::Public;
+                    if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {
+                        entry.is_public = is_pub;
+                        if !summary.share_id.is_empty() {
+                            entry.share = Some(summary.clone().into());
+                        }
+                    }
+                    if let Some(remote) =
+                        self.remote_shares.iter_mut().find(|r| r.clip_id == clip_id)
+                    {
+                        *remote = summary;
+                    }
+                    self.server_error = None;
+                    self.status_banner = Some(format!(
+                        "Visibility updated to {}",
+                        if is_pub { "Public" } else { "Private" }
+                    ));
+                }
+                Err(err) => {
+                    self.server_error = Some(err.clone());
+                    self.status_banner = Some(format!("Visibility update failed: {err}"));
+                }
+            },
+            WorkerEvent::ShareCreated { clip_id, result } => match result {
+                Ok(resp) => {
+                    let info = CloudShareInfo {
+                        share_id: resp.share_id.clone(),
+                        url: resp.url.clone(),
+                        uploaded_at: resp.created_at,
+                        expires_at: resp.expires_at,
+                    };
+                    if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {
+                        entry.share = Some(info.clone());
+                        entry.is_public = resp.visibility == ShareVisibility::Public;
+                    }
+                    if let Some(remote) =
+                        self.remote_shares.iter_mut().find(|r| r.clip_id == clip_id)
+                    {
+                        remote.share_id = resp.share_id;
+                        remote.url = resp.url;
+                        remote.visibility = resp.visibility;
+                        remote.expires_at = resp.expires_at;
+                    }
+                    self.status_banner = Some("Share link created".to_string());
+                }
+                Err(err) => {
+                    self.server_error = Some(err.clone());
+                    self.status_banner = Some(format!("Create share failed: {err}"));
+                }
+            },
+            WorkerEvent::ShareRevoked {
+                clip_id,
+                share_id,
+                result,
+            } => match result {
+                Ok(()) => {
+                    if let Some(entry) = self.uploads.iter_mut().find(|u| u.clip_id == clip_id) {
+                        entry.share = None;
+                        entry.is_public = false;
+                    }
+                    if let Some(remote) = self
+                        .remote_shares
+                        .iter_mut()
+                        .find(|r| r.clip_id == clip_id || r.share_id == share_id)
+                    {
+                        remote.share_id.clear();
+                        remote.url.clear();
+                        remote.visibility = ShareVisibility::Private;
+                    }
+                    self.status_banner = Some("Share link revoked".to_string());
+                }
+                Err(err) => {
+                    self.server_error = Some(err.clone());
+                    self.status_banner = Some(format!("Revoke share failed: {err}"));
+                }
+            },
+            WorkerEvent::CaptureSourcesDiscovered {
+                monitors,
+                audio_devices,
+                app_audio,
+            } => {
+                self.available_monitors = monitors;
+                self.available_audio_devices = audio_devices;
+                self.available_app_audio = app_audio;
+            }
+            WorkerEvent::ServerHealthChecked {
+                ok,
+                error,
+                server_info,
+            } => {
+                self.server_health_ok = Some(ok);
+                self.server_error = error;
+                if let Some(info) = server_info {
+                    self.server_info = Some(info);
+                }
+            }
+            WorkerEvent::ServerMetadataLoaded {
+                server_info,
+                current_user,
+                quota,
+            } => {
+                if let Some(info) = server_info {
+                    self.server_info = Some(info);
+                }
+                if let Some(user) = current_user {
+                    self.current_user = Some(user);
+                }
+                if let Some(q) = quota {
+                    self.quota = Some(q);
+                }
+            }
+            WorkerEvent::ServerConnected(res) => match res {
+                Ok((url, token)) => {
+                    self.config.server_url = Some(url.clone());
+                    if let Some(tok) = token {
+                        self.config.api_token = Some(tok.clone());
+                        self.api_token_edit = rune::TextEdit::new(tok);
+                    }
+                    self.server_url_edit = rune::TextEdit::new(url.clone());
+                    self.server_connected = true;
+                    self.server_health_ok = Some(true);
+                    self.server_error = None;
+                    self.save_config();
+                    self.refresh_remote_shares();
+                    self.status_banner = Some(format!("Connected to {url}"));
+                }
+                Err(err) => {
+                    self.server_connected = false;
+                    self.server_health_ok = Some(false);
+                    self.server_error = Some(err.clone());
+                    self.status_banner = Some(format!("Server connection failed: {err}"));
+                }
+            },
+            WorkerEvent::RemoteSharesLoaded(res) => match res {
+                Ok(list) => {
+                    for entry in &mut self.uploads {
+                        if let Some(remote) = list.iter().find(|r| r.clip_id == entry.clip_id) {
+                            entry.is_public = remote.visibility == ShareVisibility::Public;
+                            entry.share = if remote.share_id.is_empty() {
+                                None
+                            } else {
+                                Some(remote.clone().into())
+                            };
+                        }
+                    }
+                    self.remote_shares = list;
+                    self.server_error = None;
+                }
+                Err(err) => {
+                    self.server_error = Some(err);
+                }
+            },
+            WorkerEvent::RemoteShareDeleted { clip_id, result } => {
+                self.confirm_remote_delete = None;
+                match result {
+                    Ok(()) => {
+                        self.remote_shares.retain(|s| s.clip_id != clip_id);
+                        self.uploads.retain(|u| u.clip_id != clip_id);
+                        if self.selected_upload_id == Some(clip_id) {
+                            self.selected_upload_id = None;
+                        }
+                        self.server_error = None;
+                        self.status_banner = Some("Deleted clip from remote server".to_string());
+                    }
+                    Err(err) => {
+                        self.server_error = Some(err.clone());
+                        self.status_banner = Some(format!("Remote delete failed: {err}"));
+                    }
+                }
+            }
+            WorkerEvent::MicTest(ev) => match ev {
+                MicTestEvent::PhaseChanged(phase) => {
+                    self.mic_test.phase = phase;
+                    if matches!(phase, MicTestPhase::Recording) {
+                        self.mic_test.error = None;
+                    }
+                }
+                MicTestEvent::Level {
+                    rms_dbfs,
+                    peak_dbfs,
+                    elapsed_ms,
+                } => {
+                    self.mic_test.rms_dbfs = rms_dbfs;
+                    self.mic_test.peak_dbfs = peak_dbfs;
+                    self.mic_test.elapsed_ms = elapsed_ms;
+                }
+                MicTestEvent::Recorded { summary } => {
+                    self.mic_test.rms_dbfs = summary.rms_dbfs;
+                    self.mic_test.peak_dbfs = summary.peak_dbfs;
+                    self.mic_test.feedback = Some(summary.feedback);
+                    self.mic_test.error = None;
+                    self.mic_test.diagnostic_summary = Some(summary);
+                }
+                MicTestEvent::PlaybackFinished => {
+                    self.mic_test.phase = MicTestPhase::Completed;
+                }
+                MicTestEvent::Error {
+                    feedback,
+                    message,
+                    summary,
+                } => {
+                    self.mic_test.phase = MicTestPhase::Error;
+                    self.mic_test.feedback = Some(feedback);
+                    self.mic_test.error = Some(message);
+                    if summary.is_some() {
+                        self.mic_test.diagnostic_summary = summary;
+                    }
+                }
+            },
+            WorkerEvent::Banner(msg) => {
+                self.status_banner = Some(msg);
+            }
+        }
     }
 
     /// Cycles capture target in the Recording view.
@@ -2222,28 +2251,30 @@ impl AppState {
         }
     }
 
-    /// Requests confirmation before deleting a remote share.
-    pub fn request_delete_remote_share(&mut self, share_id: String) {
-        self.confirm_remote_delete = Some(share_id);
+    /// Requests confirmation before deleting a remote clip.
+    pub fn request_delete_remote_share(&mut self, clip_id: ClipId) {
+        self.confirm_remote_delete = Some(clip_id);
     }
 
-    /// Cancels a pending remote share deletion.
+    /// Cancels a pending remote clip deletion.
     pub fn cancel_delete_remote_share(&mut self) {
         self.confirm_remote_delete = None;
     }
 
-    /// Confirms and dispatches remote share deletion.
+    /// Confirms and dispatches remote clip deletion.
     pub fn confirm_delete_remote_share(&mut self) {
-        let Some(share_id) = self.confirm_remote_delete.take() else {
+        let Some(clip_id) = self.confirm_remote_delete.take() else {
             return;
         };
         let Some(url) = self.config.server_url.clone().filter(|u| !u.is_empty()) else {
-            self.server_error = Some("No server URL configured".to_string());
+            let err = "No server URL configured".to_string();
+            self.server_error = Some(err.clone());
+            self.status_banner = Some(format!("Remote delete failed: {err}"));
             return;
         };
         if let Some(worker) = &self.worker {
             worker.send(WorkerCommand::DeleteRemoteShare {
-                share_id,
+                clip_id,
                 server_url: url,
                 api_token: self.config.api_token.clone(),
             });

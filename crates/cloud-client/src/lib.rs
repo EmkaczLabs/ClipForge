@@ -917,13 +917,13 @@ impl HttpCloudClient {
         parse_json_response(resp).await
     }
 
-    /// Updates visibility (`public` or `private`) for a clip or share.
+    /// Updates visibility (`public` or `private`) for a clip (`PATCH /api/v1/clips/{clip_id}`).
     pub async fn set_visibility(
         &self,
-        clip_or_share_id: &str,
+        clip_id: &str,
         visibility: ShareVisibility,
     ) -> Result<RemoteClipSummary> {
-        let clip_url = format!("{}/api/v1/clips/{}", self.base_url, clip_or_share_id);
+        let clip_url = format!("{}/api/v1/clips/{}", self.base_url, clip_id);
         let resp = self
             .apply_auth(self.client.patch(clip_url))
             .json(&UpdateClipRequest {
@@ -934,23 +934,20 @@ impl HttpCloudClient {
             .await
             .map_err(|e| ClipForgeError::Cloud(format!("set visibility failed: {e}")))?;
 
-        if resp.status().is_success() {
-            let dto: ClipDto = parse_json_response(resp).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(map_http_error(status, &text));
+        }
+        let raw = resp
+            .text()
+            .await
+            .map_err(|e| ClipForgeError::Serialization(format!("read visibility response: {e}")))?;
+        if let Ok(dto) = serde_json::from_str::<ClipDto>(&raw) {
             return Ok(dto.into());
         }
-
-        let legacy_url = format!(
-            "{}/api/v1/shares/{}/visibility",
-            self.base_url, clip_or_share_id
-        );
-        let legacy_resp = self
-            .apply_auth(self.client.patch(legacy_url))
-            .json(&serde_json::json!({ "visibility": visibility }))
-            .send()
-            .await
-            .map_err(|e| ClipForgeError::Cloud(format!("set visibility failed: {e}")))?;
-
-        parse_json_response(legacy_resp).await
+        serde_json::from_str::<RemoteClipSummary>(&raw)
+            .map_err(|e| ClipForgeError::Serialization(format!("decode visibility response: {e}")))
     }
 
     /// Creates or updates a share link for a clip (`POST /api/v1/clips/{id}/shares`).
@@ -995,8 +992,8 @@ impl HttpCloudClient {
     }
 
     /// Deletes a clip by clip ID (`DELETE /api/v1/clips/{id}`).
-    pub async fn delete_clip(&self, share_or_clip_id: &str) -> Result<()> {
-        let url = format!("{}/api/v1/clips/{}", self.base_url, share_or_clip_id);
+    pub async fn delete_clip(&self, clip_id: &str) -> Result<()> {
+        let url = format!("{}/api/v1/clips/{}", self.base_url, clip_id);
         let resp = self
             .apply_auth(self.client.delete(url))
             .send()
@@ -1351,5 +1348,152 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         assert_eq!(summary.share_id, "shr_1");
         assert_eq!(pcts.last(), Some(&100));
+    }
+
+    #[tokio::test]
+    async fn set_visibility_patches_clip_id_and_surfaces_http_errors() {
+        let now = Utc::now();
+        let clip_uuid = Uuid::new_v4();
+        let err_uuid = Uuid::new_v4();
+        let patch_path = format!("PATCH /api/v1/clips/{clip_uuid} ");
+        let err_path = format!("PATCH /api/v1/clips/{err_uuid} ");
+
+        let base_url = spawn_mock_server(move |req| {
+            let patch_path = patch_path.clone();
+            let err_path = err_path.clone();
+            async move {
+                let first_line = req.lines().next().unwrap_or("");
+                if first_line.starts_with(&patch_path) {
+                    assert!(req.contains(r#""visibility":"private""#));
+                    let dto = ClipDto {
+                        id: clip_uuid,
+                        owner_id: "u1".into(),
+                        title: "Clip".into(),
+                        game: None,
+                        duration_ms: 1000,
+                        width: 1920,
+                        height: 1080,
+                        fps: 60.0,
+                        size_bytes: 123,
+                        codec: "h264".into(),
+                        content_type: "video/mp4".into(),
+                        audio_tracks: vec![],
+                        tags: vec![],
+                        notes: None,
+                        visibility: ShareVisibility::Private,
+                        share_id: Some("shr_tok".into()),
+                        share_url: Some("http://localhost/c/shr_tok".into()),
+                        stream_url: None,
+                        thumbnail_url: None,
+                        created_at: now,
+                        uploaded_at: now,
+                        expires_at: None,
+                    };
+                    (200, serde_json::to_string(&dto).unwrap())
+                } else if first_line.starts_with(&err_path) {
+                    (
+                        403,
+                        r#"{"error":"forbidden","code":"forbidden","status":403}"#.into(),
+                    )
+                } else {
+                    (
+                        404,
+                        r#"{"error":"not found","code":"not_found","status":404}"#.into(),
+                    )
+                }
+            }
+        })
+        .await;
+
+        let client = HttpCloudClient::new(&base_url, Some("tok_test".into()));
+        let summary = client
+            .set_visibility(&clip_uuid.to_string(), ShareVisibility::Private)
+            .await
+            .expect("set_visibility should succeed");
+        assert_eq!(summary.clip_id, ClipId::from_uuid(clip_uuid));
+        assert_eq!(summary.share_id, "shr_tok");
+        assert_eq!(summary.visibility, ShareVisibility::Private);
+
+        let err = client
+            .set_visibility(&err_uuid.to_string(), ShareVisibility::Public)
+            .await
+            .expect_err("403 must not be masked by legacy fallback");
+        assert!(err.to_string().contains("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn delete_clip_targets_clip_endpoint_and_list_clips_maps_unshared_clip() {
+        let now = Utc::now();
+        let clip_uuid = Uuid::new_v4();
+        let fail_uuid = Uuid::new_v4();
+        let del_ok = format!("DELETE /api/v1/clips/{clip_uuid} ");
+        let del_fail = format!("DELETE /api/v1/clips/{fail_uuid} ");
+
+        let base_url = spawn_mock_server(move |req| {
+            let del_ok = del_ok.clone();
+            let del_fail = del_fail.clone();
+            async move {
+                let first_line = req.lines().next().unwrap_or("");
+                if first_line.starts_with(&del_ok) {
+                    (204, String::new())
+                } else if first_line.starts_with(&del_fail) {
+                    (
+                        502,
+                        r#"{"error":"s3 delete failed","code":"storage_error","status":502}"#
+                            .into(),
+                    )
+                } else if first_line.starts_with("GET /api/v1/clips ") {
+                    let dto = ClipDto {
+                        id: clip_uuid,
+                        owner_id: "u1".into(),
+                        title: "Unshared Clip".into(),
+                        game: None,
+                        duration_ms: 2000,
+                        width: 1920,
+                        height: 1080,
+                        fps: 60.0,
+                        size_bytes: 456,
+                        codec: "h264".into(),
+                        content_type: "video/mp4".into(),
+                        audio_tracks: vec![],
+                        tags: vec![],
+                        notes: None,
+                        visibility: ShareVisibility::Private,
+                        share_id: None,
+                        share_url: None,
+                        stream_url: None,
+                        thumbnail_url: None,
+                        created_at: now,
+                        uploaded_at: now,
+                        expires_at: None,
+                    };
+                    (200, serde_json::to_string(&vec![dto]).unwrap())
+                } else {
+                    (
+                        404,
+                        r#"{"error":"not found","code":"not_found","status":404}"#.into(),
+                    )
+                }
+            }
+        })
+        .await;
+
+        let client = HttpCloudClient::new(&base_url, Some("tok_test".into()));
+        let clips = client.list_clips(None, None).await.expect("list_clips");
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].clip_id, ClipId::from_uuid(clip_uuid));
+        assert!(clips[0].share_id.is_empty());
+        assert_eq!(clips[0].visibility, ShareVisibility::Private);
+
+        client
+            .delete_clip(&clip_uuid.to_string())
+            .await
+            .expect("delete_clip 204");
+
+        let err = client
+            .delete_clip(&fail_uuid.to_string())
+            .await
+            .expect_err("502 must surface error");
+        assert!(err.to_string().contains("s3 delete failed"));
     }
 }
