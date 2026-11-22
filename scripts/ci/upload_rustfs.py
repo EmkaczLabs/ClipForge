@@ -216,6 +216,85 @@ class RustFSClient:
         finally:
             conn.close()
 
+    def get_object(self, key: str) -> tuple[int, dict[str, str], bytes]:
+        """Send GetObject and return (status_code, lowercase_headers, body_bytes)."""
+        path, headers = build_sigv4_headers(
+            method="GET",
+            endpoint=self.config.endpoint,
+            bucket=self.config.bucket,
+            key=key,
+            region=self.config.region,
+            access_key_id=self.config.access_key_id,
+            secret_access_key=self.config.secret_access_key,
+            payload_sha256=EMPTY_SHA256,
+        )
+        conn = self._open_connection()
+        try:
+            conn.request("GET", path, body=b"", headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+            resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+            return resp.status, resp_headers, body
+        finally:
+            conn.close()
+
+    def verify_object_sha256(
+        self,
+        key: str,
+        expected_sha256: str,
+        expected_size: int,
+        dest_path: Path | None = None,
+    ) -> None:
+        """Stream GetObject, optionally write to dest_path, and verify size + SHA-256."""
+        path, headers = build_sigv4_headers(
+            method="GET",
+            endpoint=self.config.endpoint,
+            bucket=self.config.bucket,
+            key=key,
+            region=self.config.region,
+            access_key_id=self.config.access_key_id,
+            secret_access_key=self.config.secret_access_key,
+            payload_sha256=EMPTY_SHA256,
+        )
+        conn = self._open_connection()
+        try:
+            conn.request("GET", path, body=b"", headers=headers)
+            resp = conn.getresponse()
+            if resp.status != 200:
+                resp.read()
+                raise UploadError(
+                    f"GetObject failed for {self.config.bucket}/{key}: status {resp.status}"
+                )
+            hasher = hashlib.sha256()
+            actual_size = 0
+            out_handle = dest_path.open("wb") if dest_path is not None else None
+            try:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+                    actual_size += len(chunk)
+                    if out_handle is not None:
+                        out_handle.write(chunk)
+            finally:
+                if out_handle is not None:
+                    out_handle.close()
+        finally:
+            conn.close()
+
+        actual_sha256 = hasher.hexdigest()
+        if actual_size != expected_size:
+            raise UploadError(
+                f"GetObject size mismatch for {self.config.bucket}/{key}: "
+                f"expected {expected_size}, got {actual_size}"
+            )
+        if actual_sha256 != expected_sha256:
+            raise UploadError(
+                f"GetObject SHA-256 mismatch for {self.config.bucket}/{key}: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
+
     def put_bytes(
         self,
         key: str,
@@ -387,7 +466,7 @@ def build_key_prefix(
     safe_commit = _sanitize_segment(commit, "commit")
     safe_run_id = _sanitize_segment(run_id, "run-id")
     if smoke_test:
-        return f"ci/smoke/{safe_commit}/{safe_run_id}/"
+        return f"ci/smoke-tests/{safe_commit}/{safe_run_id}/"
 
     safe_platform = _sanitize_segment(platform, "platform")
     if mode == "ci":
@@ -397,7 +476,7 @@ def build_key_prefix(
             date_str or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d"),
             "date",
         )
-        return f"nightly/{safe_platform}/{safe_date}/"
+        return f"nightly/{safe_platform}/{safe_date}/{safe_run_id}/"
     if mode == "releases":
         if not version:
             raise UploadError("--version is required when --mode=releases")
@@ -416,6 +495,7 @@ def upload_artifacts(
     platform: str,
     workflow: str,
     timestamp: str | None = None,
+    verify_download: bool = False,
 ) -> list[str]:
     """Upload artifacts, their .sha256 files, and build-metadata.json."""
     if not artifact_paths:
@@ -496,6 +576,19 @@ def upload_artifacts(
         content_type="application/json",
     )
     uploaded_keys.append(metadata_key)
+
+    if verify_download:
+        for entry in metadata_artifacts:
+            filename = str(entry["filename"])
+            expected_sha = str(entry["sha256"])
+            expected_size = int(entry["size_bytes"])  # type: ignore[arg-type]
+            key = f"{prefix}{filename}"
+            client.verify_object_sha256(key, expected_sha, expected_size)
+            LOGGER.info("Verified GetObject SHA-256 for %s/%s", client.config.bucket, key)
+        meta_sha = hashlib.sha256(metadata_bytes).hexdigest()
+        client.verify_object_sha256(metadata_key, meta_sha, len(metadata_bytes))
+        LOGGER.info("Verified GetObject SHA-256 for %s/%s", client.config.bucket, metadata_key)
+
     return uploaded_keys
 
 
@@ -506,7 +599,7 @@ def run_smoke_test(
     run_id: str,
     workflow: str,
 ) -> list[str]:
-    """Upload and verify a small non-sensitive smoke-test object under ci/smoke/."""
+    """Run end-to-end SigV4 smoke test (404, PutObject, HeadObject, GetObject SHA-256, immutability)."""
     prefix = build_key_prefix(
         mode="ci",
         platform="smoke",
@@ -514,6 +607,14 @@ def run_smoke_test(
         run_id=run_id,
         smoke_test=True,
     )
+    missing_key = f"{prefix}nonexistent-check.json"
+    missing_status, _ = client.head_object(missing_key)
+    if missing_status != 404:
+        raise UploadError(
+            f"Expected 404 for nonexistent key {client.config.bucket}/{missing_key}, got {missing_status}"
+        )
+    LOGGER.info("Verified missing-object HeadObject 404 for %s/%s", client.config.bucket, missing_key)
+
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload = (
         json.dumps(
@@ -529,8 +630,41 @@ def run_smoke_test(
         )
         + "\n"
     ).encode("utf-8")
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
     key = f"{prefix}smoke-test.json"
     client.upload_immutable_bytes(key, payload, content_type="application/json")
+
+    status, headers, downloaded = client.get_object(key)
+    if status != 200:
+        raise UploadError(
+            f"Smoke-test GetObject failed for {client.config.bucket}/{key}: status {status}"
+        )
+    actual_sha256 = hashlib.sha256(downloaded).hexdigest()
+    if actual_sha256 != expected_sha256 or downloaded != payload:
+        raise UploadError(
+            f"Smoke-test GetObject integrity mismatch for {client.config.bucket}/{key}: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    LOGGER.info(
+        "Verified GetObject 200 + SHA-256 (%s) + size (%d bytes, content-type=%s) for %s/%s",
+        actual_sha256,
+        len(downloaded),
+        headers.get("content-type", "unknown"),
+        client.config.bucket,
+        key,
+    )
+
+    try:
+        client.upload_immutable_bytes(key, b"overwrite-attempt", content_type="application/json")
+    except UploadError as exc:
+        if "Refusing to overwrite immutable object" not in str(exc):
+            raise
+        LOGGER.info("Verified immutable-key overwrite refusal for %s/%s", client.config.bucket, key)
+    else:
+        raise UploadError(
+            f"Immutability check failed: second upload to {client.config.bucket}/{key} was not refused"
+        )
+
     return [key]
 
 
@@ -585,7 +719,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--smoke-test",
         action="store_true",
-        help="Upload and verify a small non-sensitive object under ci/smoke/<commit>/<run-id>/.",
+        help="Upload and verify a small non-sensitive object under ci/smoke-tests/<commit>/<run-id>/.",
+    )
+    parser.add_argument(
+        "--verify-download",
+        action="store_true",
+        help="Verify uploaded objects by streaming GetObject and checking SHA-256 + byte size.",
+    )
+    parser.add_argument(
+        "--download",
+        default=None,
+        help="Download an object key from RustFS to --output and verify its SHA-256.",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Destination file path for --download.",
+    )
+    parser.add_argument(
+        "--expected-sha256",
+        default=None,
+        help="Expected SHA-256 hex digest for --download verification.",
     )
     return parser.parse_args(argv)
 
@@ -599,6 +753,44 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = S3Config.from_env()
         client = RustFSClient(config)
+        if args.download:
+            if not args.output:
+                raise UploadError("--output is required with --download.")
+            head_status, head_headers = client.head_object(args.download)
+            if head_status != 200:
+                raise UploadError(
+                    f"HeadObject failed for {config.bucket}/{args.download}: status {head_status}"
+                )
+            expected_size = int(head_headers["content-length"])
+            dest_path = Path(args.output)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            if args.expected_sha256:
+                client.verify_object_sha256(
+                    args.download,
+                    args.expected_sha256.strip().lower(),
+                    expected_size,
+                    dest_path=dest_path,
+                )
+            else:
+                status, _, body = client.get_object(args.download)
+                if status != 200:
+                    raise UploadError(
+                        f"GetObject failed for {config.bucket}/{args.download}: status {status}"
+                    )
+                if len(body) != expected_size:
+                    raise UploadError(
+                        f"GetObject size mismatch for {config.bucket}/{args.download}: "
+                        f"expected {expected_size}, got {len(body)}"
+                    )
+                dest_path.write_bytes(body)
+            LOGGER.info(
+                "Downloaded %s/%s (%d bytes) to %s",
+                config.bucket,
+                args.download,
+                expected_size,
+                dest_path,
+            )
+            return 0
         if args.smoke_test:
             keys = run_smoke_test(
                 client,
@@ -625,6 +817,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_id=args.run_id,
                 platform=args.platform,
                 workflow=args.workflow,
+                verify_download=args.verify_download,
             )
         LOGGER.info("Completed %d object upload(s) to %s", len(keys), config.endpoint)
         return 0

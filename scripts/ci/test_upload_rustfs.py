@@ -178,6 +178,38 @@ def make_handler(state: MockS3State):
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
+        def do_GET(self) -> None:  # noqa: N802
+            headers = self._lower_headers()
+            with state.lock:
+                state.requests.append(("GET", self.path))
+                if not verify_sigv4_request(
+                    method="GET",
+                    path=self.path,
+                    headers=headers,
+                    body=b"",
+                    access_key=TEST_ACCESS_KEY,
+                    secret_key=TEST_SECRET_KEY,
+                    region=TEST_REGION,
+                ):
+                    state.sigv4_failures.append(f"GET {self.path}")
+                    self.send_response(403)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
+                data = state.objects.get(self.path)
+                if data is None:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Type", "application/octet-stream")
+                self.end_headers()
+                self.wfile.write(data)
+
     return MockS3Handler
 
 
@@ -298,7 +330,7 @@ class UploadRustFSTests(unittest.TestCase):
                 run_id="42",
                 date_str="2026-11-22",
             ),
-            "nightly/linux-x64/2026-11-22/",
+            "nightly/linux-x64/2026-11-22/42/",
         )
         self.assertEqual(
             upload_rustfs.build_key_prefix(
@@ -318,7 +350,7 @@ class UploadRustFSTests(unittest.TestCase):
                 run_id="42",
                 smoke_test=True,
             ),
-            "ci/smoke/deadbeef/42/",
+            "ci/smoke-tests/deadbeef/42/",
         )
 
         smoke_keys = upload_rustfs.run_smoke_test(
@@ -327,8 +359,54 @@ class UploadRustFSTests(unittest.TestCase):
             run_id="42",
             workflow="smoke",
         )
-        self.assertEqual(smoke_keys, ["ci/smoke/deadbeef/42/smoke-test.json"])
+        self.assertEqual(smoke_keys, ["ci/smoke-tests/deadbeef/42/smoke-test.json"])
         self.assertEqual(self.state.sigv4_failures, [])
+
+    def test_verify_download_and_cli_download(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact = Path(tmpdir) / "bundle.zip"
+            payload = b"PK\x03\x04rustfs-download-test" * 32
+            artifact.write_bytes(payload)
+            expected_sha = hashlib.sha256(payload).hexdigest()
+
+            prefix = upload_rustfs.build_key_prefix(
+                mode="ci",
+                platform="windows-x64",
+                commit="def4567",
+                run_id="555",
+            )
+            upload_rustfs.upload_artifacts(
+                self.client,
+                prefix=prefix,
+                artifact_paths=[artifact],
+                commit="def4567",
+                run_id="555",
+                platform="windows-x64",
+                workflow="CI",
+                verify_download=True,
+            )
+
+            out_file = Path(tmpdir) / "downloaded" / "bundle.zip"
+            env = {
+                "RUSTFS_ENDPOINT": self.endpoint,
+                "RUSTFS_BUCKET": TEST_BUCKET,
+                "RUSTFS_REGION": TEST_REGION,
+                "RUSTFS_ACCESS_KEY_ID": TEST_ACCESS_KEY,
+                "RUSTFS_SECRET_ACCESS_KEY": TEST_SECRET_KEY,
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                rc = upload_rustfs.main(
+                    [
+                        "--download",
+                        f"{prefix}bundle.zip",
+                        "--output",
+                        str(out_file),
+                        "--expected-sha256",
+                        expected_sha,
+                    ]
+                )
+                self.assertEqual(rc, 0)
+            self.assertEqual(out_file.read_bytes(), payload)
 
     def test_zero_secret_leakage_in_logs_and_errors(self) -> None:
         log_stream = io.StringIO()

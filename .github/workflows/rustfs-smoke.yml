@@ -1,0 +1,37 @@
+name: RustFS Smoke Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rustfs-smoke:
+    runs-on: [self-hosted, Linux, X64, clipforge-linux-build]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run RustFS unit tests
+        run: python3 -m unittest scripts/ci/test_upload_rustfs.py
+      - name: Run live RustFS S3 smoke test
+        env:
+          RUSTFS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY_ID }}
+          RUSTFS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_ACCESS_KEY }}
+          RUSTFS_ENDPOINT: https://s3.emkacz.dev
+          RUSTFS_BUCKET: clipforge-builds
+        run: |
+          set -euo pipefail
+          if [ -z "${RUSTFS_ACCESS_KEY_ID}" ] || [ -z "${RUSTFS_SECRET_ACCESS_KEY}" ]; then
+            echo "ERROR: RUSTFS_ACCESS_KEY_ID and RUSTFS_SECRET_ACCESS_KEY secrets must be configured."
+            exit 1
+          fi
+          python3 scripts/ci/upload_rustfs.py \
+            --smoke-test \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --workflow "${{ github.workflow }}"
