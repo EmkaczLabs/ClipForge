@@ -113,7 +113,7 @@ function New-SigV4Request {
         "x-amz-content-sha256" = $PayloadSha256
         "x-amz-date" = $amzDate
     }
-    if ($null -ne $ContentType) {
+    if (-not [string]::IsNullOrEmpty($ContentType)) {
         $headersToSign["content-type"] = $ContentType
     }
     if ($null -ne $ContentLength) {
