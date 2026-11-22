@@ -1,13 +1,120 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 #[cfg(not(target_os = "windows"))]
 use clipforge_common::ClipForgeError;
-use clipforge_common::{CaptureBackend, CaptureConfig, CaptureEvent, CaptureStatus, Result};
+use clipforge_common::{
+    BorderlessCaptureStatus, CaptureBackend, CaptureConfig, CaptureEvent, CaptureStatus, Result,
+};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::audio::{is_mic_source, parse_routed_audio_source};
+
+/// Tracks cached borderless capture permission status so denied prompts are not repeated
+/// unless `force_retry` is explicitly requested.
+#[derive(Debug, Default)]
+pub struct BorderlessAccessState {
+    status: std::sync::Mutex<BorderlessCaptureStatus>,
+}
+
+impl BorderlessAccessState {
+    /// Creates a new [`BorderlessAccessState`] initialized to [`BorderlessCaptureStatus::Unknown`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the currently cached [`BorderlessCaptureStatus`].
+    pub fn current(&self) -> BorderlessCaptureStatus {
+        *self.status.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Overwrites the cached [`BorderlessCaptureStatus`].
+    pub fn set(&self, next: BorderlessCaptureStatus) {
+        *self.status.lock().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+
+    /// Resolves borderless access using `request_fn` only when `hide_windows_capture_border`
+    /// is `true` and the cached status permits prompting (never re-prompting after denial
+    /// unless `force_retry` is `true`).
+    pub fn resolve_with<F>(
+        &self,
+        hide_windows_capture_border: bool,
+        force_retry: bool,
+        request_fn: F,
+    ) -> BorderlessCaptureStatus
+    where
+        F: FnOnce() -> BorderlessCaptureStatus,
+    {
+        let current = self.current();
+        if !current.should_request_access(hide_windows_capture_border, force_retry) {
+            return current;
+        }
+        let next = request_fn();
+        self.set(next);
+        next
+    }
+}
+
+static BORDERLESS_ACCESS_STATE: OnceLock<BorderlessAccessState> = OnceLock::new();
+
+fn global_borderless_state() -> &'static BorderlessAccessState {
+    BORDERLESS_ACCESS_STATE.get_or_init(BorderlessAccessState::new)
+}
+
+/// Probes the current borderless WGC capture status without triggering a permission prompt.
+///
+/// Returns [`BorderlessCaptureStatus::Unsupported`] on non-Windows hosts.
+pub fn probe_borderless_capture_status() -> BorderlessCaptureStatus {
+    #[cfg(target_os = "windows")]
+    {
+        global_borderless_state().current()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        BorderlessCaptureStatus::Unsupported
+    }
+}
+
+/// Requests Windows borderless capture permission (`GraphicsCaptureAccessKind::Borderless`)
+/// when not yet denied, or when `force_retry` is `true`.
+///
+/// Never blocks the caller's async runtime thread and returns
+/// [`BorderlessCaptureStatus::Unsupported`] on non-Windows hosts.
+pub async fn request_borderless_access(force_retry: bool) -> BorderlessCaptureStatus {
+    request_borderless_access_for_config(true, force_retry).await
+}
+
+/// Requests Windows borderless capture permission only if `hide_windows_capture_border` is `true`
+/// and either permission has not been denied yet or `force_retry` is `true`.
+pub async fn request_borderless_access_for_config(
+    hide_windows_capture_border: bool,
+    force_retry: bool,
+) -> BorderlessCaptureStatus {
+    #[cfg(target_os = "windows")]
+    {
+        let state = global_borderless_state();
+        let current = state.current();
+        if !current.should_request_access(hide_windows_capture_border, force_retry) {
+            return current;
+        }
+        let next =
+            tokio::task::spawn_blocking(crate::windows_wgc::request_borderless_access_blocking)
+                .await
+                .unwrap_or(BorderlessCaptureStatus::Unsupported);
+        state.set(next);
+        next
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (
+            hide_windows_capture_border,
+            force_retry,
+            global_borderless_state(),
+        );
+        BorderlessCaptureStatus::Unsupported
+    }
+}
 
 /// Resolved WASAPI loopback & microphone device selection from `CaptureConfig::audio_sources`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -65,6 +172,7 @@ struct ActiveWindowsSession {
 /// [`CaptureBackend`] implementation for Windows using WGC + WASAPI + FFmpeg.
 pub struct WindowsCaptureBackend {
     status: Arc<Mutex<CaptureStatus>>,
+    borderless_status: Arc<Mutex<BorderlessCaptureStatus>>,
     #[cfg(target_os = "windows")]
     session: Arc<Mutex<Option<ActiveWindowsSession>>>,
     events: broadcast::Sender<CaptureEvent>,
@@ -82,15 +190,33 @@ impl WindowsCaptureBackend {
         let (events, _) = broadcast::channel(64);
         Self {
             status: Arc::new(Mutex::new(CaptureStatus::Idle)),
+            borderless_status: Arc::new(Mutex::new(probe_borderless_capture_status())),
             #[cfg(target_os = "windows")]
             session: Arc::new(Mutex::new(None)),
             events,
         }
     }
 
+    /// Returns the most recently observed [`BorderlessCaptureStatus`].
+    pub async fn borderless_status(&self) -> BorderlessCaptureStatus {
+        *self.borderless_status.lock().await
+    }
+
     async fn set_status(&self, new_status: CaptureStatus) {
         *self.status.lock().await = new_status.clone();
         let _ = self.events.send(CaptureEvent::StatusChanged(new_status));
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    async fn set_borderless_status(&self, next: BorderlessCaptureStatus) {
+        let mut guard = self.borderless_status.lock().await;
+        if *guard != next {
+            *guard = next;
+            drop(guard);
+            let _ = self
+                .events
+                .send(CaptureEvent::BorderlessCaptureStatusChanged(next));
+        }
     }
 }
 
@@ -121,6 +247,7 @@ mod win_impl {
         }
 
         async fn start_wgc_and_wasapi(
+            &self,
             config: &CaptureConfig,
         ) -> Result<(
             WgcCaptureHandle,
@@ -130,20 +257,46 @@ mod win_impl {
             Option<WasapiCaptureHandle>,
             Option<mpsc::Receiver<CapturedAudioChunk>>,
         )> {
+            let borderless_status = if config.hide_windows_capture_border {
+                let status = super::request_borderless_access_for_config(true, false).await;
+                self.set_borderless_status(status).await;
+                if status != clipforge_common::BorderlessCaptureStatus::Granted {
+                    tracing::info!(
+                        ?status,
+                        "borderless WGC capture not granted; continuing with system border"
+                    );
+                }
+                status
+            } else {
+                super::probe_borderless_capture_status()
+            };
+
             let fps = config.fps.max(1);
             let (video_tx, video_rx) = mpsc::channel(8);
+            let hide_border = config.hide_windows_capture_border;
             let wgc = match &config.capture_target {
-                CaptureTarget::FocusedWindow => {
-                    WgcCaptureHandle::start_focused_window(fps, video_tx)?
-                }
-                CaptureTarget::Monitor(name) => {
-                    WgcCaptureHandle::start_monitor(Some(name.as_str()), fps, video_tx)?
-                }
+                CaptureTarget::FocusedWindow => WgcCaptureHandle::start_focused_window(
+                    fps,
+                    hide_border,
+                    borderless_status,
+                    video_tx,
+                )?,
+                CaptureTarget::Monitor(name) => WgcCaptureHandle::start_monitor(
+                    Some(name.as_str()),
+                    fps,
+                    hide_border,
+                    borderless_status,
+                    video_tx,
+                )?,
                 CaptureTarget::PrimaryScreen
                 | CaptureTarget::Portal
-                | CaptureTarget::Region { .. } => {
-                    WgcCaptureHandle::start_monitor(None, fps, video_tx)?
-                }
+                | CaptureTarget::Region { .. } => WgcCaptureHandle::start_monitor(
+                    None,
+                    fps,
+                    hide_border,
+                    borderless_status,
+                    video_tx,
+                )?,
             };
 
             let audio_sel = select_windows_audio_devices(&config.audio_sources);
@@ -187,7 +340,7 @@ mod win_impl {
             tokio::fs::create_dir_all(&config.output_dir).await?;
 
             let (wgc, video_rx, loopback, loopback_rx, mic, mic_rx) =
-                Self::start_wgc_and_wasapi(config).await?;
+                self.start_wgc_and_wasapi(config).await?;
             let (width, height) = wgc.dimensions();
             if width == 0 || height == 0 {
                 return Err(ClipForgeError::CaptureFailed(
@@ -259,7 +412,7 @@ mod win_impl {
             let output_path = config.output_dir.join(format!("Recording_{stamp}.{ext}"));
 
             let (wgc, video_rx, loopback, loopback_rx, mic, mic_rx) =
-                Self::start_wgc_and_wasapi(config).await?;
+                self.start_wgc_and_wasapi(config).await?;
             let (width, height) = wgc.dimensions();
             if width == 0 || height == 0 {
                 return Err(ClipForgeError::CaptureFailed(
@@ -455,5 +608,98 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ClipForgeError::CaptureUnavailable(_)));
+    }
+
+    #[test]
+    fn borderless_access_state_does_not_reprompt_after_denial_without_force_retry() {
+        let state = BorderlessAccessState::new();
+        assert_eq!(state.current(), BorderlessCaptureStatus::Unknown);
+
+        let mut calls = 0u32;
+        // When hide_windows_capture_border is false, never prompt.
+        let s = state.resolve_with(false, false, || {
+            calls += 1;
+            BorderlessCaptureStatus::Granted
+        });
+        assert_eq!(s, BorderlessCaptureStatus::Unknown);
+        assert_eq!(calls, 0);
+
+        // First prompt returns DeniedByUser.
+        let s = state.resolve_with(true, false, || {
+            calls += 1;
+            BorderlessCaptureStatus::DeniedByUser
+        });
+        assert_eq!(s, BorderlessCaptureStatus::DeniedByUser);
+        assert_eq!(calls, 1);
+
+        // Subsequent call with force_retry = false must NOT re-prompt.
+        let s = state.resolve_with(true, false, || {
+            calls += 1;
+            BorderlessCaptureStatus::Granted
+        });
+        assert_eq!(s, BorderlessCaptureStatus::DeniedByUser);
+        assert_eq!(calls, 1);
+
+        // Explicit force_retry = true re-prompts and updates state.
+        let s = state.resolve_with(true, true, || {
+            calls += 1;
+            BorderlessCaptureStatus::Granted
+        });
+        assert_eq!(s, BorderlessCaptureStatus::Granted);
+        assert_eq!(calls, 2);
+
+        // Once Granted, even force_retry = true does not re-prompt.
+        let s = state.resolve_with(true, true, || {
+            calls += 1;
+            BorderlessCaptureStatus::DeniedBySystem
+        });
+        assert_eq!(s, BorderlessCaptureStatus::Granted);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn borderless_access_state_does_not_reprompt_after_system_denial_or_unsupported() {
+        let state = BorderlessAccessState::new();
+        let mut calls = 0u32;
+
+        let s = state.resolve_with(true, false, || {
+            calls += 1;
+            BorderlessCaptureStatus::DeniedBySystem
+        });
+        assert_eq!(s, BorderlessCaptureStatus::DeniedBySystem);
+        assert_eq!(calls, 1);
+
+        let s = state.resolve_with(true, false, || {
+            calls += 1;
+            BorderlessCaptureStatus::Granted
+        });
+        assert_eq!(s, BorderlessCaptureStatus::DeniedBySystem);
+        assert_eq!(calls, 1);
+
+        state.set(BorderlessCaptureStatus::Unsupported);
+        let s = state.resolve_with(true, true, || {
+            calls += 1;
+            BorderlessCaptureStatus::Granted
+        });
+        assert_eq!(s, BorderlessCaptureStatus::Unsupported);
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn backend_emits_borderless_status_change_events() {
+        let backend = WindowsCaptureBackend::new();
+        let mut rx = backend.subscribe();
+        backend
+            .set_borderless_status(BorderlessCaptureStatus::Granted)
+            .await;
+        assert_eq!(
+            backend.borderless_status().await,
+            BorderlessCaptureStatus::Granted
+        );
+        let ev = rx.recv().await.expect("event");
+        assert_eq!(
+            ev,
+            CaptureEvent::BorderlessCaptureStatusChanged(BorderlessCaptureStatus::Granted)
+        );
     }
 }

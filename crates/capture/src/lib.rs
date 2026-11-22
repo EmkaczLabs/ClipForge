@@ -32,7 +32,9 @@ pub use hotkey::{
     parse_windows_hotkey, select_hotkey_backend,
 };
 pub use windows_backend::{
-    WindowsAudioSelection, WindowsCaptureBackend, select_windows_audio_devices,
+    BorderlessAccessState, WindowsAudioSelection, WindowsCaptureBackend,
+    probe_borderless_capture_status, request_borderless_access,
+    request_borderless_access_for_config, select_windows_audio_devices,
 };
 pub use windows_encoder::{
     CREATE_NO_WINDOW, WindowsEncoderParams, WindowsOutputMode, build_windows_ffmpeg_args,
@@ -45,4 +47,6 @@ pub use windows_replay::{
     compute_replay_ring_slots, container_extension, order_replay_segments,
 };
 
-pub use clipforge_common::{CaptureBackend, CaptureConfig, CaptureEvent, CaptureStatus};
+pub use clipforge_common::{
+    BorderlessCaptureStatus, CaptureBackend, CaptureConfig, CaptureEvent, CaptureStatus,
+};

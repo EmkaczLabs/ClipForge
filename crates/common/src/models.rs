@@ -181,6 +181,8 @@ pub struct CaptureConfig {
     pub audio_sources: Vec<String>,
     pub restart_replay_on_save: bool,
     pub restore_portal_session: bool,
+    #[serde(default = "default_true")]
+    pub hide_windows_capture_border: bool,
 }
 
 impl Default for CaptureConfig {
@@ -200,6 +202,45 @@ impl Default for CaptureConfig {
             audio_sources: vec!["default_output".to_string()],
             restart_replay_on_save: false,
             restore_portal_session: true,
+            hide_windows_capture_border: true,
+        }
+    }
+}
+
+/// Permission and capability status for borderless Windows Graphics Capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BorderlessCaptureStatus {
+    #[default]
+    Unknown,
+    Granted,
+    DeniedByUser,
+    DeniedBySystem,
+    Unsupported,
+}
+
+impl BorderlessCaptureStatus {
+    /// Returns `true` when borderless capture access was denied by user or system policy.
+    pub fn is_denied(self) -> bool {
+        matches!(self, Self::DeniedByUser | Self::DeniedBySystem)
+    }
+
+    /// Returns `true` when borderless access should be requested for the given config and retry flag.
+    ///
+    /// Never re-prompts after a denial unless `force_retry` is `true`, and never prompts when
+    /// `hide_windows_capture_border` is `false`.
+    pub fn should_request_access(
+        self,
+        hide_windows_capture_border: bool,
+        force_retry: bool,
+    ) -> bool {
+        if !hide_windows_capture_border {
+            return false;
+        }
+        match self {
+            Self::Unknown => true,
+            Self::DeniedByUser | Self::DeniedBySystem => force_retry,
+            Self::Granted | Self::Unsupported => false,
         }
     }
 }
@@ -227,6 +268,7 @@ pub enum CaptureStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CaptureEvent {
     StatusChanged(CaptureStatus),
+    BorderlessCaptureStatusChanged(BorderlessCaptureStatus),
     ReplaySaved {
         path: PathBuf,
         saved_at: DateTime<Utc>,
@@ -357,9 +399,41 @@ mod tests {
     #[test]
     fn capture_config_json_roundtrip() {
         let cfg = CaptureConfig::default();
+        assert!(cfg.hide_windows_capture_border);
         let json = serde_json::to_string(&cfg).expect("serialize");
         let decoded: CaptureConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(cfg, decoded);
+    }
+
+    #[test]
+    fn capture_config_backward_compat_defaults_hide_border_true() {
+        let mut value = serde_json::to_value(CaptureConfig::default()).expect("to_value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("hide_windows_capture_border");
+        let decoded: CaptureConfig = serde_json::from_value(value).expect("deserialize legacy");
+        assert!(decoded.hide_windows_capture_border);
+    }
+
+    #[test]
+    fn borderless_capture_status_retry_policy() {
+        assert!(BorderlessCaptureStatus::Unknown.should_request_access(true, false));
+        assert!(!BorderlessCaptureStatus::Unknown.should_request_access(false, true));
+
+        assert!(!BorderlessCaptureStatus::Granted.should_request_access(true, false));
+        assert!(!BorderlessCaptureStatus::Granted.should_request_access(true, true));
+
+        assert!(!BorderlessCaptureStatus::Unsupported.should_request_access(true, false));
+        assert!(!BorderlessCaptureStatus::Unsupported.should_request_access(true, true));
+
+        assert!(BorderlessCaptureStatus::DeniedByUser.is_denied());
+        assert!(!BorderlessCaptureStatus::DeniedByUser.should_request_access(true, false));
+        assert!(BorderlessCaptureStatus::DeniedByUser.should_request_access(true, true));
+
+        assert!(BorderlessCaptureStatus::DeniedBySystem.is_denied());
+        assert!(!BorderlessCaptureStatus::DeniedBySystem.should_request_access(true, false));
+        assert!(BorderlessCaptureStatus::DeniedBySystem.should_request_access(true, true));
     }
 
     #[test]

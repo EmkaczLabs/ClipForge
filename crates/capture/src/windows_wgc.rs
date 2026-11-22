@@ -6,15 +6,17 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use clipforge_common::{ClipForgeError, Result};
+use clipforge_common::{BorderlessCaptureStatus, ClipForgeError, Result};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    Direct3D11CaptureFramePool, GraphicsCaptureAccess, GraphicsCaptureAccessKind,
+    GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus;
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
@@ -271,6 +273,86 @@ fn is_device_lost_hr(hr: windows::core::HRESULT) -> bool {
     hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET
 }
 
+fn map_app_capability_access_status(status: AppCapabilityAccessStatus) -> BorderlessCaptureStatus {
+    match status {
+        AppCapabilityAccessStatus::Allowed => BorderlessCaptureStatus::Granted,
+        AppCapabilityAccessStatus::DeniedByUser | AppCapabilityAccessStatus::UserPromptRequired => {
+            BorderlessCaptureStatus::DeniedByUser
+        }
+        AppCapabilityAccessStatus::DeniedBySystem | AppCapabilityAccessStatus::NotDeclaredByApp => {
+            BorderlessCaptureStatus::DeniedBySystem
+        }
+        _ => BorderlessCaptureStatus::Unsupported,
+    }
+}
+
+/// Requests `GraphicsCaptureAccessKind::Borderless` permission synchronously on a WinRT-initialized thread.
+pub(crate) fn request_borderless_access_blocking() -> BorderlessCaptureStatus {
+    let _ro_guard = match RoInitGuard::new_multithreaded() {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            warn!(error = %err, "WinRT initialization failed while requesting borderless capture access");
+            return BorderlessCaptureStatus::Unsupported;
+        }
+    };
+
+    let op = match GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless)
+    {
+        Ok(op) => op,
+        Err(err) => {
+            info!(
+                error = %err,
+                "GraphicsCaptureAccess::RequestAccessAsync(Borderless) unavailable; using system border"
+            );
+            return BorderlessCaptureStatus::Unsupported;
+        }
+    };
+
+    match op.join() {
+        Ok(status) => {
+            let mapped = map_app_capability_access_status(status);
+            info!(
+                raw = status.0,
+                ?mapped,
+                "resolved WGC borderless capture access"
+            );
+            mapped
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "GraphicsCaptureAccess::RequestAccessAsync(Borderless) failed; using system border"
+            );
+            BorderlessCaptureStatus::Unsupported
+        }
+    }
+}
+
+fn configure_capture_session(
+    session: &GraphicsCaptureSession,
+    hide_border: bool,
+    borderless_status: BorderlessCaptureStatus,
+) {
+    if !hide_border {
+        return;
+    }
+    if borderless_status != BorderlessCaptureStatus::Granted {
+        info!(
+            ?borderless_status,
+            "borderless capture not granted; continuing capture with system border"
+        );
+        return;
+    }
+    if let Err(err) = session.SetIsBorderRequired(false) {
+        warn!(
+            error = %err,
+            "GraphicsCaptureSession::SetIsBorderRequired(false) failed; continuing capture with system border"
+        );
+    } else {
+        debug!("configured borderless WGC capture session (SetIsBorderRequired(false))");
+    }
+}
+
 /// Handle to an active Windows Graphics Capture session.
 ///
 /// Stops and joins the capture worker thread on [`Self::stop`] and [`Drop`].
@@ -286,6 +368,8 @@ impl WgcCaptureHandle {
     pub fn start_monitor(
         monitor_name: Option<&str>,
         fps: u32,
+        hide_border: bool,
+        borderless_status: BorderlessCaptureStatus,
         tx: mpsc::Sender<CapturedVideoFrame>,
     ) -> Result<Self> {
         let monitors = enumerate_monitors_internal()?;
@@ -307,23 +391,42 @@ impl WgcCaptureHandle {
                 .ok_or_else(|| ClipForgeError::NotFound(format!("monitor '{name}' not found")))?,
         };
 
-        Self::start_target(CaptureTarget::Monitor(chosen.hmonitor), fps, tx)
+        Self::start_target(
+            CaptureTarget::Monitor(chosen.hmonitor),
+            fps,
+            hide_border,
+            borderless_status,
+            tx,
+        )
     }
 
     /// Starts capturing the currently focused foreground window.
-    pub fn start_focused_window(fps: u32, tx: mpsc::Sender<CapturedVideoFrame>) -> Result<Self> {
+    pub fn start_focused_window(
+        fps: u32,
+        hide_border: bool,
+        borderless_status: BorderlessCaptureStatus,
+        tx: mpsc::Sender<CapturedVideoFrame>,
+    ) -> Result<Self> {
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.is_invalid() {
             return Err(ClipForgeError::CaptureFailed(
                 "no foreground window is currently focused".to_string(),
             ));
         }
-        Self::start_target(CaptureTarget::Window(hwnd.0 as isize), fps, tx)
+        Self::start_target(
+            CaptureTarget::Window(hwnd.0 as isize),
+            fps,
+            hide_border,
+            borderless_status,
+            tx,
+        )
     }
 
     fn start_target(
         target: CaptureTarget,
         fps: u32,
+        hide_border: bool,
+        borderless_status: BorderlessCaptureStatus,
         tx: mpsc::Sender<CapturedVideoFrame>,
     ) -> Result<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -342,6 +445,8 @@ impl WgcCaptureHandle {
                 run_wgc_loop(
                     target,
                     fps.max(1),
+                    hide_border,
+                    borderless_status,
                     tx,
                     stop_clone,
                     signal_clone,
@@ -409,9 +514,12 @@ impl Drop for WgcCaptureHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_wgc_loop(
     target: CaptureTarget,
     fps: u32,
+    hide_border: bool,
+    borderless_status: BorderlessCaptureStatus,
     tx: mpsc::Sender<CapturedVideoFrame>,
     stop_flag: Arc<AtomicBool>,
     signal: Arc<(Mutex<bool>, Condvar)>,
@@ -531,6 +639,8 @@ fn run_wgc_loop(
         }
     };
 
+    configure_capture_session(&session, hide_border, borderless_status);
+
     if let Err(e) = session.StartCapture() {
         let _ = session.Close();
         let _ = frame_pool.Close();
@@ -617,6 +727,7 @@ fn run_wgc_loop(
                     let _ = frame.Close();
                     break;
                 }
+                configure_capture_session(&session, hide_border, borderless_status);
                 current_size = content_size;
                 dimensions
                     .0
@@ -742,6 +853,7 @@ fn run_wgc_loop(
                             )
                             .is_ok()
                     {
+                        configure_capture_session(&session, hide_border, borderless_status);
                         d3d = new_d3d;
                         continue;
                     }
