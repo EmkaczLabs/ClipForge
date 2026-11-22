@@ -195,6 +195,42 @@ mod tests {
     }
 
     #[test]
+    fn editor_fast_trim_default_mode_toggle_pause_and_cancel() {
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(AppState::default(), views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        click_key(&mut rt, NavSection::Editor.key());
+        // Defaults to Fast Trim (stream copy, reencode = false).
+        assert!(!rt.state.editor.reencode);
+
+        // Toggling between Precise Trim (Re-encode) and Fast Trim (Stream Copy).
+        click_key(&mut rt, "mode-reencode");
+        assert!(rt.state.editor.reencode);
+        click_key(&mut rt, "mode-stream-copy");
+        assert!(!rt.state.editor.reencode);
+
+        // Starting export pauses active preview playback so decoding does not compete with export.
+        rt.state.editor.playing = true;
+        click_key(&mut rt, "trim-export");
+        assert!(!rt.state.editor.playing);
+        assert!(rt.state.editor.last_export_path.is_some());
+
+        // Cancelling an active export via the UI button clears progress and updates status.
+        rt.state.editor.exporting = true;
+        rt.state.editor.export_progress = Some(0.5);
+        // Trigger a UI frame rebuild so the exporting toolbar/inspector buttons appear.
+        click_key(&mut rt, "in-plus");
+        click_key(&mut rt, "cancel-export");
+        assert!(!rt.state.editor.exporting);
+        assert_eq!(rt.state.editor.export_progress, None);
+        assert_eq!(
+            rt.state.status_banner.as_deref(),
+            Some("Trim export cancelled")
+        );
+    }
+
+    #[test]
     fn library_filter_and_view_mode_toggle() {
         let env = Env::new(true, 1.0);
         let mut rt = Runtime::new(AppState::default(), views::root_view, (1240.0, 800.0), env);

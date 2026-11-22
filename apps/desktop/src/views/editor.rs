@@ -762,7 +762,7 @@ fn build_inspector(
                     segmented_item(
                         p,
                         "mode-stream-copy",
-                        "Stream Copy",
+                        "Fast Trim",
                         !s.editor.reencode,
                         |st| {
                             st.editor.reencode = false;
@@ -771,7 +771,7 @@ fn build_inspector(
                     segmented_item(
                         p,
                         "mode-reencode",
-                        "Frame-Accurate",
+                        "Precise Trim",
                         s.editor.reencode,
                         |st| {
                             st.editor.reencode = true;
@@ -781,9 +781,9 @@ fn build_inspector(
             ))
             .child(
                 text(if s.editor.reencode {
-                    "Re-encodes video for exact frame-accurate cuts."
+                    "Precise Trim (Re-encode) — re-encodes the trimmed segment for exact frame-accurate cuts."
                 } else {
-                    "Fast lossless stream copy (aligns to keyframe)."
+                    "Fast Trim (Stream Copy) — instant lossless copy; start cut aligns to the nearest keyframe."
                 })
                 .font(typography::LABEL)
                 .color(p.text_muted)
@@ -817,9 +817,9 @@ fn build_inspector(
                         )
                         .child(
                             text(if s.editor.reencode {
-                                "Re-encode"
+                                "Precise Trim (Re-encode)"
                             } else {
-                                "Stream copy"
+                                "Fast Trim (Stream Copy)"
                             })
                             .font(typography::MICRO)
                             .color(p.text_secondary),

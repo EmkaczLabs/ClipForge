@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -264,7 +264,7 @@ struct WorkerServices {
     store: Arc<Mutex<Option<Arc<SqliteClipStore>>>>,
     player: VideoPlayerHandle,
     active_player_clip: Arc<Mutex<Option<(ClipId, rune::Pixels)>>>,
-    active_trim_cancel: Arc<Mutex<Option<ExportCancelToken>>>,
+    active_trim_cancel: Arc<Mutex<Option<(u64, ExportCancelToken)>>>,
     active_uploads: Arc<Mutex<HashMap<ClipId, Arc<AtomicBool>>>>,
     config: Arc<Mutex<AppConfig>>,
     hotkey_manager: Arc<Mutex<Option<HotkeyManager>>>,
@@ -674,9 +674,15 @@ async fn handle_command(
             execute_stop_capture(&svc, evt_tx, waker).await;
         }
         WorkerCommand::TrimClip(req) => {
+            static NEXT_TRIM_ID: AtomicU64 = AtomicU64::new(1);
+            // Quiesce preview playback/decoding so it never competes with ffmpeg export.
+            svc.player.pause();
+            let trim_id = NEXT_TRIM_ID.fetch_add(1, Ordering::Relaxed);
             let cancel = ExportCancelToken::new();
-            if let Ok(mut guard) = svc.active_trim_cancel.lock() {
-                *guard = Some(cancel.clone());
+            if let Ok(mut guard) = svc.active_trim_cancel.lock()
+                && let Some((_, prev)) = guard.replace((trim_id, cancel.clone()))
+            {
+                prev.cancel();
             }
             let prog_tx = evt_tx.clone();
             let prog_waker = waker.clone();
@@ -688,7 +694,9 @@ async fn handle_command(
                 })
                 .await
                 .map_err(|e| e.to_string());
-            if let Ok(mut guard) = svc.active_trim_cancel.lock() {
+            if let Ok(mut guard) = svc.active_trim_cancel.lock()
+                && guard.as_ref().is_some_and(|(id, _)| *id == trim_id)
+            {
                 *guard = None;
             }
             if let Ok(ref out_path) = res
@@ -710,7 +718,7 @@ async fn handle_command(
         }
         WorkerCommand::CancelTrim => {
             if let Ok(guard) = svc.active_trim_cancel.lock()
-                && let Some(token) = guard.as_ref()
+                && let Some((_, token)) = guard.as_ref()
             {
                 token.cancel();
             }

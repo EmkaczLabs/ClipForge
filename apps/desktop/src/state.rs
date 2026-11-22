@@ -1393,6 +1393,10 @@ impl AppState {
                 self.status_banner = Some(msg);
                 return;
             }
+            if self.editor.playing {
+                self.editor.playing = false;
+                worker.send(WorkerCommand::PlayerPause);
+            }
             self.editor.exporting = true;
             self.editor.export_progress = Some(0.0);
             self.editor.export_error = None;
@@ -1401,6 +1405,7 @@ impl AppState {
         } else {
             match req.validate() {
                 Ok(()) => {
+                    self.editor.playing = false;
                     self.editor.exporting = false;
                     self.editor.export_progress = None;
                     self.editor.export_error = None;
