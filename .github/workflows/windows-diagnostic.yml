@@ -1,0 +1,164 @@
+name: Windows Runner Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: [self-hosted, Windows, X64, clipforge-windows-build]
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Identity and Host
+        run: |
+          Write-Host "=== Identity ==="
+          whoami
+          Write-Host "COMPUTERNAME: $env:COMPUTERNAME"
+          Write-Host "USERNAME: $env:USERNAME"
+
+          Write-Host "`n=== PowerShell & OS ==="
+          $PSVersionTable.PSVersion | Format-Table -AutoSize
+          [System.Environment]::OSVersion | Format-List
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture |
+            Format-List
+
+          Write-Host "=== Disk Space (C:) ==="
+          Get-PSDrive C |
+            Select-Object Name, Used, Free, @{ Name = 'FreeGB'; Expression = { [math]::Round($_.Free / 1GB, 2) } } |
+            Format-Table -AutoSize
+
+      - name: Service and Permissions
+        run: |
+          Write-Host "=== Runner Services ==="
+          Get-CimInstance Win32_Service -Filter "Name LIKE 'actions.runner%'" |
+            Select-Object Name, State, StartMode, StartName |
+            Format-Table -AutoSize
+
+          Write-Host "=== Service Failure Configuration ==="
+          $serviceName = "actions.runner.EmkaczLabs-ClipForge.clipforge-win-builder"
+          sc.exe qfailure "$serviceName"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "sc.exe qfailure exited with code $LASTEXITCODE for $serviceName"
+          }
+
+          Write-Host "`n=== Directory ACLs ==="
+          foreach ($dir in @("C:\Rust", "C:\Actions")) {
+            Write-Host "--- $dir ---"
+            if (Test-Path -LiteralPath $dir) {
+              icacls "$dir"
+              try {
+                $null = Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop | Select-Object -First 1
+                Write-Host "Read check: OK"
+              } catch {
+                Write-Warning "Read check failed for ${dir}: $($_.Exception.Message)"
+              }
+            } else {
+              Write-Warning "Path does not exist: $dir"
+            }
+          }
+
+      - name: Environment and Toolchain
+        run: |
+          Write-Host "=== Toolchain Environment Variables ==="
+          Write-Host "CARGO_HOME: $env:CARGO_HOME"
+          Write-Host "RUSTUP_HOME: $env:RUSTUP_HOME"
+          Write-Host "PATH:"
+          ($env:PATH -split ';') | Where-Object { $_ } | ForEach-Object { Write-Host "  $_" }
+
+          Write-Host "`n=== Rust & Git ==="
+          rustc --version
+          cargo --version
+          rustup toolchain list
+          git --version
+
+          Write-Host "`n=== FFmpeg (non-fatal) ==="
+          $ffmpegPath = "C:\ffmpeg-bin"
+          Write-Host "C:\ffmpeg-bin exists: $(Test-Path -LiteralPath $ffmpegPath)"
+          if (Test-Path -LiteralPath $ffmpegPath) {
+            $env:PATH = "$ffmpegPath;$env:PATH"
+          }
+          foreach ($tool in @("ffmpeg", "ffprobe")) {
+            $cmd = Get-Command $tool -ErrorAction SilentlyContinue
+            if ($cmd) {
+              Write-Host "${tool} path: $($cmd.Source)"
+              & $tool -version | Select-Object -First 2
+            } else {
+              Write-Warning "$tool not found in C:\ffmpeg-bin or PATH"
+            }
+          }
+
+          Write-Host "`n=== Visual Studio / Linker / Windows SDK ==="
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path -LiteralPath $vswhere) {
+            Write-Host "vswhere.exe: $vswhere"
+            & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          } else {
+            Write-Warning "vswhere.exe not found at $vswhere"
+          }
+
+          $linkCmd = Get-Command link.exe -ErrorAction SilentlyContinue
+          if ($linkCmd) {
+            Write-Host "link.exe on PATH: $($linkCmd.Source)"
+          } else {
+            Write-Host "link.exe not currently on PATH (normal if vcvars not activated)"
+          }
+
+          $sdkRegPath = "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots"
+          if (Test-Path -LiteralPath $sdkRegPath) {
+            $kitsRoot = (Get-ItemProperty -LiteralPath $sdkRegPath -Name KitsRoot10 -ErrorAction SilentlyContinue).KitsRoot10
+            Write-Host "Windows SDK KitsRoot10: $kitsRoot"
+            if ($kitsRoot -and (Test-Path -LiteralPath (Join-Path $kitsRoot "Include"))) {
+              Get-ChildItem -LiteralPath (Join-Path $kitsRoot "Include") -Directory |
+                Select-Object -ExpandProperty Name |
+                ForEach-Object { Write-Host "  SDK Version: $_" }
+            }
+          } else {
+            Write-Warning "Windows Kits registry key not found: $sdkRegPath"
+          }
+
+      - name: Minimal Rust Release Smoke Test
+        run: |
+          $smokeDir = Join-Path $env:RUNNER_TEMP "rust-smoke"
+          if (Test-Path -LiteralPath $smokeDir) {
+            Remove-Item -LiteralPath $smokeDir -Recurse -Force
+          }
+
+          try {
+            New-Item -ItemType Directory -Path (Join-Path $smokeDir "src") -Force | Out-Null
+
+            @"
+          [package]
+          name = "rust-smoke"
+          version = "0.1.0"
+          edition = "2021"
+          "@ | Set-Content -LiteralPath (Join-Path $smokeDir "Cargo.toml") -Encoding Ascii
+
+            @'
+          fn main() {
+              println!("clipforge-win-smoke-ok");
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $smokeDir "src\main.rs") -Encoding Ascii
+
+            Push-Location -LiteralPath $smokeDir
+            cargo build --release
+            if ($LASTEXITCODE -ne 0) {
+              throw "cargo build --release failed with exit code $LASTEXITCODE"
+            }
+
+            $exePath = Join-Path $smokeDir "target\release\rust-smoke.exe"
+            if (-not (Test-Path -LiteralPath $exePath)) {
+              throw "Expected binary not found at $exePath"
+            }
+            Write-Host "Smoke test succeeded: $exePath"
+          } finally {
+            Pop-Location -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $smokeDir) {
+              Remove-Item -LiteralPath $smokeDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "Cleaned up $smokeDir"
+          }
