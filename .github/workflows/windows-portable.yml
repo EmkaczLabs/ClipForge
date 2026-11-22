@@ -96,5 +96,7 @@ jobs:
             -RunId "${{ github.run_id }}" `
             -Workflow "${{ github.workflow }}" `
             -VerifyDownload `
-            "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip" `
-            "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip.sha256"
+            -Artifacts @(
+              "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip",
+              "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip.sha256"
+            )

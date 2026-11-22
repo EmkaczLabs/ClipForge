@@ -9,7 +9,7 @@ param(
     [string]$Workflow = $(if ($env:GITHUB_WORKFLOW) { $env:GITHUB_WORKFLOW } else { "local" }),
     [string]$DateStr = "",
     [switch]$VerifyDownload,
-    [Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)]
+    [Parameter(Mandatory = $true)]
     [string[]]$Artifacts
 )
 
