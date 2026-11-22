@@ -124,12 +124,15 @@ jobs:
           retention-days: 7
           if-no-files-found: error
       - name: Upload Windows portable artifact to RustFS
-        if: ${{ secrets.RUSTFS_ACCESS_KEY_ID != '' && secrets.RUSTFS_SECRET_ACCESS_KEY != '' }}
         env:
           RUSTFS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY_ID }}
           RUSTFS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_ACCESS_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
+          if (-not $env:RUSTFS_ACCESS_KEY_ID -or -not $env:RUSTFS_SECRET_ACCESS_KEY) {
+            Write-Host "Skipping RustFS upload (RUSTFS_ACCESS_KEY_ID / RUSTFS_SECRET_ACCESS_KEY secrets not configured)."
+            exit 0
+          }
           $python = if (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" } else { throw "Python 3 not found on PATH" }
           $mode = if ("${{ github.ref }}".StartsWith("refs/tags/")) { "releases" } else { "ci" }
           & $python scripts/ci/upload_rustfs.py `
