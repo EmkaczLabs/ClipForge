@@ -29,6 +29,43 @@ env:
 
 jobs:
   linux:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, clipforge-linux-build]
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /home/runner/.cache/clipforge-target/ci-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure persistent Rust toolchain & verify dependencies
+        run: |
+          set -euo pipefail
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+
+          mkdir -p "$CARGO_TARGET_DIR"
+
+          avail_gb=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          echo "Free disk space on /: ${avail_gb}G"
+          if [ "${avail_gb}" -lt 5 ]; then
+            echo "::warning::Low disk space on / (${avail_gb}G < 5G)."
+          fi
+
+          rustc --version
+          cargo --version
+          rustfmt --version
+          cargo clippy --version
+          pkg-config --exists alsa xkbcommon
+          ffmpeg -version
+          ffprobe -version
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Cargo clippy workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace
+
+  linux-fork-pr:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -48,7 +85,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: linux-ci
+          prefix-key: linux-fork-pr
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Cargo clippy workspace
