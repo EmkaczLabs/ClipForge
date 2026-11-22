@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,6 +19,7 @@ env:
 jobs:
   windows-build:
     runs-on: [self-hosted, Windows, X64, clipforge-windows-build]
+    timeout-minutes: 30
     defaults:
       run:
         shell: powershell
@@ -49,15 +50,25 @@ jobs:
           $freeGb = [math]::Round($drive.Free / 1GB, 2)
           Write-Host "Free disk space on C:: $freeGb GB"
           if ($freeGb -lt 15) {
-            Write-Warning "Low disk space on C: ($freeGb GB < 15 GB). Pruning persistent target dir: $targetDir"
-            if ($targetDir -and (Test-Path -LiteralPath $targetDir)) {
-              Remove-Item -LiteralPath $targetDir -Recurse -Force -ErrorAction SilentlyContinue
-              New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-            }
-            $driveAfter = Get-PSDrive -Name C
-            $freeGbAfter = [math]::Round($driveAfter.Free / 1GB, 2)
-            Write-Host "Free disk space on C: after prune: $freeGbAfter GB"
+            Write-Warning "Low disk space on C: ($freeGb GB < 15 GB)."
           }
+      - name: Verify persistent FFmpeg
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ffmpegDir = "C:\ffmpeg-bin"
+          $ffmpegExe = Join-Path $ffmpegDir "ffmpeg.exe"
+          $ffprobeExe = Join-Path $ffmpegDir "ffprobe.exe"
+
+          if (-not ((Test-Path -LiteralPath $ffmpegExe -PathType Leaf) -and (Test-Path -LiteralPath $ffprobeExe -PathType Leaf))) {
+            throw "Missing C:\ffmpeg-bin\ffmpeg.exe or ffprobe.exe on clipforge-win-builder."
+          }
+
+          "C:\ffmpeg-bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = "C:\ffmpeg-bin;$env:PATH"
+          ffmpeg -version
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg -version failed with exit code $LASTEXITCODE" }
+          ffprobe -version
+          if ($LASTEXITCODE -ne 0) { throw "ffprobe -version failed with exit code $LASTEXITCODE" }
       - name: Build release binary
         run: cargo build --release -p clipforge-desktop
       - name: Upload release binary
@@ -73,12 +84,13 @@ jobs:
   package-portable:
     needs: windows-build
     runs-on: [self-hosted, Windows, X64, clipforge-windows-build]
+    timeout-minutes: 10
     defaults:
       run:
         shell: powershell
     steps:
       - uses: actions/checkout@v4
-      - name: Ensure FFmpeg on persistent runner & verify
+      - name: Verify persistent FFmpeg
         run: |
           $ErrorActionPreference = "Stop"
           $ffmpegDir = "C:\ffmpeg-bin"
@@ -86,62 +98,14 @@ jobs:
           $ffprobeExe = Join-Path $ffmpegDir "ffprobe.exe"
 
           if (-not ((Test-Path -LiteralPath $ffmpegExe -PathType Leaf) -and (Test-Path -LiteralPath $ffprobeExe -PathType Leaf))) {
-            New-Item -ItemType Directory -Path $ffmpegDir -Force | Out-Null
-            $chocoCmd = Get-Command choco -ErrorAction SilentlyContinue
-            if ($chocoCmd) {
-              Write-Host "Installing FFmpeg via Chocolatey..."
-              choco install ffmpeg -y --no-progress
-              if ($LASTEXITCODE -ne 0) { throw "choco install ffmpeg failed with exit code $LASTEXITCODE" }
-              $chocoRoot = if ($env:ChocolateyInstall) { $env:ChocolateyInstall } else { "C:\ProgramData\chocolatey" }
-              $toolsDir = Join-Path $chocoRoot "lib\ffmpeg\tools"
-              $foundFfmpeg = Get-ChildItem -Path $toolsDir -Filter "ffmpeg.exe" -Recurse -File | Select-Object -First 1
-              if (-not $foundFfmpeg) { throw "ffmpeg.exe not found under $toolsDir" }
-              $srcBinDir = $foundFfmpeg.DirectoryName
-              $srcPkgDir = Split-Path -Path $srcBinDir -Parent
-              Copy-Item -Path (Join-Path $srcBinDir "*") -Destination $ffmpegDir -Recurse -Force
-              foreach ($doc in @("LICENSE", "LICENSE.txt", "README", "README.txt")) {
-                $docPath = Join-Path $srcPkgDir $doc
-                if (Test-Path -LiteralPath $docPath -PathType Leaf) {
-                  Copy-Item -LiteralPath $docPath -Destination $ffmpegDir -Force
-                }
-              }
-            } else {
-              Write-Host "Chocolatey not found; downloading FFmpeg from gyan.dev..."
-              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-              $zipUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-              $tempRoot = Join-Path $env:RUNNER_TEMP ("ffmpeg-dl-" + [guid]::NewGuid().ToString("N"))
-              $zipPath = Join-Path $tempRoot "ffmpeg-release-essentials.zip"
-              $extractDir = Join-Path $tempRoot "extract"
-              New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
-              try {
-                Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
-                Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
-                $foundFfmpeg = Get-ChildItem -Path $extractDir -Filter "ffmpeg.exe" -Recurse -File | Select-Object -First 1
-                if (-not $foundFfmpeg) { throw "ffmpeg.exe not found in downloaded archive" }
-                $srcBinDir = $foundFfmpeg.DirectoryName
-                $srcPkgDir = Split-Path -Path $srcBinDir -Parent
-                Copy-Item -Path (Join-Path $srcBinDir "*") -Destination $ffmpegDir -Recurse -Force
-                foreach ($doc in @("LICENSE", "LICENSE.txt", "README", "README.txt")) {
-                  $docPath = Join-Path $srcPkgDir $doc
-                  if (Test-Path -LiteralPath $docPath -PathType Leaf) {
-                    Copy-Item -LiteralPath $docPath -Destination $ffmpegDir -Force
-                  }
-                }
-              } finally {
-                if (Test-Path -LiteralPath $tempRoot) {
-                  Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
-                }
-              }
-            }
-          } else {
-            Write-Host "Using persistent FFmpeg at $ffmpegDir"
+            throw "Missing C:\ffmpeg-bin\ffmpeg.exe or ffprobe.exe on clipforge-win-builder."
           }
 
           "C:\ffmpeg-bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           $env:PATH = "C:\ffmpeg-bin;$env:PATH"
-          & $ffmpegExe -version
+          ffmpeg -version
           if ($LASTEXITCODE -ne 0) { throw "ffmpeg -version failed with exit code $LASTEXITCODE" }
-          & $ffprobeExe -version
+          ffprobe -version
           if ($LASTEXITCODE -ne 0) { throw "ffprobe -version failed with exit code $LASTEXITCODE" }
       - name: Download release binary
         uses: actions/download-artifact@v4
