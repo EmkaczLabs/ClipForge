@@ -1,19 +1,17 @@
 # ClipForge Next Tasks
 
-Ordered tasks remaining after `ClipForge` (`1afbd80`) and `ClipForge-Server` (`8b6326d`):
+Ordered tasks remaining after `ClipForge` (`aae63b7`) and `ClipForge-Server` (`9216eb2`):
 
-1. **RustFS Production Storage Cutover (Separate Approval Required):**
-   - Create dedicated `clipforge` bucket and scoped service account credentials on RustFS (`111 rustfs` / `https://s3.emkacz.dev`).
-   - Run authenticated `clipforge-server storage check --write-probe` from LXC `112` and switch LXC `112` `.env` from `local` to `s3` (`S3_ENDPOINT=https://s3.emkacz.dev`, `S3_BUCKET=clipforge`).
-2. **Cloudflare & Public Route Cutover (`clips.emkacz.dev`, Separate Approval Required):**
-   - Configure Cloudflare Tunnel (`102 cf-tunnel`) / Nginx Proxy Manager (`108`) ingress for `clips.emkacz.dev -> http://192.168.1.112:3000` (with Zero Trust / upload timeout & chunking verification) and update `CLIPFORGE_PUBLIC_BASE_URL=https://clips.emkacz.dev`.
-   - Disable open registration (`CLIPFORGE_REGISTRATION_ENABLED=false`) after creating production user/admin accounts.
+1. **Windows CI & Physical Windows 10/11 Validation (`windows-latest` + Hardware):**
+   - Push `ClipForge` `main` (when ready) to trigger `.github/workflows/ci.yml` (`windows-test` validating `#[cfg(target_os = "windows")]` WGC/WASAPI/`RegisterHotKey` compilation and the `aa6825c` `cpal` COM fix on Windows Server 2025) and `.github/workflows/windows-portable.yml`.
+   - Test the portable ZIP (`ClipForge-Windows-x64-portable.zip`) on physical Windows 10/11 hardware:
+     - Verify zero console window flash (`windows_subsystem = "windows"` + `CREATE_NO_WINDOW`).
+     - Verify WGC monitor/focused-window capture, WASAPI loopback + mic A/V sync, rolling replay buffer save, `RegisterHotKey` (`F9`/`F10`/`F11`), and FFmpeg HW/SW encoding.
+2. **RustFS & LXC 112 Production Cutover (Separate Approval Required):**
+   - Rebuild/redeploy LXC `112` from `ClipForge-Server` `9216eb2` (storage-before-DB `DELETE` + `shares.visibility` sync) + `7ef9197` (OG/Twitter/oEmbed link previews).
+   - Create `clipforge-svc` + `clipforge-rw` policy in RustFS Console (`https://s3-web.emkacz.dev/rustfs/console/index.html`), run `clipforge-server storage check --write-probe`, and switch LXC `112` to `s3` backend.
+   - Route `https://clips.emkacz.dev` via Cloudflare Tunnel (`102`) / NPM (`108`) and disable open registration.
 3. **Manual Interactive Windowed Auditioning on CachyOS Wayland:**
-   - Run `cargo run -p clipforge-desktop` interactively on KDE Wayland:
-     - `Test Microphone` with live voice (`GoodSignal`) + audible `Play Sample` (`cpal`).
-     - Approve KDE `GlobalShortcuts` portal dialog and test unfocused `F9`/`F10`/`F11`.
-     - Live multi-frame embedded playback (`Auto` mixed multi-track audio), pointer-drag timeline/trim/volume UX, and live desktop-to-LXC-112 upload/share flow (`secret-tool` token storage).
-4. **Repository Hygiene & Publishing:**
-   - Decide whether to commit or ignore untracked design artifacts in `ClipForge` (`design/`, `docs/design.md`, `docs/ui-implementation-plan.md`, `docs/ui-screen-specs.md`).
-   - Migrate `apps/desktop` sample tracking from `"sample"` tag to `ClipOrigin::Sample`.
-   - Validate `ClipForge/packaging/arch/PKGBUILD` (`makepkg`), update `.github/workflows/ci.yml` (`libxkbcommon-dev`, `libasound2-dev`), and push both `ClipForge` and `ClipForge-Server` `main` branches when ready.
+   - Test `Test Microphone` with live voice + `Play Sample`, KDE `GlobalShortcuts` portal approval + unfocused `F9`/`F10`/`F11`, and pointer-drag editor UX.
+4. **Repository Hygiene:**
+   - Commit `Cargo.lock` update for `windows 0.62` when appropriate, decide whether to commit or `.gitignore` `design/` + `docs/{design,ui-*}.md`, and migrate `apps/desktop` sample tracking from `"sample"` tag to `ClipOrigin::Sample`.
