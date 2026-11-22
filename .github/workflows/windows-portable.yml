@@ -87,27 +87,14 @@ jobs:
           if (-not $env:RUSTFS_ACCESS_KEY_ID -or -not $env:RUSTFS_SECRET_ACCESS_KEY) {
             throw "RUSTFS_ACCESS_KEY_ID and RUSTFS_SECRET_ACCESS_KEY secrets must be configured."
           }
-          $pythonCmd = $null
-          $pythonArgs = @()
-          if (Get-Command python3 -ErrorAction SilentlyContinue) {
-            $pythonCmd = "python3"
-          } elseif (Get-Command python -ErrorAction SilentlyContinue) {
-            $pythonCmd = "python"
-          } elseif (Get-Command py -ErrorAction SilentlyContinue) {
-            $pythonCmd = "py"
-            $pythonArgs = @("-3")
-          } else {
-            throw "Python 3 not found on PATH"
-          }
           $mode = if ("${{ github.ref }}".StartsWith("refs/tags/")) { "releases" } else { "ci" }
-          & $pythonCmd @pythonArgs scripts/ci/upload_rustfs.py `
-            --mode $mode `
-            --platform windows-x64 `
-            --version "${{ github.ref_name }}" `
-            --commit "${{ github.sha }}" `
-            --run-id "${{ github.run_id }}" `
-            --workflow "${{ github.workflow }}" `
-            --verify-download `
+          ./scripts/ci/upload_rustfs.ps1 `
+            -Mode $mode `
+            -Platform "windows-x64" `
+            -Version "${{ github.ref_name }}" `
+            -Commit "${{ github.sha }}" `
+            -RunId "${{ github.run_id }}" `
+            -Workflow "${{ github.workflow }}" `
+            -VerifyDownload `
             "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip" `
             "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip.sha256"
-          if ($LASTEXITCODE -ne 0) { throw "RustFS upload/verification failed with exit code $LASTEXITCODE" }
