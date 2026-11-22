@@ -2,6 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use clipforge_capture::{AudioTrackTarget, GlobalHotkeyStatus, parse_routed_audio_source};
+#[cfg(target_os = "windows")]
+use clipforge_common::BorderlessCaptureStatus;
 use clipforge_common::{
     AudioCodec, CaptureStatus, CaptureTarget, ContainerFormat, EncoderMode, QualityPreset,
     VideoCodec,
@@ -641,7 +643,7 @@ fn capture_pipeline_card(p: &Palette, s: &AppState) -> El {
         ));
     }
 
-    card_el
+    card_el = card_el
         .child(encoder_and_quality_row(p, cfg.encoder, cfg.quality))
         .child(container_and_buffer_row(
             p,
@@ -676,7 +678,109 @@ fn capture_pipeline_card(p: &Palette, s: &AppState) -> El {
                     restart_on_save,
                     move |st| st.set_restart_replay_on_save(!restart_on_save),
                 )),
-        )
+        );
+
+    #[cfg(target_os = "windows")]
+    {
+        card_el = card_el.child(windows_borderless_section(p, s));
+    }
+
+    card_el
+}
+
+#[cfg(target_os = "windows")]
+fn windows_borderless_section(p: &Palette, s: &AppState) -> El {
+    let (status_label, status_fg, status_bg) = if s.borderless_request_in_flight {
+        ("Requesting...", p.text_secondary, p.bg_surface)
+    } else {
+        match s.borderless_status {
+            BorderlessCaptureStatus::Unknown => {
+                ("Pending / Unknown", p.text_secondary, p.bg_surface)
+            }
+            BorderlessCaptureStatus::Granted => ("Granted", p.success, p.success_soft),
+            BorderlessCaptureStatus::DeniedByUser => {
+                ("Denied by User", p.warning_text, p.warning_soft)
+            }
+            BorderlessCaptureStatus::DeniedBySystem => {
+                ("Denied by System", p.warning_text, p.warning_soft)
+            }
+            BorderlessCaptureStatus::Unsupported => ("Unsupported", p.text_muted, p.bg_surface),
+        }
+    };
+
+    let mut section = col()
+        .key("cfg-windows-borderless-section")
+        .w_full()
+        .gap(space::SM)
+        .child(
+            row()
+                .key("cfg-hide-win-border-row")
+                .w_full()
+                .justify_between()
+                .center_y()
+                .child(
+                    col()
+                        .key("hide-win-border-meta")
+                        .gap(2.0)
+                        .child(
+                            text("Hide Windows capture border")
+                                .font(typography::BODY)
+                                .color(p.text_primary),
+                        )
+                        .child(
+                            text("Windows may require user permission to hide the yellow capture border")
+                                .font(typography::LABEL)
+                                .color(p.text_muted),
+                        ),
+                )
+                .child(
+                    row()
+                        .key("cfg-hide-win-border-controls")
+                        .gap(space::SM)
+                        .center_y()
+                        .child(badge(
+                            "rec-borderless-status-badge",
+                            status_label,
+                            status_fg,
+                            status_bg,
+                        ))
+                        .child(toggle_switch(
+                            p,
+                            "cfg-hide-win-border-switch",
+                            "Hide Windows capture border",
+                            s.config.capture.hide_windows_capture_border,
+                            |st| st.toggle_hide_windows_capture_border(),
+                        )),
+                ),
+        );
+
+    if s.borderless_status.is_denied() {
+        let btn_label = if s.borderless_request_in_flight {
+            "Requesting..."
+        } else {
+            "Retry Permission"
+        };
+        section = section.child(
+            row()
+                .key("rec-borderless-denied-row")
+                .w_full()
+                .gap(space::SM)
+                .center_y()
+                .child(fallback_notice(
+                    p,
+                    "rec-borderless-denied-note",
+                    "Borderless capture permission was denied; capture continues normally with the yellow border.",
+                ))
+                .child(btn_secondary(
+                    p,
+                    "retry-borderless-btn",
+                    btn_label,
+                    |st| st.retry_borderless_permission(),
+                )),
+        );
+    }
+
+    section
 }
 
 fn target_selector_section(p: &Palette, s: &AppState, is_region: bool) -> El {

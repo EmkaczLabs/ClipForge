@@ -1321,4 +1321,105 @@ mod tests {
                 .join("clipforge.log")
         );
     }
+
+    #[test]
+    fn hide_windows_capture_border_toggle_updates_config() {
+        let mut st = AppState::default();
+        assert!(st.config.capture.hide_windows_capture_border);
+
+        st.toggle_hide_windows_capture_border();
+        assert!(!st.config.capture.hide_windows_capture_border);
+        assert_eq!(
+            st.status_banner.as_deref(),
+            Some("Config updated in memory")
+        );
+
+        st.toggle_hide_windows_capture_border();
+        assert!(st.config.capture.hide_windows_capture_border);
+    }
+
+    #[test]
+    fn borderless_capture_status_changed_updates_state() {
+        use clipforge_common::{BorderlessCaptureStatus, CaptureEvent};
+
+        let mut st = AppState {
+            borderless_request_in_flight: true,
+            ..AppState::default()
+        };
+        assert_eq!(st.borderless_status, BorderlessCaptureStatus::Unknown);
+
+        st.handle_capture_event(CaptureEvent::BorderlessCaptureStatusChanged(
+            BorderlessCaptureStatus::Granted,
+        ));
+        assert_eq!(st.borderless_status, BorderlessCaptureStatus::Granted);
+        assert!(!st.borderless_request_in_flight);
+
+        st.borderless_request_in_flight = true;
+        st.handle_capture_event(CaptureEvent::BorderlessCaptureStatusChanged(
+            BorderlessCaptureStatus::DeniedByUser,
+        ));
+        assert_eq!(st.borderless_status, BorderlessCaptureStatus::DeniedByUser);
+        assert!(!st.borderless_request_in_flight);
+
+        st.handle_capture_event(CaptureEvent::BorderlessCaptureStatusChanged(
+            BorderlessCaptureStatus::DeniedBySystem,
+        ));
+        assert_eq!(
+            st.borderless_status,
+            BorderlessCaptureStatus::DeniedBySystem
+        );
+
+        st.handle_capture_event(CaptureEvent::BorderlessCaptureStatusChanged(
+            BorderlessCaptureStatus::Unsupported,
+        ));
+        assert_eq!(st.borderless_status, BorderlessCaptureStatus::Unsupported);
+    }
+
+    #[test]
+    fn retry_borderless_permission_dispatches_non_blocking_to_worker() {
+        use clipforge_common::BorderlessCaptureStatus;
+
+        let handle = WorkerHandle::spawn(std::sync::Arc::new(|| {}));
+        let mut st = AppState {
+            worker: Some(handle),
+            ..AppState::default()
+        };
+
+        let start = std::time::Instant::now();
+        st.retry_borderless_permission();
+        // Must return immediately without blocking the UI thread.
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+        assert!(st.borderless_request_in_flight);
+
+        // Duplicate call while in-flight is a no-op.
+        st.retry_borderless_permission();
+        assert!(st.borderless_request_in_flight);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while st.borderless_request_in_flight && std::time::Instant::now() < deadline {
+            let _ = st.poll_worker();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!st.borderless_request_in_flight);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(st.borderless_status, BorderlessCaptureStatus::Unsupported);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn linux_ui_hides_windows_borderless_controls() {
+        let st = AppState::default();
+        let env = Env::new(true, 1.0);
+        let mut rt = Runtime::new(st, views::root_view, (1240.0, 800.0), env);
+        rt.frame(0.0);
+
+        click_key(&mut rt, NavSection::Recording.key());
+        assert!(rt.find("cfg-hide-win-border-switch").is_none());
+        assert!(rt.find("retry-borderless-btn").is_none());
+
+        click_key(&mut rt, NavSection::Settings.key());
+        click_key(&mut rt, crate::state::SettingsTab::Recording.key());
+        assert!(rt.find("settings-hide-win-border").is_none());
+        assert!(rt.find("retry-borderless-btn").is_none());
+    }
 }

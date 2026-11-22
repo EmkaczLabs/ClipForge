@@ -1,5 +1,7 @@
 //! Settings view: Obsidian Forge split-pane configuration, search, and dependency diagnostics.
 
+#[cfg(target_os = "windows")]
+use clipforge_common::BorderlessCaptureStatus;
 use clipforge_common::{
     AudioCodec, CaptureTarget, ContainerFormat, EncoderMode, QualityPreset, VideoCodec,
 };
@@ -386,6 +388,8 @@ fn search_results_body(p: &Palette, s: &AppState, query: &str) -> El {
     rows.extend(general_rows(p, s));
     rows.extend(storage_rows(p, s));
     rows.extend(recording_rows(p, s));
+    #[cfg(target_os = "windows")]
+    rows.extend(windows_borderless_rows(p, s));
     rows.extend(audio_rows(p, s));
     rows.extend(shortcut_rows(p, s));
     rows.extend(appearance_rows(p, s));
@@ -679,7 +683,8 @@ fn recording_tab(p: &Palette, s: &AppState) -> El {
         }
     }
 
-    col()
+    #[allow(unused_mut)]
+    let mut tab = col()
         .key("settings-recording-tab")
         .w_full()
         .gap(space::LG)
@@ -694,7 +699,106 @@ fn recording_tab(p: &Palette, s: &AppState) -> El {
             "recording-encode-group",
             "ENCODER & FORMAT",
             encode_rows,
-        ))
+        ));
+
+    #[cfg(target_os = "windows")]
+    {
+        let win_rows: Vec<El> = windows_borderless_rows(p, s)
+            .into_iter()
+            .map(|r| r.element)
+            .collect();
+        tab = tab.child(settings_group(
+            p,
+            "recording-windows-group",
+            "WINDOWS GRAPHICS CAPTURE",
+            win_rows,
+        ));
+    }
+
+    tab
+}
+
+#[cfg(target_os = "windows")]
+fn windows_borderless_rows(p: &Palette, s: &AppState) -> Vec<SettingRowSpec> {
+    let (status_label, status_fg, status_bg) = if s.borderless_request_in_flight {
+        ("Requesting...", p.text_secondary, p.bg_surface)
+    } else {
+        match s.borderless_status {
+            BorderlessCaptureStatus::Unknown => {
+                ("Pending / Unknown", p.text_secondary, p.bg_surface)
+            }
+            BorderlessCaptureStatus::Granted => ("Granted", p.success, p.success_soft),
+            BorderlessCaptureStatus::DeniedByUser => {
+                ("Denied by User", p.warning_text, p.warning_soft)
+            }
+            BorderlessCaptureStatus::DeniedBySystem => {
+                ("Denied by System", p.warning_text, p.warning_soft)
+            }
+            BorderlessCaptureStatus::Unsupported => ("Unsupported", p.text_muted, p.bg_surface),
+        }
+    };
+
+    let status_desc = if s.borderless_status.is_denied() {
+        "Permission denied — capture continues normally with the yellow Windows border."
+    } else {
+        "Current Windows Graphics Capture borderless permission status"
+    };
+
+    let mut status_controls = row()
+        .key("settings-borderless-status-controls")
+        .gap(space::SM)
+        .center_y()
+        .child(badge(
+            "settings-borderless-status-badge",
+            status_label,
+            status_fg,
+            status_bg,
+        ));
+
+    if s.borderless_status.is_denied() {
+        let btn_label = if s.borderless_request_in_flight {
+            "Requesting..."
+        } else {
+            "Retry Permission"
+        };
+        status_controls =
+            status_controls.child(btn_secondary(p, "retry-borderless-btn", btn_label, |st| {
+                st.retry_borderless_permission()
+            }));
+    }
+
+    vec![
+        SettingRowSpec {
+            title: "Hide Windows capture border",
+            description: "Hide the yellow Windows Graphics Capture border when supported; Windows may require user permission",
+            category: "Recording Defaults Windows",
+            element: settings_row(
+                p,
+                "row-hide-windows-border",
+                "Hide Windows capture border",
+                "Hide the yellow Windows Graphics Capture border when supported; Windows may require user permission",
+                toggle_switch(
+                    p,
+                    "settings-hide-win-border",
+                    "Hide Windows capture border",
+                    s.config.capture.hide_windows_capture_border,
+                    |st| st.toggle_hide_windows_capture_border(),
+                ),
+            ),
+        },
+        SettingRowSpec {
+            title: "Borderless capture permission",
+            description: status_desc,
+            category: "Recording Defaults Windows",
+            element: settings_row(
+                p,
+                "row-borderless-status",
+                "Borderless capture permission",
+                status_desc,
+                status_controls,
+            ),
+        },
+    ]
 }
 
 fn recording_rows(p: &Palette, s: &AppState) -> Vec<SettingRowSpec> {

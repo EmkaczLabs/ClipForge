@@ -13,9 +13,9 @@ use clipforge_cloud_client::{
     QuotaDto, RemoteClipSummary, ServerInfoDto, ShareVisibility, UserInfo,
 };
 use clipforge_common::{
-    AppConfig, AudioCodec, AudioTrackInfo, CaptureEvent, CaptureStatus, CaptureTarget, ClipId,
-    ClipMetadata, CloudShareInfo, ContainerFormat, EncoderMode, GameInfo, HotkeyBindings,
-    QualityPreset, TrimRequest, VideoCodec,
+    AppConfig, AudioCodec, AudioTrackInfo, BorderlessCaptureStatus, CaptureEvent, CaptureStatus,
+    CaptureTarget, ClipId, ClipMetadata, CloudShareInfo, ContainerFormat, EncoderMode, GameInfo,
+    HotkeyBindings, QualityPreset, TrimRequest, VideoCodec,
 };
 use clipforge_library::{ClipOrigin, ClipSort};
 use clipforge_media::{
@@ -357,6 +357,8 @@ pub struct AppState {
     pub confirm_remote_delete: Option<ClipId>,
     pub hotkeys: HotkeyConfig,
     pub hotkey_status: GlobalHotkeyStatus,
+    pub borderless_status: BorderlessCaptureStatus,
+    pub borderless_request_in_flight: bool,
     #[allow(dead_code)]
     pub audio_config_dirty_while_active: bool,
     #[allow(dead_code)]
@@ -477,6 +479,8 @@ impl Default for AppState {
             confirm_remote_delete: None,
             hotkeys,
             hotkey_status: GlobalHotkeyStatus::FocusedWindowOnly { reason: None },
+            borderless_status: BorderlessCaptureStatus::Unknown,
+            borderless_request_in_flight: false,
             audio_config_dirty_while_active: false,
             mic_test: MicTestState::default(),
             status_banner: None,
@@ -1515,6 +1519,29 @@ impl AppState {
         }
     }
 
+    /// Applies an incoming [`CaptureEvent`] to `AppState`.
+    pub(crate) fn handle_capture_event(&mut self, cap_ev: CaptureEvent) {
+        match cap_ev {
+            CaptureEvent::StatusChanged(status) => {
+                self.capture_status = status;
+            }
+            CaptureEvent::BorderlessCaptureStatusChanged(status) => {
+                self.borderless_status = status;
+                self.borderless_request_in_flight = false;
+            }
+            CaptureEvent::ReplaySaved { path, .. }
+            | CaptureEvent::RecordingFinished { path, .. } => {
+                self.status_banner = Some(format!("Captured: {}", path.display()));
+                if let Some(worker) = &self.worker {
+                    worker.send(WorkerCommand::ScanLibrary(self.config.clone()));
+                }
+            }
+            CaptureEvent::Warning(msg) | CaptureEvent::Error(msg) => {
+                self.status_banner = Some(msg);
+            }
+        }
+    }
+
     /// Saves the current `AppConfig` asynchronously via the background worker.
     pub fn save_config(&mut self) {
         if let Some(worker) = &self.worker {
@@ -1621,21 +1648,7 @@ impl AppState {
             WorkerEvent::HotkeyStatusChanged(status) => {
                 self.hotkey_status = status;
             }
-            WorkerEvent::CaptureEventReceived(cap_ev) => match cap_ev {
-                CaptureEvent::StatusChanged(status) => {
-                    self.capture_status = status;
-                }
-                CaptureEvent::ReplaySaved { path, .. }
-                | CaptureEvent::RecordingFinished { path, .. } => {
-                    self.status_banner = Some(format!("Captured: {}", path.display()));
-                    if let Some(worker) = &self.worker {
-                        worker.send(WorkerCommand::ScanLibrary(self.config.clone()));
-                    }
-                }
-                CaptureEvent::Warning(msg) | CaptureEvent::Error(msg) => {
-                    self.status_banner = Some(msg);
-                }
-            },
+            WorkerEvent::CaptureEventReceived(cap_ev) => self.handle_capture_event(cap_ev),
             WorkerEvent::ConfigSaved(Ok(path)) => {
                 self.status_banner = Some(format!("Saved config to {}", path.display()));
             }
@@ -2104,6 +2117,27 @@ impl AppState {
     /// Sets whether Wayland screencast portal session tokens are restored.
     pub fn set_restore_portal_session(&mut self, enabled: bool) {
         self.config.capture.restore_portal_session = enabled;
+    }
+
+    /// Toggles whether Windows Graphics Capture hides the yellow capture border and persists config.
+    pub fn toggle_hide_windows_capture_border(&mut self) {
+        self.config.capture.hide_windows_capture_border =
+            !self.config.capture.hide_windows_capture_border;
+        self.save_config();
+    }
+
+    /// Requests Windows borderless capture permission asynchronously via the background worker.
+    pub fn retry_borderless_permission(&mut self) {
+        if self.borderless_request_in_flight {
+            return;
+        }
+        if let Some(worker) = &self.worker {
+            self.borderless_request_in_flight = true;
+            worker.send(WorkerCommand::RetryBorderlessPermission);
+        } else {
+            self.status_banner =
+                Some("Worker unavailable for borderless permission request".to_string());
+        }
     }
 
     /// Updates `clips_dir` and persists settings.

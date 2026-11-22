@@ -10,7 +10,8 @@ use chrono::{DateTime, Utc};
 use clipforge_capture::{
     AudioDeviceInfo, CaptureBackend, GlobalHotkeyStatus, HotkeyAction, HotkeyManager, HotkeySpec,
     MonitorInfo, create_capture_backend, discover_application_audio, discover_audio_devices,
-    discover_monitors, parse_hotkey, probe_capture_capabilities,
+    discover_monitors, parse_hotkey, probe_borderless_capture_status, probe_capture_capabilities,
+    request_borderless_access_for_config,
 };
 use clipforge_cloud_client::{
     CreateShareRequest, CreateShareResponse, HttpCloudClient, QuotaDto, RemoteClipSummary,
@@ -157,6 +158,7 @@ pub enum WorkerCommand {
     PlayMicTestSample,
     ClearMicTest,
     RestartReplayBuffer(CaptureConfig),
+    RetryBorderlessPermission,
 }
 
 /// Events emitted by the background Tokio worker back to the Rune UI thread.
@@ -465,6 +467,10 @@ async fn handle_command(
                 *guard = cfg.clone();
             }
             register_hotkeys(&svc, &cfg.hotkeys);
+            let borderless_status = probe_borderless_capture_status();
+            let _ = evt_tx.send(WorkerEvent::CaptureEventReceived(
+                CaptureEvent::BorderlessCaptureStatusChanged(borderless_status),
+            ));
             let deps = probe_dependencies().await;
             let _ = evt_tx.send(WorkerEvent::DependenciesProbed(deps));
             let t_deps = t_init.elapsed();
@@ -1232,6 +1238,13 @@ async fn handle_command(
                 Err(err) => format!("Failed to export diagnostics: {err}"),
             };
             let _ = evt_tx.send(WorkerEvent::Banner(msg));
+            (waker)();
+        }
+        WorkerCommand::RetryBorderlessPermission => {
+            let status = request_borderless_access_for_config(true, true).await;
+            let _ = evt_tx.send(WorkerEvent::CaptureEventReceived(
+                CaptureEvent::BorderlessCaptureStatusChanged(status),
+            ));
             (waker)();
         }
     }
