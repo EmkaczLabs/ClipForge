@@ -18,6 +18,7 @@ x11rb = "0.13"
 zbus.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+uuid.workspace = true
 windows = { version = "0.62", features = [
     "Foundation",
     "Graphics_Capture",

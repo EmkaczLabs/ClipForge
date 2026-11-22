@@ -554,6 +554,7 @@ impl HotkeyManager {
         let stop_clone = Arc::clone(&stop_flag);
         let thread_id = Arc::new(AtomicU32::new(0));
         let thread_id_clone = Arc::clone(&thread_id);
+        let status_tx_thread = status_tx.clone();
 
         let handle = std::thread::Builder::new()
             .name("clipforge-win-hotkey".to_string())
@@ -569,7 +570,7 @@ impl HotkeyManager {
                         for reg_id in registered_ids {
                             let _ = UnregisterHotKey(None, reg_id);
                         }
-                        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                        let _ = status_tx_thread.send(GlobalHotkeyStatus::RegistrationError {
                             message: format!("RegisterHotKey failed for '{display}': {err}"),
                         });
                         return;
@@ -577,7 +578,7 @@ impl HotkeyManager {
                     registered_ids.push(*id);
                 }
 
-                let _ = status_tx.send(GlobalHotkeyStatus::WindowsGlobalActive);
+                let _ = status_tx_thread.send(GlobalHotkeyStatus::WindowsGlobalActive);
 
                 let mut msg = MSG::default();
                 while !stop_clone.load(Ordering::Relaxed) {

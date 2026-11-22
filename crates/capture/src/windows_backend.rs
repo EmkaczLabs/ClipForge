@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use clipforge_common::{
-    CaptureBackend, CaptureConfig, CaptureEvent, CaptureStatus, ClipForgeError, Result,
-};
+#[cfg(not(target_os = "windows"))]
+use clipforge_common::ClipForgeError;
+use clipforge_common::{CaptureBackend, CaptureConfig, CaptureEvent, CaptureStatus, Result};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::audio::{is_mic_source, parse_routed_audio_source};
