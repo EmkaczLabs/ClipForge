@@ -125,12 +125,127 @@ pub async fn detect_gsr() -> Result<GsrInstallation> {
     ))
 }
 
-/// Detects `gpu-screen-recorder` on non-Linux hosts (always unavailable; WGC+WASAPI unimplemented).
+/// Cross-platform capture backend availability and location probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureCapabilityProbe {
+    pub available: bool,
+    pub backend_name: String,
+    pub location: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Probes capture backend availability on the current host.
+///
+/// - On Linux, probes `gpu-screen-recorder` (native `PATH` or Flatpak).
+/// - On Windows, probes `ffmpeg.exe` + WGC/WASAPI availability (`available: true` when `ffmpeg.exe` is present).
+pub async fn probe_capture_capabilities() -> CaptureCapabilityProbe {
+    #[cfg(target_os = "linux")]
+    {
+        match detect_gsr().await {
+            Ok(GsrInstallation::Native(path)) => CaptureCapabilityProbe {
+                available: true,
+                backend_name: "gpu-screen-recorder".to_string(),
+                location: Some(path.display().to_string()),
+                detail: None,
+            },
+            Ok(GsrInstallation::Flatpak { app_id }) => CaptureCapabilityProbe {
+                available: true,
+                backend_name: "gpu-screen-recorder".to_string(),
+                location: Some(format!("flatpak: {app_id}")),
+                detail: None,
+            },
+            Err(err) => CaptureCapabilityProbe {
+                available: false,
+                backend_name: "gpu-screen-recorder".to_string(),
+                location: None,
+                detail: Some(err.to_string()),
+            },
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match crate::windows_encoder::find_ffmpeg_binary() {
+            Some(ffmpeg_path) => CaptureCapabilityProbe {
+                available: true,
+                backend_name: "Windows Graphics Capture + WASAPI".to_string(),
+                location: Some(ffmpeg_path.display().to_string()),
+                detail: None,
+            },
+            None => CaptureCapabilityProbe {
+                available: false,
+                backend_name: "Windows Graphics Capture + WASAPI".to_string(),
+                location: None,
+                detail: Some(
+                    "ffmpeg.exe was not found in the application directory or PATH".to_string(),
+                ),
+            },
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        CaptureCapabilityProbe {
+            available: false,
+            backend_name: "unsupported".to_string(),
+            location: None,
+            detail: Some("capture is only supported on Linux and Windows".to_string()),
+        }
+    }
+}
+
+/// Discovers capture monitors using the platform-native backend
+/// (`gpu-screen-recorder` on Linux, WGC/DXGI on Windows).
+pub async fn discover_monitors() -> Result<Vec<MonitorInfo>> {
+    #[cfg(target_os = "linux")]
+    {
+        let install = detect_gsr().await?;
+        list_monitors(&install).await
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_wgc::enumerate_windows_monitors()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+/// Discovers audio input/output devices using the platform-native backend
+/// (`gpu-screen-recorder` on Linux, WASAPI on Windows).
+pub async fn discover_audio_devices() -> Result<Vec<AudioDeviceInfo>> {
+    #[cfg(target_os = "linux")]
+    {
+        let install = detect_gsr().await?;
+        list_audio_devices(&install).await
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_audio::enumerate_wasapi_devices()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+/// Discovers per-application audio capture targets (Linux PipeWire/GSR only).
+pub async fn discover_application_audio() -> Result<Vec<AudioDeviceInfo>> {
+    #[cfg(target_os = "linux")]
+    {
+        let install = detect_gsr().await?;
+        list_application_audio(&install).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+/// Detects `gpu-screen-recorder` on non-Linux hosts (always unavailable; use `probe_capture_capabilities()`).
 #[cfg(not(target_os = "linux"))]
 pub async fn detect_gsr() -> Result<GsrInstallation> {
     Err(ClipForgeError::CaptureUnavailable(
-        "gpu-screen-recorder is Linux-only (WGC + WASAPI capture is unimplemented on Windows)."
-            .to_string(),
+        "gpu-screen-recorder is Linux-only; use WindowsCaptureBackend on Windows.".to_string(),
     ))
 }
 
@@ -323,5 +438,11 @@ mod tests {
         assert!(caps.supports_vulkan);
         assert!(caps.supports_portal);
         assert!(!caps.supports_nvenc);
+    }
+
+    #[tokio::test]
+    async fn probe_capture_capabilities_returns_non_empty_backend_name() {
+        let probe = probe_capture_capabilities().await;
+        assert!(!probe.backend_name.is_empty());
     }
 }

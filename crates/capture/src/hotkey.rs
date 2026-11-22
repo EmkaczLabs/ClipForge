@@ -87,11 +87,12 @@ impl HotkeyAction {
     }
 }
 
-/// Selected global hotkey backend for the current Linux session.
+/// Selected global hotkey backend for the current session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyBackendKind {
     WaylandPortal,
     X11,
+    Windows,
     FocusedOnly,
 }
 
@@ -104,6 +105,8 @@ pub enum GlobalHotkeyStatus {
     PermissionPending,
     /// X11 global key grabs are active.
     X11GlobalActive,
+    /// Windows `RegisterHotKey` global shortcuts are active.
+    WindowsGlobalActive,
     /// Only focused-window shortcuts are active (e.g. headless, cancelled, or unsupported).
     FocusedWindowOnly { reason: Option<String> },
     /// Global shortcut registration failed; focused-window shortcuts still work.
@@ -117,6 +120,7 @@ impl GlobalHotkeyStatus {
             Self::WaylandPortalActive => "GlobalShortcuts (Wayland Portal Active)".to_string(),
             Self::PermissionPending => "Permission Pending".to_string(),
             Self::X11GlobalActive => "X11 Global".to_string(),
+            Self::WindowsGlobalActive => "Windows Global (RegisterHotKey)".to_string(),
             Self::FocusedWindowOnly { reason: None } => "Focused-Window Only".to_string(),
             Self::FocusedWindowOnly { reason: Some(r) } => {
                 format!("Focused-Window Only ({r})")
@@ -127,7 +131,10 @@ impl GlobalHotkeyStatus {
 
     /// Returns `true` when system-wide global hotkeys are actively registered.
     pub fn is_global_active(&self) -> bool {
-        matches!(self, Self::WaylandPortalActive | Self::X11GlobalActive)
+        matches!(
+            self,
+            Self::WaylandPortalActive | Self::X11GlobalActive | Self::WindowsGlobalActive
+        )
     }
 }
 
@@ -159,7 +166,11 @@ pub fn detect_hotkey_backend() -> HotkeyBackendKind {
         let display = std::env::var("DISPLAY").ok();
         select_hotkey_backend(xdg.as_deref(), wayland.as_deref(), display.as_deref())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        HotkeyBackendKind::Windows
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         HotkeyBackendKind::FocusedOnly
     }
@@ -319,13 +330,88 @@ fn parse_keysym(key: &str) -> Option<u32> {
     }
 }
 
-/// Manages global hotkeys via XDG Desktop Portal `GlobalShortcuts` on Wayland or `x11rb` on X11.
+/// Windows virtual-key + `RegisterHotKey` modifier bitmask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsHotkeyCode {
+    /// Win32 `HOT_KEY_MODIFIERS` bitmask (`MOD_ALT`, `MOD_CONTROL`, `MOD_SHIFT`, `MOD_WIN`, `MOD_NOREPEAT`).
+    pub modifiers: u32,
+    /// Win32 Virtual-Key code (`VK_*`).
+    pub vk: u32,
+}
+
+const WIN_MOD_ALT: u32 = 0x0001;
+const WIN_MOD_CONTROL: u32 = 0x0002;
+const WIN_MOD_SHIFT: u32 = 0x0004;
+const WIN_MOD_WIN: u32 = 0x0008;
+const WIN_MOD_NOREPEAT: u32 = 0x4000;
+
+/// Converts a [`HotkeySpec`] into a Win32 [`WindowsHotkeyCode`] for `RegisterHotKey`.
+pub fn hotkey_spec_to_windows_code(spec: &HotkeySpec) -> Result<WindowsHotkeyCode> {
+    let mut modifiers = WIN_MOD_NOREPEAT;
+    if spec.modifiers & MOD_ALT != 0 {
+        modifiers |= WIN_MOD_ALT;
+    }
+    if spec.modifiers & MOD_CONTROL != 0 {
+        modifiers |= WIN_MOD_CONTROL;
+    }
+    if spec.modifiers & MOD_SHIFT != 0 {
+        modifiers |= WIN_MOD_SHIFT;
+    }
+    if spec.modifiers & MOD_SUPER != 0 {
+        modifiers |= WIN_MOD_WIN;
+    }
+
+    let vk = if (0xFFBE..=0xFFD5).contains(&spec.keysym) {
+        // VK_F1 (0x70) .. VK_F24 (0x87)
+        0x70 + (spec.keysym - 0xFFBE)
+    } else if (b'a' as u32..=b'z' as u32).contains(&spec.keysym) {
+        // ASCII uppercase 'A'..'Z'
+        (b'A' as u32) + (spec.keysym - b'a' as u32)
+    } else if (b'0' as u32..=b'9' as u32).contains(&spec.keysym) {
+        spec.keysym
+    } else {
+        match spec.keysym {
+            0x0020 => 0x20, // VK_SPACE
+            0xFF0D => 0x0D, // VK_RETURN
+            0xFF1B => 0x1B, // VK_ESCAPE
+            0xFF09 => 0x09, // VK_TAB
+            0xFF61 => 0x2C, // VK_SNAPSHOT (PrintScreen)
+            0xFF63 => 0x2D, // VK_INSERT
+            0xFFFF => 0x2E, // VK_DELETE
+            0xFF50 => 0x24, // VK_HOME
+            0xFF57 => 0x23, // VK_END
+            0xFF13 => 0x13, // VK_PAUSE
+            other => {
+                return Err(ClipForgeError::InvalidInput(format!(
+                    "unsupported Windows hotkey keysym 0x{other:x} for '{}'",
+                    spec.display
+                )));
+            }
+        }
+    };
+
+    Ok(WindowsHotkeyCode { modifiers, vk })
+}
+
+/// Parses a human-readable hotkey string (e.g. `"F9"`, `"Ctrl+Alt+F10"`) directly into
+/// a Win32 [`WindowsHotkeyCode`].
+pub fn parse_windows_hotkey(input: &str) -> Result<WindowsHotkeyCode> {
+    let spec = parse_hotkey(input)?;
+    hotkey_spec_to_windows_code(&spec)
+}
+
+/// Manages global hotkeys via XDG Desktop Portal `GlobalShortcuts` on Wayland,
+/// `x11rb` on X11, or Win32 `RegisterHotKey` on Windows.
 pub struct HotkeyManager {
     stop_flag: Arc<AtomicBool>,
     #[cfg(target_os = "linux")]
     x11_handle: Option<JoinHandle<()>>,
     #[cfg(target_os = "linux")]
     portal_stop_tx: Option<oneshot::Sender<()>>,
+    #[cfg(target_os = "windows")]
+    win_thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(target_os = "windows")]
+    win_thread_id: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl HotkeyManager {
@@ -337,6 +423,10 @@ impl HotkeyManager {
             x11_handle: None,
             #[cfg(target_os = "linux")]
             portal_stop_tx: None,
+            #[cfg(target_os = "windows")]
+            win_thread: None,
+            #[cfg(target_os = "windows")]
+            win_thread_id: None,
         }
     }
 
@@ -381,7 +471,7 @@ impl HotkeyManager {
                     Self::idle()
                 }
             },
-            HotkeyBackendKind::FocusedOnly => {
+            HotkeyBackendKind::FocusedOnly | HotkeyBackendKind::Windows => {
                 let _ = status_tx.send(GlobalHotkeyStatus::FocusedWindowOnly {
                     reason: Some("no Wayland portal or X11 display detected".to_string()),
                 });
@@ -390,8 +480,31 @@ impl HotkeyManager {
         }
     }
 
-    /// Starts global hotkey registration on non-Linux platforms (focused-window shortcuts only).
-    #[cfg(not(target_os = "linux"))]
+    /// Starts global hotkey registration on Windows via `RegisterHotKey`.
+    #[cfg(target_os = "windows")]
+    pub fn start_with_backend(
+        backend: HotkeyBackendKind,
+        bindings: Vec<(HotkeyAction, HotkeySpec)>,
+        tx: mpsc::UnboundedSender<HotkeyAction>,
+        status_tx: mpsc::UnboundedSender<GlobalHotkeyStatus>,
+    ) -> Self {
+        if bindings.is_empty() {
+            let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                message: "at least one hotkey binding is required".to_string(),
+            });
+            return Self::idle();
+        }
+        if backend == HotkeyBackendKind::FocusedOnly {
+            let _ = status_tx.send(GlobalHotkeyStatus::FocusedWindowOnly {
+                reason: Some("focused-window shortcuts requested".to_string()),
+            });
+            return Self::idle();
+        }
+        Self::start_windows_register_hotkey(bindings, tx, status_tx)
+    }
+
+    /// Starts global hotkey registration on non-Linux, non-Windows platforms.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     pub fn start_with_backend(
         _backend: HotkeyBackendKind,
         bindings: Vec<(HotkeyAction, HotkeySpec)>,
@@ -405,12 +518,101 @@ impl HotkeyManager {
             return Self::idle();
         }
         let _ = status_tx.send(GlobalHotkeyStatus::FocusedWindowOnly {
-            reason: Some(
-                "global hotkeys are not yet implemented on Windows; focused-window shortcuts are active"
-                    .to_string(),
-            ),
+            reason: Some("global hotkeys are not supported on this platform".to_string()),
         });
         Self::idle()
+    }
+
+    /// Starts a Win32 `RegisterHotKey` message-loop thread on Windows.
+    #[cfg(target_os = "windows")]
+    pub fn start_windows_register_hotkey(
+        bindings: Vec<(HotkeyAction, HotkeySpec)>,
+        tx: mpsc::UnboundedSender<HotkeyAction>,
+        status_tx: mpsc::UnboundedSender<GlobalHotkeyStatus>,
+    ) -> Self {
+        use std::sync::atomic::AtomicU32;
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
+
+        let mut parsed = Vec::with_capacity(bindings.len());
+        for (idx, (action, spec)) in bindings.into_iter().enumerate() {
+            match hotkey_spec_to_windows_code(&spec) {
+                Ok(code) => parsed.push(((idx as i32) + 1, action, spec.display, code)),
+                Err(err) => {
+                    let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                        message: err.to_string(),
+                    });
+                    return Self::idle();
+                }
+            }
+        }
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop_flag);
+        let thread_id = Arc::new(AtomicU32::new(0));
+        let thread_id_clone = Arc::clone(&thread_id);
+
+        let handle = std::thread::Builder::new()
+            .name("clipforge-win-hotkey".to_string())
+            .spawn(move || unsafe {
+                let tid = GetCurrentThreadId();
+                thread_id_clone.store(tid, Ordering::SeqCst);
+
+                let mut registered_ids = Vec::new();
+                for (id, _action, display, code) in &parsed {
+                    if let Err(err) =
+                        RegisterHotKey(None, *id, HOT_KEY_MODIFIERS(code.modifiers), code.vk)
+                    {
+                        for reg_id in registered_ids {
+                            let _ = UnregisterHotKey(None, reg_id);
+                        }
+                        let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                            message: format!("RegisterHotKey failed for '{display}': {err}"),
+                        });
+                        return;
+                    }
+                    registered_ids.push(*id);
+                }
+
+                let _ = status_tx.send(GlobalHotkeyStatus::WindowsGlobalActive);
+
+                let mut msg = MSG::default();
+                while !stop_clone.load(Ordering::Relaxed) {
+                    let ret = GetMessageW(&mut msg, None, 0, 0);
+                    if ret.0 <= 0 {
+                        break;
+                    }
+                    if msg.message == WM_HOTKEY {
+                        let hotkey_id = msg.wParam.0 as i32;
+                        if let Some((_, action, _, _)) =
+                            parsed.iter().find(|(id, _, _, _)| *id == hotkey_id)
+                        {
+                            let _ = tx.send(*action);
+                        }
+                    }
+                }
+
+                for reg_id in registered_ids {
+                    let _ = UnregisterHotKey(None, reg_id);
+                }
+            });
+
+        match handle {
+            Ok(join) => Self {
+                stop_flag,
+                win_thread: Some(join),
+                win_thread_id: Some(thread_id),
+            },
+            Err(err) => {
+                let _ = status_tx.send(GlobalHotkeyStatus::RegistrationError {
+                    message: format!("failed to spawn Windows hotkey thread: {err}"),
+                });
+                Self::idle()
+            }
+        }
     }
 
     /// Starts an async XDG Desktop Portal `GlobalShortcuts` listener on the current Tokio runtime.
@@ -548,7 +750,7 @@ impl HotkeyManager {
         })
     }
 
-    /// Stops the background hotkey listener (X11 thread or Wayland portal task).
+    /// Stops the background hotkey listener (X11 thread, Wayland portal task, or Windows message loop).
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
@@ -557,6 +759,22 @@ impl HotkeyManager {
                 let _ = tx.send(());
             }
             if let Some(handle) = self.x11_handle.take() {
+                let _ = handle.join();
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(tid_arc) = self.win_thread_id.take() {
+                let tid = tid_arc.load(Ordering::SeqCst);
+                if tid != 0 {
+                    use windows::Win32::Foundation::{LPARAM, WPARAM};
+                    use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+                    unsafe {
+                        let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
+            if let Some(handle) = self.win_thread.take() {
                 let _ = handle.join();
             }
         }
@@ -1058,10 +1276,42 @@ mod tests {
         assert_eq!(GlobalHotkeyStatus::X11GlobalActive.label(), "X11 Global");
         assert!(GlobalHotkeyStatus::X11GlobalActive.is_global_active());
         assert_eq!(
+            GlobalHotkeyStatus::WindowsGlobalActive.label(),
+            "Windows Global (RegisterHotKey)"
+        );
+        assert!(GlobalHotkeyStatus::WindowsGlobalActive.is_global_active());
+        assert_eq!(
             GlobalHotkeyStatus::PermissionPending.label(),
             "Permission Pending"
         );
         assert!(!GlobalHotkeyStatus::PermissionPending.is_global_active());
+    }
+
+    #[test]
+    fn parse_windows_hotkey_maps_function_and_modified_keys() {
+        let f9 = parse_windows_hotkey("F9").unwrap();
+        assert_eq!(f9.vk, 0x78); // VK_F9
+        assert_eq!(f9.modifiers, WIN_MOD_NOREPEAT);
+
+        let f10 = parse_windows_hotkey("F10").unwrap();
+        assert_eq!(f10.vk, 0x79); // VK_F10
+
+        let f11 = parse_windows_hotkey("F11").unwrap();
+        assert_eq!(f11.vk, 0x7A); // VK_F11
+
+        let combo = parse_windows_hotkey("Ctrl+Alt+Shift+R").unwrap();
+        assert_eq!(combo.vk, b'R' as u32);
+        assert_eq!(
+            combo.modifiers,
+            WIN_MOD_CONTROL | WIN_MOD_ALT | WIN_MOD_SHIFT | WIN_MOD_NOREPEAT
+        );
+
+        let win_key = parse_windows_hotkey("Super+Space").unwrap();
+        assert_eq!(win_key.vk, 0x20);
+        assert_eq!(win_key.modifiers, WIN_MOD_WIN | WIN_MOD_NOREPEAT);
+
+        assert!(parse_windows_hotkey("").is_err());
+        assert!(parse_windows_hotkey("Ctrl+UnknownKey").is_err());
     }
 
     #[cfg(target_os = "linux")]

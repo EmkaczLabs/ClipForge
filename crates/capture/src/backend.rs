@@ -99,7 +99,22 @@ impl GsrCaptureBackend {
         *self.status.lock().await = new_status.clone();
         let _ = self.events.send(CaptureEvent::StatusChanged(new_status));
     }
+}
 
+/// Creates the platform-appropriate [`CaptureBackend`] implementation:
+/// [`GsrCaptureBackend`] on Linux and [`WindowsCaptureBackend`] on Windows.
+pub fn create_capture_backend() -> Arc<dyn CaptureBackend> {
+    #[cfg(target_os = "windows")]
+    {
+        Arc::new(crate::windows_backend::WindowsCaptureBackend::new())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Arc::new(GsrCaptureBackend::new())
+    }
+}
+
+impl GsrCaptureBackend {
     /// Toggles pause/resume (`SIGUSR2`) when a regular recording is active.
     #[cfg(target_os = "linux")]
     pub async fn toggle_pause(&self) -> Result<bool> {
@@ -683,6 +698,13 @@ mod tests {
         let backend = GsrCaptureBackend::new();
         assert!(backend.stop().await.is_ok());
         assert_eq!(backend.status().await, CaptureStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn create_capture_backend_returns_idle_backend() {
+        let backend = create_capture_backend();
+        assert_eq!(backend.status().await, CaptureStatus::Idle);
+        assert!(backend.stop().await.is_ok());
     }
 
     #[cfg(target_os = "linux")]
