@@ -17,7 +17,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  windows-build:
+  windows-portable:
     runs-on: [self-hosted, Windows, X64, clipforge-windows-build]
     timeout-minutes: 30
     defaults:
@@ -70,78 +70,44 @@ jobs:
           ffprobe -version
           if ($LASTEXITCODE -ne 0) { throw "ffprobe -version failed with exit code $LASTEXITCODE" }
       - name: Build release binary
-        run: cargo build --release -p clipforge-desktop
-      - name: Upload release binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-release-bin
-          path: |
-            C:/Rust/target/portable-release/release/clipforge-desktop.exe
-            C:/Rust/target/portable-release/release/*.dll
-          retention-days: 1
-          if-no-files-found: warn
-
-  package-portable:
-    needs: windows-build
-    runs-on: [self-hosted, Windows, X64, clipforge-windows-build]
-    timeout-minutes: 10
-    defaults:
-      run:
-        shell: powershell
-    steps:
-      - uses: actions/checkout@v4
-      - name: Verify persistent FFmpeg
         run: |
           $ErrorActionPreference = "Stop"
-          $ffmpegDir = "C:\ffmpeg-bin"
-          $ffmpegExe = Join-Path $ffmpegDir "ffmpeg.exe"
-          $ffprobeExe = Join-Path $ffmpegDir "ffprobe.exe"
-
-          if (-not ((Test-Path -LiteralPath $ffmpegExe -PathType Leaf) -and (Test-Path -LiteralPath $ffprobeExe -PathType Leaf))) {
-            throw "Missing C:\ffmpeg-bin\ffmpeg.exe or ffprobe.exe on clipforge-win-builder."
-          }
-
-          "C:\ffmpeg-bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $env:PATH = "C:\ffmpeg-bin;$env:PATH"
-          ffmpeg -version
-          if ($LASTEXITCODE -ne 0) { throw "ffmpeg -version failed with exit code $LASTEXITCODE" }
-          ffprobe -version
-          if ($LASTEXITCODE -ne 0) { throw "ffprobe -version failed with exit code $LASTEXITCODE" }
-      - name: Download release binary
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-release-bin
-          path: target/release
+          cargo build --release -p clipforge-desktop
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
       - name: Package Windows portable bundle
-        run: ./packaging/windows/package-portable.ps1 -TargetDir "target/release" -OutDir "${{ runner.temp }}/dist" -FfmpegDir "C:\ffmpeg-bin"
-      - name: Upload Windows portable artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ClipForge-Windows-x64-portable
-          path: |
-            ${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip
-            ${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip.sha256
-          retention-days: 7
-          if-no-files-found: error
-      - name: Upload Windows portable artifact to RustFS
+        run: ./packaging/windows/package-portable.ps1 -TargetDir "C:\Rust\target\portable-release\release" -OutDir "${{ runner.temp }}/dist" -FfmpegDir "C:\ffmpeg-bin"
+      - name: Upload & verify Windows portable artifact in RustFS
         env:
           RUSTFS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY_ID }}
           RUSTFS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_ACCESS_KEY }}
+          RUSTFS_ENDPOINT: https://s3.emkacz.dev
+          RUSTFS_BUCKET: clipforge-builds
         run: |
           $ErrorActionPreference = "Stop"
           if (-not $env:RUSTFS_ACCESS_KEY_ID -or -not $env:RUSTFS_SECRET_ACCESS_KEY) {
-            Write-Host "Skipping RustFS upload (RUSTFS_ACCESS_KEY_ID / RUSTFS_SECRET_ACCESS_KEY secrets not configured)."
-            exit 0
+            throw "RUSTFS_ACCESS_KEY_ID and RUSTFS_SECRET_ACCESS_KEY secrets must be configured."
           }
-          $python = if (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" } else { throw "Python 3 not found on PATH" }
+          $pythonCmd = $null
+          $pythonArgs = @()
+          if (Get-Command python3 -ErrorAction SilentlyContinue) {
+            $pythonCmd = "python3"
+          } elseif (Get-Command python -ErrorAction SilentlyContinue) {
+            $pythonCmd = "python"
+          } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+            $pythonCmd = "py"
+            $pythonArgs = @("-3")
+          } else {
+            throw "Python 3 not found on PATH"
+          }
           $mode = if ("${{ github.ref }}".StartsWith("refs/tags/")) { "releases" } else { "ci" }
-          & $python scripts/ci/upload_rustfs.py `
+          & $pythonCmd @pythonArgs scripts/ci/upload_rustfs.py `
             --mode $mode `
             --platform windows-x64 `
             --version "${{ github.ref_name }}" `
             --commit "${{ github.sha }}" `
             --run-id "${{ github.run_id }}" `
             --workflow "${{ github.workflow }}" `
+            --verify-download `
             "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip" `
             "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip.sha256"
-          if ($LASTEXITCODE -ne 0) { throw "RustFS upload failed with exit code $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "RustFS upload/verification failed with exit code $LASTEXITCODE" }
