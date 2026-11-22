@@ -1534,8 +1534,13 @@ fn about_tab(p: &Palette, s: &AppState) -> El {
             config_file_path().display().to_string(),
         ));
 
+    let capture_dep_label = if cfg!(target_os = "windows") {
+        "Windows Graphics Capture + WASAPI"
+    } else {
+        "gpu-screen-recorder"
+    };
     let gsr_guidance = if cfg!(target_os = "windows") {
-        "Linux-only (WGC + WASAPI capture is unimplemented on Windows)"
+        "Built-in WGC + WASAPI capture (requires ffmpeg.exe on PATH)"
     } else {
         "Install via Flatpak (com.dec05eba.gpu_screen_recorder) or distro package"
     };
@@ -1567,7 +1572,7 @@ fn about_tab(p: &Palette, s: &AppState) -> El {
         .child(dep_row(
             p,
             "dep-gsr",
-            "gpu-screen-recorder",
+            capture_dep_label,
             s.deps.gsr_available,
             gsr_guidance,
         ))

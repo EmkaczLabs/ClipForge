@@ -410,13 +410,27 @@ fn capture_health_card(p: &Palette, s: &AppState) -> El {
         ("Error", p.error_text, p.recording_soft)
     } else if s.deps.gsr_available {
         ("Ready", p.success_text, p.success_soft)
+    } else if cfg!(target_os = "windows") {
+        ("Capture Missing", p.warning_text, p.warning_soft)
     } else {
         ("GSR Missing", p.warning_text, p.warning_soft)
     };
 
+    let engine_row_label = if cfg!(target_os = "windows") {
+        "Capture Engine"
+    } else {
+        "GSR Engine"
+    };
+
     let gsr_val = s.deps.gsr_location.clone().unwrap_or_else(|| {
         if s.deps.gsr_available {
-            "Available".to_string()
+            if cfg!(target_os = "windows") {
+                "Windows Graphics Capture + WASAPI".to_string()
+            } else {
+                "Available".to_string()
+            }
+        } else if cfg!(target_os = "windows") {
+            "FFmpeg missing from PATH".to_string()
         } else {
             "Not found on PATH".to_string()
         }
@@ -457,7 +471,7 @@ fn capture_health_card(p: &Palette, s: &AppState) -> El {
                     health_bg,
                 )),
         )
-        .child(kv_row(p, "rec-hlth-gsr", "GSR Engine", gsr_val))
+        .child(kv_row(p, "rec-hlth-gsr", engine_row_label, gsr_val))
         .child(kv_row(p, "rec-hlth-media", "Media Tools", media_tools_val))
         .child(kv_row(
             p,
@@ -771,9 +785,13 @@ fn monitors_section(p: &Palette, s: &AppState) -> El {
                     .color(p.text_secondary),
             )
             .child(
-                text("Click Refresh Sources to enumerate displays from GSR")
-                    .font(typography::LABEL)
-                    .color(p.text_muted),
+                text(if cfg!(target_os = "windows") {
+                    "Click Refresh Sources to enumerate displays"
+                } else {
+                    "Click Refresh Sources to enumerate displays from GSR"
+                })
+                .font(typography::LABEL)
+                .color(p.text_muted),
             );
     }
 
@@ -1781,6 +1799,13 @@ fn hotkeys_card(p: &Palette, s: &AppState) -> El {
             p.success_text,
             p.success_soft,
             "X11 global keybindings active".to_string(),
+            None,
+        ),
+        GlobalHotkeyStatus::WindowsGlobalActive => (
+            "Windows Global".to_string(),
+            p.success_text,
+            p.success_soft,
+            "Windows global hotkeys (RegisterHotKey) active".to_string(),
             None,
         ),
         GlobalHotkeyStatus::PermissionPending => (

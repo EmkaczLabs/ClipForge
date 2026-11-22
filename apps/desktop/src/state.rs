@@ -2405,10 +2405,12 @@ impl AppState {
         } else {
             "x11".to_string()
         };
-        let capture_backend = if cfg!(target_os = "linux") {
+        let capture_backend = if cfg!(target_os = "windows") {
+            "windows-graphics-capture + wasapi".to_string()
+        } else if cfg!(target_os = "linux") {
             "gpu-screen-recorder".to_string()
         } else {
-            "unimplemented (WGC+WASAPI pending)".to_string()
+            "unsupported".to_string()
         };
         let audio_routing_summary = format!(
             "{} source(s) configured",

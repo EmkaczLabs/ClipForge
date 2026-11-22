@@ -1,5 +1,9 @@
-//! ClipForge Desktop — native GPU-rendered Linux game clipping app built with Rune.
+//! ClipForge Desktop — native GPU-rendered game clipping app built with Rune.
 
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 #![forbid(unsafe_code)]
 
 mod components;
@@ -102,8 +106,95 @@ fn on_key(state: &mut AppState, event: &KeyEvent, _tx: &mut Tx) -> bool {
     true
 }
 
+fn log_file_path_from_env(
+    is_windows: bool,
+    appdata: Option<&str>,
+    userprofile: Option<&str>,
+    xdg_state_home: Option<&str>,
+    home: Option<&str>,
+) -> std::path::PathBuf {
+    if is_windows {
+        if let Some(dir) = appdata.filter(|s| !s.is_empty()) {
+            return std::path::PathBuf::from(dir)
+                .join("clipforge")
+                .join("logs")
+                .join("clipforge.log");
+        }
+        if let Some(profile) = userprofile.filter(|s| !s.is_empty()) {
+            return std::path::PathBuf::from(profile)
+                .join("AppData")
+                .join("Roaming")
+                .join("clipforge")
+                .join("logs")
+                .join("clipforge.log");
+        }
+        return std::env::temp_dir()
+            .join("clipforge")
+            .join("logs")
+            .join("clipforge.log");
+    }
+
+    if let Some(state) = xdg_state_home.filter(|s| !s.is_empty()) {
+        return std::path::PathBuf::from(state)
+            .join("clipforge")
+            .join("clipforge.log");
+    }
+    if let Some(home_dir) = home.filter(|s| !s.is_empty()) {
+        return std::path::PathBuf::from(home_dir)
+            .join(".local")
+            .join("state")
+            .join("clipforge")
+            .join("clipforge.log");
+    }
+    std::env::temp_dir().join("clipforge").join("clipforge.log")
+}
+
+fn default_log_file_path() -> std::path::PathBuf {
+    let appdata = std::env::var("APPDATA").ok();
+    let userprofile = std::env::var("USERPROFILE").ok();
+    let xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    log_file_path_from_env(
+        cfg!(target_os = "windows"),
+        appdata.as_deref(),
+        userprofile.as_deref(),
+        xdg_state_home.as_deref(),
+        home.as_deref(),
+    )
+}
+
+fn init_desktop_tracing() {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let log_path = default_log_file_path();
+    let file_opt = log_path
+        .parent()
+        .and_then(|parent| std::fs::create_dir_all(parent).ok())
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .ok()
+        });
+
+    if let Some(file) = file_opt {
+        let writer = std::io::stderr.and(std::sync::Mutex::new(file));
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .with_ansi(false)
+            .with_writer(writer)
+            .try_init();
+    } else {
+        clipforge_common::init_tracing("info");
+    }
+}
+
 fn main() {
-    clipforge_common::init_tracing("info");
+    init_desktop_tracing();
     rune::run(AppSpec::<AppState> {
         min_size: Some((960.0, 640.0)),
         scenes: &[
@@ -818,6 +909,9 @@ mod tests {
             "GlobalShortcuts (Wayland Portal Active)"
         );
 
+        st.hotkey_status = GlobalHotkeyStatus::WindowsGlobalActive;
+        assert_eq!(st.hotkey_status.label(), "Windows Global (RegisterHotKey)");
+
         st.hotkey_status = GlobalHotkeyStatus::RegistrationError {
             message: "portal denied".to_string(),
         };
@@ -1184,5 +1278,47 @@ mod tests {
         click_key(&mut rt, NavSection::Settings.key());
         click_key(&mut rt, crate::state::SettingsTab::About.key());
         assert!(rt.find("export-diagnostics-btn").is_some());
+    }
+
+    #[test]
+    fn log_file_path_resolves_for_windows_and_linux() {
+        let win = log_file_path_from_env(
+            true,
+            Some("C:\\Users\\Alice\\AppData\\Roaming"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            win,
+            std::path::PathBuf::from("C:\\Users\\Alice\\AppData\\Roaming")
+                .join("clipforge")
+                .join("logs")
+                .join("clipforge.log")
+        );
+
+        let linux_xdg = log_file_path_from_env(
+            false,
+            None,
+            None,
+            Some("/tmp/xdg-state"),
+            Some("/home/alice"),
+        );
+        assert_eq!(
+            linux_xdg,
+            std::path::PathBuf::from("/tmp/xdg-state")
+                .join("clipforge")
+                .join("clipforge.log")
+        );
+
+        let linux_home = log_file_path_from_env(false, None, None, Some(""), Some("/home/alice"));
+        assert_eq!(
+            linux_home,
+            std::path::PathBuf::from("/home/alice")
+                .join(".local")
+                .join("state")
+                .join("clipforge")
+                .join("clipforge.log")
+        );
     }
 }

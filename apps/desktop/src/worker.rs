@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use clipforge_capture::{
-    AudioDeviceInfo, CaptureBackend, GlobalHotkeyStatus, GsrCaptureBackend, HotkeyAction,
-    HotkeyManager, HotkeySpec, MonitorInfo, detect_gsr, list_application_audio, list_audio_devices,
-    list_monitors, parse_hotkey,
+    AudioDeviceInfo, CaptureBackend, GlobalHotkeyStatus, HotkeyAction, HotkeyManager, HotkeySpec,
+    MonitorInfo, create_capture_backend, discover_application_audio, discover_audio_devices,
+    discover_monitors, parse_hotkey, probe_capture_capabilities,
 };
 use clipforge_cloud_client::{
     CreateShareRequest, CreateShareResponse, HttpCloudClient, QuotaDto, RemoteClipSummary,
@@ -259,7 +259,7 @@ pub struct WorkerHandle {
 }
 
 struct WorkerServices {
-    capture: Arc<GsrCaptureBackend>,
+    capture: Arc<dyn CaptureBackend>,
     media: Arc<FfmpegMediaProcessor>,
     store: Arc<Mutex<Option<Arc<SqliteClipStore>>>>,
     player: VideoPlayerHandle,
@@ -295,7 +295,7 @@ impl WorkerHandle {
                 };
 
                 rt.block_on(async move {
-                    let capture = Arc::new(GsrCaptureBackend::new());
+                    let capture = create_capture_backend();
                     let ffmpeg_bin =
                         resolve_binary("ffmpeg").unwrap_or_else(|| PathBuf::from("ffmpeg"));
                     let ffprobe_bin =
@@ -1011,24 +1011,16 @@ async fn handle_command(
             svc.player.set_audio_track(track);
         }
         WorkerCommand::DiscoverCaptureSources => {
-            if let Ok(install) = detect_gsr().await {
-                let (monitors_res, audio_res, app_res) = tokio::join!(
-                    list_monitors(&install),
-                    list_audio_devices(&install),
-                    list_application_audio(&install)
-                );
-                let _ = evt_tx.send(WorkerEvent::CaptureSourcesDiscovered {
-                    monitors: monitors_res.unwrap_or_default(),
-                    audio_devices: audio_res.unwrap_or_default(),
-                    app_audio: app_res.unwrap_or_default(),
-                });
-            } else {
-                let _ = evt_tx.send(WorkerEvent::CaptureSourcesDiscovered {
-                    monitors: Vec::new(),
-                    audio_devices: Vec::new(),
-                    app_audio: Vec::new(),
-                });
-            }
+            let (monitors_res, audio_res, app_res) = tokio::join!(
+                discover_monitors(),
+                discover_audio_devices(),
+                discover_application_audio()
+            );
+            let _ = evt_tx.send(WorkerEvent::CaptureSourcesDiscovered {
+                monitors: monitors_res.unwrap_or_default(),
+                audio_devices: audio_res.unwrap_or_default(),
+                app_audio: app_res.unwrap_or_default(),
+            });
             (waker)();
         }
         WorkerCommand::CheckServerHealth { server_url } => {
@@ -1254,7 +1246,10 @@ fn open_with_system(
         if is_dir {
             std::process::Command::new("explorer").arg(target).spawn()
         } else {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             std::process::Command::new("cmd")
+                .creation_flags(CREATE_NO_WINDOW)
                 .args(["/C", "start", ""])
                 .arg(target)
                 .spawn()
@@ -1283,7 +1278,10 @@ async fn copy_text_to_clipboard(text: &str) -> bool {
         ("xsel", &["--clipboard", "--input"]),
     ];
     for (bin, args) in candidates {
-        let Ok(mut child) = Command::new(bin)
+        let mut cmd = Command::new(bin);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let Ok(mut child) = cmd
             .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
@@ -1314,7 +1312,10 @@ async fn decode_thumbnail_rgba(
         "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x161820ff"
     );
     let ffmpeg_bin = resolve_binary("ffmpeg").unwrap_or_else(|| PathBuf::from("ffmpeg"));
-    let output = Command::new(&ffmpeg_bin)
+    let mut cmd = Command::new(&ffmpeg_bin);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let output = cmd
         .arg("-v")
         .arg("error")
         .arg("-i")
@@ -1516,20 +1517,13 @@ async fn scan_and_load_library(
 }
 
 async fn probe_dependencies() -> DependencyStatus {
-    let gsr_install = detect_gsr().await.ok();
-    let gsr_location = gsr_install.map(|inst| match inst {
-        clipforge_capture::GsrInstallation::Native(p) => p.display().to_string(),
-        clipforge_capture::GsrInstallation::Flatpak { app_id } => {
-            format!("flatpak: {app_id}")
-        }
-    });
-
+    let probe = probe_capture_capabilities().await;
     let ffmpeg_available = find_binary("ffmpeg").await.is_some();
     let ffprobe_available = find_binary("ffprobe").await.is_some();
 
     DependencyStatus {
-        gsr_available: gsr_location.is_some(),
-        gsr_location,
+        gsr_available: probe.available,
+        gsr_location: probe.location,
         ffmpeg_available,
         ffprobe_available,
         probed: true,

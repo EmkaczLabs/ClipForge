@@ -438,7 +438,10 @@ impl MicTestWorker {
             }
         };
 
-        let mut child = match Command::new(&self.parec_bin)
+        let mut cmd = Command::new(&self.parec_bin);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let mut child = match cmd
             .arg(format!("--device={}", resolved.name))
             .arg("--format=float32le")
             .arg(format!("--rate={}", resolved.sample_rate))
@@ -854,7 +857,10 @@ async fn resolve_pipewire_source(
 
     let normalized = trimmed.strip_prefix("device:").unwrap_or(trimmed);
 
-    let list_out = Command::new(pactl_bin)
+    let mut list_cmd = Command::new(pactl_bin);
+    #[cfg(windows)]
+    list_cmd.creation_flags(0x0800_0000);
+    let list_out = list_cmd
         .args(["list", "sources", "short"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -880,7 +886,10 @@ async fn resolve_pipewire_source(
     let entries = parse_pactl_sources_short(&stdout);
 
     let target_name = if normalized == "default_input" {
-        let def_out = Command::new(pactl_bin)
+        let mut def_cmd = Command::new(pactl_bin);
+        #[cfg(windows)]
+        def_cmd.creation_flags(0x0800_0000);
+        let def_out = def_cmd
             .args(["get-default-source"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -908,7 +917,10 @@ async fn resolve_pipewire_source(
         }
         name
     } else if normalized == "default_output" {
-        let def_out = Command::new(pactl_bin)
+        let mut def_cmd = Command::new(pactl_bin);
+        #[cfg(windows)]
+        def_cmd.creation_flags(0x0800_0000);
+        let def_out = def_cmd
             .args(["get-default-sink"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -954,7 +966,10 @@ async fn resolve_pipewire_source(
 }
 
 async fn query_source_mute(pactl_bin: &Path, source_name: &str) -> Option<bool> {
-    let out = Command::new(pactl_bin)
+    let mut cmd = Command::new(pactl_bin);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let out = cmd
         .args(["get-source-mute", source_name])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -1019,7 +1019,10 @@ async fn decode_single_frame(
             "decoding single RGBA frame"
         );
 
-        let output = Command::new(ffmpeg_bin)
+        let mut cmd = Command::new(ffmpeg_bin);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let output = cmd
             .arg("-v")
             .arg("error")
             .arg("-ss")
@@ -1117,7 +1120,10 @@ fn spawn_playback_stream(
         "spawning ffmpeg playback stream"
     );
 
-    let mut child = Command::new(ffmpeg_bin)
+    let mut cmd = Command::new(ffmpeg_bin);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let mut child = cmd
         .arg("-v")
         .arg("error")
         .arg("-ss")

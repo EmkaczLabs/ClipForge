@@ -197,6 +197,8 @@ impl FfmpegMediaProcessor {
         );
 
         let mut cmd = Command::new(&self.ffmpeg_bin);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
         cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -327,7 +329,10 @@ impl MediaProcessor for FfmpegMediaProcessor {
         let canonical = validate_input_path(path).await?;
         let file_size = tokio::fs::metadata(&canonical).await?.len();
 
-        let output = Command::new(&self.ffprobe_bin)
+        let mut cmd = Command::new(&self.ffprobe_bin);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let output = cmd
             .arg("-v")
             .arg("quiet")
             .arg("-print_format")
@@ -654,7 +659,10 @@ async fn run_thumbnail_ffmpeg(
     ts: &str,
     temp_out: &Path,
 ) -> Result<()> {
-    let result = Command::new(ffmpeg_bin)
+    let mut cmd = Command::new(ffmpeg_bin);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let result = cmd
         .arg("-y")
         .arg("-v")
         .arg("error")

@@ -256,7 +256,10 @@ impl AudioSession {
             "spawning ffmpeg audio decode stream"
         );
 
-        let mut child = match Command::new(ffmpeg_bin)
+        let mut cmd = Command::new(ffmpeg_bin);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let mut child = match cmd
             .args(&ffmpeg_args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
