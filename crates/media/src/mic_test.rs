@@ -10,13 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
+
+use crate::audio::{CpalStreamSource, start_cpal_output_stream_blocking};
 
 /// Noise/silence floor in dBFS used when signal amplitude is zero or near-zero.
 pub const DBFS_FLOOR: f32 = -96.0;
@@ -1073,93 +1073,25 @@ fn play_samples_cpal(
     output_device_name: Option<&str>,
     stop_flag: Arc<AtomicBool>,
 ) -> std::result::Result<(), String> {
-    let host = cpal::default_host();
-    let device = match output_device_name {
-        Some(name) if !name.trim().is_empty() => host
-            .output_devices()
-            .map_err(|e| format!("failed to enumerate output devices: {e}"))?
-            .find(|d| d.name().ok().as_deref() == Some(name))
-            .ok_or_else(|| format!("selected output device '{name}' not found"))?,
-        _ => host
-            .default_output_device()
-            .ok_or_else(|| "no audio output device available".to_string())?,
-    };
-
-    let supported = device
-        .default_output_config()
-        .map_err(|e| format!("failed to read output audio config: {e}"))?;
-    let dst_rate = supported.sample_rate().0;
-    let dst_channels = supported.channels();
-    let sample_format = supported.sample_format();
-    let config: StreamConfig = supported.into();
-
-    let resampled = resample_for_output(samples, src_rate, src_channels, dst_rate, dst_channels);
-    if resampled.is_empty() {
-        return Ok(());
-    }
-
     let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let finished = Arc::new(AtomicBool::new(false));
-    let total_samples = resampled.len();
-    let data = Arc::new(resampled);
 
-    let err_flag = Arc::clone(&stop_flag);
-    let err_fn = move |err| {
-        warn!(error = %err, "mic test cpal playback error");
-        err_flag.store(true, Ordering::Relaxed);
-    };
+    let (guard, _dst_rate, _dst_channels, total_samples) = start_cpal_output_stream_blocking(
+        output_device_name.map(str::to_owned),
+        CpalStreamSource::Buffer {
+            samples: samples.to_vec(),
+            src_rate,
+            src_channels,
+            cursor: Arc::clone(&cursor),
+            finished: Arc::clone(&finished),
+            error_flag: Arc::clone(&stop_flag),
+        },
+    )?;
 
-    let stream = match sample_format {
-        SampleFormat::F32 => {
-            let d = Arc::clone(&data);
-            let c = Arc::clone(&cursor);
-            let f = Arc::clone(&finished);
-            device.build_output_stream(
-                &config,
-                move |out: &mut [f32], _| {
-                    write_playback_slice(out, &d, &c, &f, |s| s);
-                },
-                err_fn,
-                None,
-            )
-        }
-        SampleFormat::I16 => {
-            let d = Arc::clone(&data);
-            let c = Arc::clone(&cursor);
-            let f = Arc::clone(&finished);
-            device.build_output_stream(
-                &config,
-                move |out: &mut [i16], _| {
-                    write_playback_slice(out, &d, &c, &f, |s| {
-                        (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
-                    });
-                },
-                err_fn,
-                None,
-            )
-        }
-        SampleFormat::U16 => {
-            let d = Arc::clone(&data);
-            let c = Arc::clone(&cursor);
-            let f = Arc::clone(&finished);
-            device.build_output_stream(
-                &config,
-                move |out: &mut [u16], _| {
-                    write_playback_slice(out, &d, &c, &f, |s| {
-                        (((s.clamp(-1.0, 1.0) + 1.0) * 0.5) * u16::MAX as f32) as u16
-                    });
-                },
-                err_fn,
-                None,
-            )
-        }
-        other => return Err(format!("unsupported output sample format: {other:?}")),
+    if total_samples == 0 {
+        guard.stop_blocking();
+        return Ok(());
     }
-    .map_err(|e| format!("failed to build output stream: {e}"))?;
-
-    stream
-        .play()
-        .map_err(|e| format!("failed to start output stream: {e}"))?;
 
     while !stop_flag.load(Ordering::Relaxed)
         && !finished.load(Ordering::Relaxed)
@@ -1168,11 +1100,11 @@ fn play_samples_cpal(
         std::thread::sleep(Duration::from_millis(15));
     }
 
-    drop(stream);
+    guard.stop_blocking();
     Ok(())
 }
 
-fn write_playback_slice<T: Copy + Default>(
+pub(crate) fn write_playback_slice<T: Copy + Default>(
     out: &mut [T],
     data: &[f32],
     cursor: &std::sync::atomic::AtomicUsize,

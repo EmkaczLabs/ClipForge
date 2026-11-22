@@ -1,11 +1,10 @@
 //! Native audio output (`cpal` via ALSA/PipeWire) and sample-accurate A/V master clock.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -207,7 +206,7 @@ pub(crate) struct AudioSession {
     stop_flag: Arc<AtomicBool>,
     feeder_task: Option<TokioJoinHandle<()>>,
     child: Option<Child>,
-    cpal_thread: Option<JoinHandle<()>>,
+    stream_guard: Option<CpalStreamGuard>,
 }
 
 impl AudioSession {
@@ -228,33 +227,15 @@ impl AudioSession {
         let audio_eof = Arc::new(AtomicBool::new(false));
         let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
 
-        let (init_tx, init_rx) = oneshot::channel::<std::result::Result<(u32, u16), String>>();
-
-        let cpal_stop = Arc::clone(&stop_flag);
-        let cpal_played = Arc::clone(&samples_played);
-        let cpal_ring = Arc::clone(&ring);
-        let cpal_controls = controls.clone();
-
-        let cpal_thread = std::thread::Builder::new()
-            .name("clipforge-audio".into())
-            .spawn(move || {
-                run_cpal_thread(init_tx, cpal_stop, cpal_played, cpal_ring, cpal_controls);
-            })
-            .map_err(|e| format!("failed to spawn audio thread: {e}"))?;
-
-        let (sample_rate, channels) = match init_rx.await {
-            Ok(Ok(cfg)) => cfg,
-            Ok(Err(err)) => {
-                stop_flag.store(true, Ordering::Relaxed);
-                let _ = cpal_thread.join();
-                return Err(err);
-            }
-            Err(_) => {
-                stop_flag.store(true, Ordering::Relaxed);
-                let _ = cpal_thread.join();
-                return Err("audio initialization thread exited unexpectedly".into());
-            }
-        };
+        let (stream_guard, sample_rate, channels, _) = start_cpal_output_stream_async(
+            None,
+            CpalStreamSource::RingBuffer {
+                ring: Arc::clone(&ring),
+                samples_played: Arc::clone(&samples_played),
+                controls: controls.clone(),
+            },
+        )
+        .await?;
 
         let ffmpeg_args = build_audio_decode_args(
             canonical_in,
@@ -275,19 +256,24 @@ impl AudioSession {
             "spawning ffmpeg audio decode stream"
         );
 
-        let mut child = Command::new(ffmpeg_bin)
+        let mut child = match Command::new(ffmpeg_bin)
             .args(&ffmpeg_args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("failed to spawn ffmpeg audio stream: {e}"))?;
+        {
+            Ok(child) => child,
+            Err(e) => {
+                stream_guard.stop().await;
+                return Err(format!("failed to spawn ffmpeg audio stream: {e}"));
+            }
+        };
 
         let Some(mut stdout) = child.stdout.take() else {
             let _ = child.kill().await;
-            stop_flag.store(true, Ordering::Relaxed);
-            let _ = cpal_thread.join();
+            stream_guard.stop().await;
             return Err("failed to capture ffmpeg audio stdout".into());
         };
 
@@ -383,7 +369,7 @@ impl AudioSession {
             stop_flag,
             feeder_task: Some(feeder_task),
             child: Some(child),
-            cpal_thread: Some(cpal_thread),
+            stream_guard: Some(stream_guard),
         };
 
         Ok((session, clock))
@@ -398,11 +384,8 @@ impl AudioSession {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
-        if let Some(thread) = self.cpal_thread.take() {
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = thread.join();
-            })
-            .await;
+        if let Some(guard) = self.stream_guard.take() {
+            guard.stop().await;
         }
     }
 }
@@ -416,109 +399,376 @@ impl Drop for AudioSession {
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
         }
+        // Dropping `self.stream_guard` dispatches `StopStream` to the persistent
+        // `"clipforge-cpal"` thread so the `cpal::Stream` is never dropped on a
+        // tokio worker thread.
     }
 }
 
-fn run_cpal_thread(
-    init_tx: oneshot::Sender<std::result::Result<(u32, u16), String>>,
-    stop_flag: Arc<AtomicBool>,
-    samples_played: Arc<AtomicU64>,
-    ring: Arc<Mutex<VecDeque<f32>>>,
-    controls: AudioControlState,
-) {
+pub(crate) enum CpalStreamSource {
+    RingBuffer {
+        ring: Arc<Mutex<VecDeque<f32>>>,
+        samples_played: Arc<AtomicU64>,
+        controls: AudioControlState,
+    },
+    Buffer {
+        samples: Vec<f32>,
+        src_rate: u32,
+        src_channels: u16,
+        cursor: Arc<AtomicUsize>,
+        finished: Arc<AtomicBool>,
+        error_flag: Arc<AtomicBool>,
+    },
+}
+
+pub(crate) struct CpalStreamGuard {
+    id: u64,
+    stopped: bool,
+}
+
+impl CpalStreamGuard {
+    pub(crate) async fn stop(mut self) {
+        self.stopped = true;
+        if let Ok(worker) = cpal_worker() {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if worker
+                .cmd_tx
+                .send(CpalCommand::StopStream {
+                    id: self.id,
+                    ack: Some(ack_tx),
+                })
+                .is_ok()
+            {
+                let _ = ack_rx.await;
+            }
+        }
+    }
+
+    pub(crate) fn stop_blocking(mut self) {
+        self.stopped = true;
+        if let Ok(worker) = cpal_worker() {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if worker
+                .cmd_tx
+                .send(CpalCommand::StopStream {
+                    id: self.id,
+                    ack: Some(ack_tx),
+                })
+                .is_ok()
+            {
+                let _ = ack_rx.blocking_recv();
+            }
+        }
+    }
+}
+
+impl Drop for CpalStreamGuard {
+    fn drop(&mut self) {
+        if !self.stopped
+            && let Ok(worker) = cpal_worker()
+        {
+            let _ = worker.cmd_tx.send(CpalCommand::StopStream {
+                id: self.id,
+                ack: None,
+            });
+        }
+    }
+}
+
+enum CpalCommand {
+    StartStream {
+        id: u64,
+        device_name: Option<String>,
+        source: CpalStreamSource,
+        reply: oneshot::Sender<std::result::Result<(u32, u16, usize), String>>,
+    },
+    StopStream {
+        id: u64,
+        ack: Option<oneshot::Sender<()>>,
+    },
+}
+
+struct CpalWorker {
+    cmd_tx: std::sync::mpsc::Sender<CpalCommand>,
+}
+
+/// Single persistent OS thread for all `cpal` host/device/stream operations.
+///
+/// On Windows, `cpal::wasapi` initializes COM as STA on the first thread that touches
+/// `IMMDeviceEnumerator` (`static ENUMERATOR: OnceLock<Enumerator>`) and tears down COM
+/// via `CoUninitialize()` when that thread exits. Keeping one persistent thread alive for
+/// the process lifetime prevents use-after-`CoUninitialize` access violations (`0xC0000005`).
+static CPAL_WORKER: OnceLock<std::result::Result<CpalWorker, String>> = OnceLock::new();
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+fn cpal_worker() -> std::result::Result<&'static CpalWorker, String> {
+    let res = CPAL_WORKER.get_or_init(|| {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CpalCommand>();
+        std::thread::Builder::new()
+            .name("clipforge-cpal".into())
+            .spawn(move || {
+                run_cpal_worker_loop(cmd_rx);
+            })
+            .map_err(|e| format!("failed to spawn persistent cpal audio thread: {e}"))?;
+        Ok(CpalWorker { cmd_tx })
+    });
+    res.as_ref().map_err(Clone::clone)
+}
+
+fn run_cpal_worker_loop(cmd_rx: std::sync::mpsc::Receiver<CpalCommand>) {
+    let mut streams: HashMap<u64, cpal::Stream> = HashMap::new();
+    while let Ok(cmd) = cmd_rx.recv() {
+        match cmd {
+            CpalCommand::StartStream {
+                id,
+                device_name,
+                source,
+                reply,
+            } => {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    open_and_play_cpal_stream(device_name.as_deref(), source)
+                }));
+                match res {
+                    Ok(Ok((maybe_stream, sample_rate, channels, total_samples))) => {
+                        if let Some(stream) = maybe_stream {
+                            streams.insert(id, stream);
+                        }
+                        let _ = reply.send(Ok((sample_rate, channels, total_samples)));
+                    }
+                    Ok(Err(err)) => {
+                        let _ = reply.send(Err(err));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(
+                            "cpal audio backend panicked during stream initialization".into(),
+                        ));
+                    }
+                }
+            }
+            CpalCommand::StopStream { id, ack } => {
+                if let Some(stream) = streams.remove(&id) {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drop(stream);
+                    }));
+                }
+                if let Some(ack_tx) = ack {
+                    let _ = ack_tx.send(());
+                }
+            }
+        }
+    }
+}
+
+pub(crate) async fn start_cpal_output_stream_async(
+    device_name: Option<String>,
+    source: CpalStreamSource,
+) -> std::result::Result<(CpalStreamGuard, u32, u16, usize), String> {
+    let worker = cpal_worker()?;
+    let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    worker
+        .cmd_tx
+        .send(CpalCommand::StartStream {
+            id,
+            device_name,
+            source,
+            reply: reply_tx,
+        })
+        .map_err(|_| "persistent cpal audio thread is unavailable".to_string())?;
+
+    let (sample_rate, channels, total_samples) = reply_rx
+        .await
+        .map_err(|_| "persistent cpal audio thread exited unexpectedly".to_string())??;
+
+    Ok((
+        CpalStreamGuard { id, stopped: false },
+        sample_rate,
+        channels,
+        total_samples,
+    ))
+}
+
+pub(crate) fn start_cpal_output_stream_blocking(
+    device_name: Option<String>,
+    source: CpalStreamSource,
+) -> std::result::Result<(CpalStreamGuard, u32, u16, usize), String> {
+    let worker = cpal_worker()?;
+    let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    worker
+        .cmd_tx
+        .send(CpalCommand::StartStream {
+            id,
+            device_name,
+            source,
+            reply: reply_tx,
+        })
+        .map_err(|_| "persistent cpal audio thread is unavailable".to_string())?;
+
+    let (sample_rate, channels, total_samples) = reply_rx
+        .blocking_recv()
+        .map_err(|_| "persistent cpal audio thread exited unexpectedly".to_string())??;
+
+    Ok((
+        CpalStreamGuard { id, stopped: false },
+        sample_rate,
+        channels,
+        total_samples,
+    ))
+}
+
+trait SampleConvert: cpal::SizedSample + Default {
+    fn from_f32_sample(s: f32) -> Self;
+}
+
+impl SampleConvert for f32 {
+    #[inline]
+    fn from_f32_sample(s: f32) -> Self {
+        s
+    }
+}
+
+impl SampleConvert for i16 {
+    #[inline]
+    fn from_f32_sample(s: f32) -> Self {
+        (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+    }
+}
+
+impl SampleConvert for u16 {
+    #[inline]
+    fn from_f32_sample(s: f32) -> Self {
+        (((s.clamp(-1.0, 1.0) + 1.0) * 0.5) * u16::MAX as f32) as u16
+    }
+}
+
+fn build_typed_output_stream<T: SampleConvert>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    channels: u16,
+    sample_rate: u32,
+    source: CpalStreamSource,
+) -> std::result::Result<(Option<cpal::Stream>, usize), String> {
+    match source {
+        CpalStreamSource::RingBuffer {
+            ring,
+            samples_played,
+            controls,
+        } => {
+            let err_fn = |err| {
+                warn!(error = %err, "cpal output stream error");
+            };
+            let stream = device
+                .build_output_stream(
+                    config,
+                    move |data: &mut [T], _| {
+                        fill_audio_buffer(
+                            data,
+                            channels,
+                            &ring,
+                            &samples_played,
+                            &controls,
+                            T::from_f32_sample,
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("failed to build cpal output stream: {e}"))?;
+            Ok((Some(stream), 0))
+        }
+        CpalStreamSource::Buffer {
+            samples,
+            src_rate,
+            src_channels,
+            cursor,
+            finished,
+            error_flag,
+        } => {
+            let resampled = crate::mic_test::resample_for_output(
+                &samples,
+                src_rate,
+                src_channels,
+                sample_rate,
+                channels,
+            );
+            if resampled.is_empty() {
+                return Ok((None, 0));
+            }
+            let total_samples = resampled.len();
+            let data = Arc::new(resampled);
+            let err_fn = move |err| {
+                warn!(error = %err, "mic test cpal playback error");
+                error_flag.store(true, Ordering::Relaxed);
+            };
+            let stream = device
+                .build_output_stream(
+                    config,
+                    move |out: &mut [T], _| {
+                        crate::mic_test::write_playback_slice(
+                            out,
+                            &data,
+                            &cursor,
+                            &finished,
+                            T::from_f32_sample,
+                        );
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|e| format!("failed to build output stream: {e}"))?;
+            Ok((Some(stream), total_samples))
+        }
+    }
+}
+
+fn open_and_play_cpal_stream(
+    output_device_name: Option<&str>,
+    source: CpalStreamSource,
+) -> std::result::Result<(Option<cpal::Stream>, u32, u16, usize), String> {
     let host = cpal::default_host();
-    let Some(device) = host.default_output_device() else {
-        let _ = init_tx.send(Err("no default audio output device available".into()));
-        return;
+    let device = match output_device_name {
+        Some(name) if !name.trim().is_empty() => host
+            .output_devices()
+            .map_err(|e| format!("failed to enumerate output devices: {e}"))?
+            .find(|d| d.name().ok().as_deref() == Some(name))
+            .ok_or_else(|| format!("selected output device '{name}' not found"))?,
+        _ => host
+            .default_output_device()
+            .ok_or_else(|| "no default audio output device available".to_string())?,
     };
 
-    let supported_cfg = match device.default_output_config() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            let _ = init_tx.send(Err(format!("failed to query default audio config: {e}")));
-            return;
-        }
-    };
+    let supported_cfg = device
+        .default_output_config()
+        .map_err(|e| format!("failed to query default audio config: {e}"))?;
 
     let sample_format = supported_cfg.sample_format();
     let config: StreamConfig = supported_cfg.into();
     let channels = config.channels.max(1);
     let sample_rate = config.sample_rate.0.max(1);
 
-    let err_fn = |err| {
-        warn!(error = %err, "cpal output stream error");
-    };
-
-    let stream_res = match sample_format {
+    let (maybe_stream, total_samples) = match sample_format {
         SampleFormat::F32 => {
-            let ring_cb = Arc::clone(&ring);
-            let played_cb = Arc::clone(&samples_played);
-            let ctrl_cb = controls.clone();
-            device.build_output_stream(
-                &config,
-                move |data: &mut [f32], _| {
-                    fill_audio_buffer(data, channels, &ring_cb, &played_cb, &ctrl_cb, |s| s);
-                },
-                err_fn,
-                None,
-            )
+            build_typed_output_stream::<f32>(&device, &config, channels, sample_rate, source)?
         }
         SampleFormat::I16 => {
-            let ring_cb = Arc::clone(&ring);
-            let played_cb = Arc::clone(&samples_played);
-            let ctrl_cb = controls.clone();
-            device.build_output_stream(
-                &config,
-                move |data: &mut [i16], _| {
-                    fill_audio_buffer(data, channels, &ring_cb, &played_cb, &ctrl_cb, |s| {
-                        (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
-                    });
-                },
-                err_fn,
-                None,
-            )
+            build_typed_output_stream::<i16>(&device, &config, channels, sample_rate, source)?
         }
         SampleFormat::U16 => {
-            let ring_cb = Arc::clone(&ring);
-            let played_cb = Arc::clone(&samples_played);
-            let ctrl_cb = controls.clone();
-            device.build_output_stream(
-                &config,
-                move |data: &mut [u16], _| {
-                    fill_audio_buffer(data, channels, &ring_cb, &played_cb, &ctrl_cb, |s| {
-                        ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16
-                    });
-                },
-                err_fn,
-                None,
-            )
+            build_typed_output_stream::<u16>(&device, &config, channels, sample_rate, source)?
         }
         other => {
-            let _ = init_tx.send(Err(format!("unsupported audio sample format: {other:?}")));
-            return;
+            return Err(format!("unsupported audio sample format: {other:?}"));
         }
     };
 
-    let stream = match stream_res {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = init_tx.send(Err(format!("failed to build cpal output stream: {e}")));
-            return;
-        }
-    };
-
-    if let Err(e) = stream.play() {
-        let _ = init_tx.send(Err(format!("failed to start cpal audio stream: {e}")));
-        return;
+    if let Some(stream) = &maybe_stream {
+        stream
+            .play()
+            .map_err(|e| format!("failed to start cpal audio stream: {e}"))?;
     }
 
-    let _ = init_tx.send(Ok((sample_rate, channels)));
-
-    while !stop_flag.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    drop(stream);
+    Ok((maybe_stream, sample_rate, channels, total_samples))
 }
 
 fn fill_audio_buffer<T: Copy>(
@@ -598,5 +848,57 @@ mod tests {
         );
         assert!(explicit.windows(2).any(|w| w == ["-map", "0:a:1?"]));
         assert!(!explicit.iter().any(|a| a == "-filter_complex"));
+    }
+
+    #[tokio::test]
+    async fn cpal_worker_handles_repeated_and_concurrent_open_close_drop() {
+        for i in 0..5 {
+            let res = start_cpal_output_stream_async(
+                None,
+                CpalStreamSource::RingBuffer {
+                    ring: Arc::new(Mutex::new(VecDeque::new())),
+                    samples_played: Arc::new(AtomicU64::new(0)),
+                    controls: AudioControlState::new(),
+                },
+            )
+            .await;
+
+            if let Ok((guard, rate, ch, _)) = res {
+                assert!(rate > 0);
+                assert!(ch > 0);
+                if i % 2 == 0 {
+                    guard.stop().await;
+                } else {
+                    drop(guard);
+                }
+            }
+        }
+
+        // Also test blocking entry point from a worker thread (used by mic_test playback).
+        let blocking_handle = std::thread::spawn(|| {
+            for i in 0..3 {
+                let res = start_cpal_output_stream_blocking(
+                    None,
+                    CpalStreamSource::Buffer {
+                        samples: vec![0.0; 256],
+                        src_rate: 48_000,
+                        src_channels: 1,
+                        cursor: Arc::new(AtomicUsize::new(0)),
+                        finished: Arc::new(AtomicBool::new(false)),
+                        error_flag: Arc::new(AtomicBool::new(false)),
+                    },
+                );
+                if let Ok((guard, rate, ch, _)) = res {
+                    assert!(rate > 0);
+                    assert!(ch > 0);
+                    if i % 2 == 0 {
+                        guard.stop_blocking();
+                    } else {
+                        drop(guard);
+                    }
+                }
+            }
+        });
+        blocking_handle.join().expect("blocking cpal thread");
     }
 }

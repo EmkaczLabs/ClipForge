@@ -5,6 +5,27 @@ use clipforge_common::{ClipForgeError, MediaProcessor, TrimRequest, VideoCodec};
 use clipforge_media::FfmpegMediaProcessor;
 use uuid::Uuid;
 
+struct TestLogGuard {
+    name: &'static str,
+}
+
+impl TestLogGuard {
+    fn new(name: &'static str) -> Self {
+        eprintln!("[media_integration] START {name}");
+        Self { name }
+    }
+}
+
+impl Drop for TestLogGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("[media_integration] PANIC {}", self.name);
+        } else {
+            eprintln!("[media_integration] END   {}", self.name);
+        }
+    }
+}
+
 struct TestDir {
     path: PathBuf,
 }
@@ -56,6 +77,7 @@ fn generate_synthetic_mp4(dest: &Path) {
 
 #[tokio::test]
 async fn probe_thumbnail_and_trim_synthetic_mp4() {
+    let _log = TestLogGuard::new("probe_thumbnail_and_trim_synthetic_mp4");
     let dir = TestDir::new("clipforge_media_it");
     let source = dir.join("synthetic.mp4");
     generate_synthetic_mp4(&source);
@@ -163,6 +185,7 @@ async fn probe_thumbnail_and_trim_synthetic_mp4() {
 
 #[tokio::test]
 async fn validation_rejects_bad_paths_and_ranges() {
+    let _log = TestLogGuard::new("validation_rejects_bad_paths_and_ranges");
     let dir = TestDir::new("clipforge_media_val");
     let processor = FfmpegMediaProcessor::new();
 
@@ -207,6 +230,7 @@ async fn validation_rejects_bad_paths_and_ranges() {
 
 #[tokio::test]
 async fn gsr_like_mkv_multi_audio_and_past_eof_thumbnail_fallback() {
+    let _log = TestLogGuard::new("gsr_like_mkv_multi_audio_and_past_eof_thumbnail_fallback");
     let dir = TestDir::new("clipforge_media_mkv");
     let mkv_path = dir.join("gsr_replay.mkv");
 
@@ -277,6 +301,7 @@ async fn gsr_like_mkv_multi_audio_and_past_eof_thumbnail_fallback() {
 
 #[tokio::test]
 async fn video_player_open_seek_play_trim_and_switch_clips() {
+    let _log = TestLogGuard::new("video_player_open_seek_play_trim_and_switch_clips");
     use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
     use std::time::Duration;
 
@@ -419,6 +444,7 @@ async fn video_player_open_seek_play_trim_and_switch_clips() {
 
 #[tokio::test]
 async fn video_player_handles_missing_and_corrupt_files_gracefully() {
+    let _log = TestLogGuard::new("video_player_handles_missing_and_corrupt_files_gracefully");
     use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
     use std::time::Duration;
 
@@ -452,6 +478,7 @@ async fn video_player_handles_missing_and_corrupt_files_gracefully() {
 
 #[tokio::test]
 async fn extract_timeline_thumbnails_returns_scaled_rgba_frames() {
+    let _log = TestLogGuard::new("extract_timeline_thumbnails_returns_scaled_rgba_frames");
     use clipforge_media::extract_timeline_thumbnails;
 
     let dir = TestDir::new("clipforge_thumbs_it");
@@ -496,6 +523,7 @@ fn generate_video_only_mp4(path: &Path) {
 
 #[tokio::test]
 async fn video_player_no_audio_clip_fallback_and_volume_mute() {
+    let _log = TestLogGuard::new("video_player_no_audio_clip_fallback_and_volume_mute");
     use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
     use std::time::Duration;
 
@@ -558,6 +586,7 @@ async fn video_player_no_audio_clip_fallback_and_volume_mute() {
 
 #[tokio::test]
 async fn video_player_pause_seek_resume_av_sync() {
+    let _log = TestLogGuard::new("video_player_pause_seek_resume_av_sync");
     use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
     use std::time::Duration;
 
@@ -657,6 +686,7 @@ async fn video_player_pause_seek_resume_av_sync() {
 
 #[tokio::test]
 async fn trim_with_progress_reports_progress_and_supports_cancellation() {
+    let _log = TestLogGuard::new("trim_with_progress_reports_progress_and_supports_cancellation");
     use clipforge_media::ExportCancelToken;
     use std::sync::{Arc, Mutex};
 
@@ -714,6 +744,7 @@ async fn trim_with_progress_reports_progress_and_supports_cancellation() {
 
 #[tokio::test]
 async fn multi_track_auto_mix_and_explicit_track_playback() {
+    let _log = TestLogGuard::new("multi_track_auto_mix_and_explicit_track_playback");
     use std::time::Duration;
 
     use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
@@ -813,6 +844,9 @@ async fn multi_track_auto_mix_and_explicit_track_playback() {
 
 #[tokio::test]
 async fn mic_test_rejects_missing_device_and_tests_real_pipewire_source_if_present() {
+    let _log = TestLogGuard::new(
+        "mic_test_rejects_missing_device_and_tests_real_pipewire_source_if_present",
+    );
     use std::time::Duration;
 
     use clipforge_media::{DBFS_FLOOR, MicFeedbackKind, MicTestEvent, MicTestHandle};
@@ -879,6 +913,7 @@ async fn mic_test_rejects_missing_device_and_tests_real_pipewire_source_if_prese
 
 #[tokio::test]
 async fn trim_near_end_of_recording_duration_keyframe_and_av_sync() {
+    let _log = TestLogGuard::new("trim_near_end_of_recording_duration_keyframe_and_av_sync");
     let dir = TestDir::new("trim_long_end");
     let base = dir.join("base.mp4");
     let long_src = dir.join("long_30s.mp4");
@@ -1011,6 +1046,7 @@ async fn trim_near_end_of_recording_duration_keyframe_and_av_sync() {
 
 #[tokio::test]
 async fn trim_paths_with_spaces_and_drop_cleanup() {
+    let _log = TestLogGuard::new("trim_paths_with_spaces_and_drop_cleanup");
     let dir = TestDir::new("trim spaces");
     let spaced_dir = dir.join("my game clips");
     std::fs::create_dir_all(&spaced_dir).unwrap();
@@ -1061,6 +1097,7 @@ async fn trim_paths_with_spaces_and_drop_cleanup() {
 
 #[tokio::test]
 async fn thumbnail_cancellation_and_player_rapid_seek_hygiene() {
+    let _log = TestLogGuard::new("thumbnail_cancellation_and_player_rapid_seek_hygiene");
     use clipforge_media::{
         ExportCancelToken, PlayerEvent, VideoPlayerHandle, extract_timeline_thumbnails_with_cancel,
     };
@@ -1106,4 +1143,74 @@ async fn thumbnail_cancellation_and_player_rapid_seek_hygiene() {
     }
     assert_eq!(settled_pos, Some(2200));
     player.close();
+}
+
+#[tokio::test]
+async fn video_player_repeated_and_concurrent_open_play_close_drop() {
+    let _log = TestLogGuard::new("video_player_repeated_and_concurrent_open_play_close_drop");
+    use clipforge_media::{PlaybackState, PlayerEvent, VideoPlayerHandle};
+    use std::time::Duration;
+
+    let dir = TestDir::new("clipforge_player_repeat");
+    let clip = dir.join("av_repeat.mp4");
+    generate_synthetic_mp4(&clip);
+
+    // 1. Repeated open -> play -> close and open -> play -> immediate drop (no close).
+    for iter in 0..4 {
+        let (player, mut rx) = VideoPlayerHandle::spawn();
+        player.set_volume(0.0);
+        player.open(&clip, Some((0, 900)), Some(160));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut paused = false;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(PlayerEvent::StateChanged(PlaybackState::Paused))) =
+                tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+            {
+                paused = true;
+                break;
+            }
+        }
+        assert!(paused, "iter {iter}: player did not reach Paused");
+
+        player.play();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        if iter % 2 == 0 {
+            player.close();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        } else {
+            drop(player);
+            drop(rx);
+        }
+    }
+
+    // 2. Concurrent VideoPlayerHandle instances playing A/V clips simultaneously.
+    async fn play_and_drop(clip: PathBuf, close_explicitly: bool) {
+        let (player, mut rx) = VideoPlayerHandle::spawn();
+        player.set_volume(0.0);
+        player.open(clip, Some((0, 700)), Some(160));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut paused = false;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(PlayerEvent::StateChanged(PlaybackState::Paused))) =
+                tokio::time::timeout(Duration::from_secs(2), rx.recv()).await
+            {
+                paused = true;
+                break;
+            }
+        }
+        assert!(paused, "concurrent player did not reach Paused");
+
+        player.play();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if close_explicitly {
+            player.close();
+        }
+    }
+
+    tokio::join!(
+        play_and_drop(clip.clone(), true),
+        play_and_drop(clip, false),
+    );
 }
