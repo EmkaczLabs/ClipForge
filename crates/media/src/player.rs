@@ -13,7 +13,9 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, trace, warn};
 
 use crate::audio::{AudioControlState, AudioSession, AudioTrackMode, PlaybackClock};
-use crate::processor::{FfmpegMediaProcessor, format_timestamp_ms, validate_input_path};
+use crate::processor::{
+    ExportCancelToken, FfmpegMediaProcessor, format_timestamp_ms, validate_input_path,
+};
 
 /// Default maximum frame dimension (matches Rune's 1024x1024 image atlas fast path).
 pub const DEFAULT_MAX_DECODE_DIM: u32 = 1024;
@@ -222,8 +224,38 @@ pub async fn extract_timeline_thumbnails_with_binaries(
     max_width: u32,
     max_height: u32,
 ) -> Result<Vec<DecodedFrame>> {
+    extract_timeline_thumbnails_with_cancel(
+        ffmpeg_bin,
+        ffprobe_bin,
+        path,
+        count,
+        max_width,
+        max_height,
+        None,
+    )
+    .await
+}
+
+/// Extracts `count` evenly-spaced RGBA8 thumbnails with optional cancellation.
+///
+/// When `cancel` is triggered, all pending and in-flight `ffmpeg` decode subprocesses
+/// are aborted and killed immediately.
+pub async fn extract_timeline_thumbnails_with_cancel(
+    ffmpeg_bin: impl AsRef<Path>,
+    ffprobe_bin: impl AsRef<Path>,
+    path: &Path,
+    count: usize,
+    max_width: u32,
+    max_height: u32,
+    cancel: Option<&ExportCancelToken>,
+) -> Result<Vec<DecodedFrame>> {
     if count == 0 {
         return Ok(Vec::new());
+    }
+    if cancel.is_some_and(ExportCancelToken::is_cancelled) {
+        return Err(ClipForgeError::MediaFailed(
+            "thumbnail extraction cancelled".into(),
+        ));
     }
     if max_width < 2 || max_height < 2 {
         return Err(ClipForgeError::InvalidInput(
@@ -262,11 +294,30 @@ pub async fn extract_timeline_thumbnails_with_binaries(
     }
 
     let mut indexed = Vec::with_capacity(handles.len());
-    for handle in handles {
-        let res = handle.await.map_err(|e| {
+    let mut handle_iter = handles.into_iter();
+    while let Some(mut handle) = handle_iter.next() {
+        let res = if let Some(tok) = cancel {
+            tokio::select! {
+                biased;
+                _ = tok.cancelled() => {
+                    handle.abort();
+                    for rem in handle_iter {
+                        rem.abort();
+                    }
+                    return Err(ClipForgeError::MediaFailed(
+                        "thumbnail extraction cancelled".into(),
+                    ));
+                }
+                res = &mut handle => res,
+            }
+        } else {
+            handle.await
+        };
+
+        let frame = res.map_err(|e| {
             ClipForgeError::MediaFailed(format!("thumbnail decode task panicked: {e}"))
         })??;
-        indexed.push(res);
+        indexed.push(frame);
     }
     indexed.sort_by_key(|(idx, _)| *idx);
     Ok(indexed.into_iter().map(|(_, frame)| frame).collect())
@@ -489,33 +540,51 @@ impl PlayerWorker {
         cmd: PlayerCommand,
         cmd_rx: &mut mpsc::UnboundedReceiver<PlayerCommand>,
     ) {
-        // Coalesce rapid Seek commands during timeline scrubbing.
-        let cmd = match cmd {
-            PlayerCommand::Seek(mut latest_ms) => {
-                let mut override_cmd = None;
-                while let Ok(next) = cmd_rx.try_recv() {
-                    match next {
-                        PlayerCommand::Seek(ms) => latest_ms = ms,
-                        other => {
-                            override_cmd = Some(other);
-                            break;
+        let mut pending = Some(cmd);
+        while let Some(next_cmd) = pending.take() {
+            // Coalesce rapid Seek commands during timeline scrubbing.
+            let coalesced = match next_cmd {
+                PlayerCommand::Seek(mut latest_ms) => {
+                    let mut override_cmd = None;
+                    while let Ok(next) = cmd_rx.try_recv() {
+                        match next {
+                            PlayerCommand::Seek(ms) => latest_ms = ms,
+                            other => {
+                                override_cmd = Some(other);
+                                break;
+                            }
                         }
                     }
-                }
-                if let Some(other) = override_cmd {
-                    self.execute_command(PlayerCommand::Seek(latest_ms)).await;
-                    other
-                } else {
+                    if let Some(other) = override_cmd {
+                        // A newer non-seek command arrived right after seeks; execute the seek
+                        // (which itself may be interrupted by `other` if not queued) or just
+                        // skip stale intermediate seeks if `other` closes/reopens the clip.
+                        match other {
+                            PlayerCommand::Close | PlayerCommand::Open { .. } => {
+                                pending = Some(other);
+                                continue;
+                            }
+                            _ => {
+                                let interrupted_by = self.seek_to(latest_ms, cmd_rx).await;
+                                pending = interrupted_by.or(Some(other));
+                                continue;
+                            }
+                        }
+                    }
                     PlayerCommand::Seek(latest_ms)
                 }
-            }
-            other => other,
-        };
+                other => other,
+            };
 
-        self.execute_command(cmd).await;
+            pending = self.execute_command(coalesced, cmd_rx).await;
+        }
     }
 
-    async fn execute_command(&mut self, cmd: PlayerCommand) {
+    async fn execute_command(
+        &mut self,
+        cmd: PlayerCommand,
+        cmd_rx: &mut mpsc::UnboundedReceiver<PlayerCommand>,
+    ) -> Option<PlayerCommand> {
         match cmd {
             PlayerCommand::Open {
                 path,
@@ -523,39 +592,43 @@ impl PlayerWorker {
                 max_dim,
             } => {
                 self.open_clip(path, trim_range, max_dim).await;
+                None
             }
             PlayerCommand::Play => {
                 self.start_playback().await;
+                None
             }
             PlayerCommand::Pause => {
                 if self.status == PlaybackState::Playing {
                     self.stop_stream().await;
                     self.set_status(PlaybackState::Paused).await;
                 }
+                None
             }
-            PlayerCommand::Seek(ms) => {
-                self.seek_to(ms).await;
-            }
+            PlayerCommand::Seek(ms) => self.seek_to(ms, cmd_rx).await,
             PlayerCommand::Restart => {
                 if let Some(clip) = self.clip.as_ref() {
                     let start = clip.trim_start_ms;
-                    self.seek_to(start).await;
+                    if let Some(interrupted) = self.seek_to(start, cmd_rx).await {
+                        return Some(interrupted);
+                    }
                     self.start_playback().await;
                 }
+                None
             }
-            PlayerCommand::SetTrimRange(range) => {
-                self.update_trim_range(range).await;
-            }
+            PlayerCommand::SetTrimRange(range) => self.update_trim_range(range, cmd_rx).await,
             PlayerCommand::SetAudioTrack(track_index) => {
                 self.audio_track_index = track_index;
                 if self.status == PlaybackState::Playing {
                     self.start_playback().await;
                 }
+                None
             }
             PlayerCommand::Close => {
                 self.stop_stream().await;
                 self.clip = None;
                 self.set_status(PlaybackState::Stopped).await;
+                None
             }
         }
     }
@@ -735,44 +808,73 @@ impl PlayerWorker {
         }
     }
 
-    async fn seek_to(&mut self, requested_ms: u64) {
+    async fn seek_to(
+        &mut self,
+        mut requested_ms: u64,
+        cmd_rx: &mut mpsc::UnboundedReceiver<PlayerCommand>,
+    ) -> Option<PlayerCommand> {
         let was_playing = self.status == PlaybackState::Playing;
         self.stop_stream().await;
 
-        let Some(clip) = self.clip.as_mut() else {
-            return;
-        };
+        loop {
+            let clip = self.clip.as_ref()?;
 
-        let clamped_ms = requested_ms.clamp(clip.trim_start_ms, clip.trim_end_ms);
-        let path = clip.path.clone();
-        let out_w = clip.out_width;
-        let out_h = clip.out_height;
+            let clamped_ms = requested_ms.clamp(clip.trim_start_ms, clip.trim_end_ms);
+            let path = clip.path.clone();
+            let out_w = clip.out_width;
+            let out_h = clip.out_height;
 
-        match decode_single_frame(&self.ffmpeg_bin, &path, clamped_ms, out_w, out_h).await {
-            Ok(mut frame) => {
-                frame.pts_ms = clamped_ms;
-                if let Some(clip) = self.clip.as_mut() {
-                    clip.position_ms = clamped_ms;
+            // Cancel the in-flight single-frame ffmpeg decode immediately if a newer command arrives.
+            let decode_res = tokio::select! {
+                biased;
+                maybe_cmd = cmd_rx.recv() => {
+                    match maybe_cmd {
+                        Some(PlayerCommand::Seek(newer_ms)) => {
+                            requested_ms = newer_ms;
+                            while let Ok(next) = cmd_rx.try_recv() {
+                                match next {
+                                    PlayerCommand::Seek(ms) => requested_ms = ms,
+                                    other => return Some(other),
+                                }
+                            }
+                            continue;
+                        }
+                        Some(other) => return Some(other),
+                        None => return None,
+                    }
                 }
-                self.emit_frame(frame);
-                self.emit(PlayerEvent::Position(clamped_ms)).await;
-                if was_playing {
-                    self.start_playback().await;
-                } else {
+                res = decode_single_frame(&self.ffmpeg_bin, &path, clamped_ms, out_w, out_h) => res,
+            };
+
+            match decode_res {
+                Ok(mut frame) => {
+                    frame.pts_ms = clamped_ms;
+                    if let Some(clip) = self.clip.as_mut() {
+                        clip.position_ms = clamped_ms;
+                    }
+                    self.emit_frame(frame);
+                    self.emit(PlayerEvent::Position(clamped_ms)).await;
+                    if was_playing {
+                        self.start_playback().await;
+                    } else {
+                        self.set_status(PlaybackState::Paused).await;
+                    }
+                }
+                Err(e) => {
+                    self.emit(PlayerEvent::Error(e.to_string())).await;
                     self.set_status(PlaybackState::Paused).await;
                 }
             }
-            Err(e) => {
-                self.emit(PlayerEvent::Error(e.to_string())).await;
-                self.set_status(PlaybackState::Paused).await;
-            }
+            return None;
         }
     }
 
-    async fn update_trim_range(&mut self, trim_range: Option<(u64, u64)>) {
-        let Some(clip) = self.clip.as_mut() else {
-            return;
-        };
+    async fn update_trim_range(
+        &mut self,
+        trim_range: Option<(u64, u64)>,
+        cmd_rx: &mut mpsc::UnboundedReceiver<PlayerCommand>,
+    ) -> Option<PlayerCommand> {
+        let clip = self.clip.as_mut()?;
         let (new_start, new_end) = normalize_trim_range(trim_range, clip.metadata.duration_ms);
         clip.trim_start_ms = new_start;
         clip.trim_end_ms = new_end;
@@ -780,11 +882,12 @@ impl PlayerWorker {
         let clamped_pos = current_pos.clamp(new_start, new_end);
 
         if clamped_pos != current_pos {
-            self.seek_to(clamped_pos).await;
+            return self.seek_to(clamped_pos, cmd_rx).await;
         } else if self.status == PlaybackState::Playing {
             // Restart stream so the new trim_end_ms bound is enforced.
             self.start_playback().await;
         }
+        None
     }
 }
 

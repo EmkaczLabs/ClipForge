@@ -876,3 +876,234 @@ async fn mic_test_rejects_missing_device_and_tests_real_pipewire_source_if_prese
 
     mic.shutdown();
 }
+
+#[tokio::test]
+async fn trim_near_end_of_recording_duration_keyframe_and_av_sync() {
+    let dir = TestDir::new("trim_long_end");
+    let base = dir.join("base.mp4");
+    let long_src = dir.join("long_30s.mp4");
+    let fast_out = dir.join("fast_trim.mp4");
+    let precise_out = dir.join("precise_trim.mp4");
+
+    // Generate a 5s base with 2s GOP (-g 60 at 30fps) and loop it to 30s via -c copy.
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            "5",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "60",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+        ])
+        .arg(&base)
+        .status()
+        .expect("spawn ffmpeg base");
+    assert!(status.success());
+
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-stream_loop", "5", "-i"])
+        .arg(&base)
+        .args(["-c", "copy", "-t", "30"])
+        .arg(&long_src)
+        .status()
+        .expect("spawn ffmpeg loop");
+    assert!(status.success());
+
+    let proc = FfmpegMediaProcessor::new();
+
+    // Non-keyframe start near end: [24_250ms .. 29_250ms] (5000ms requested).
+    let fast_req = TrimRequest {
+        source_path: long_src.clone(),
+        output_path: fast_out.clone(),
+        start_ms: 24_250,
+        end_ms: 29_250,
+        reencode: false,
+        video_codec: None,
+    };
+    proc.trim(&fast_req).await.expect("fast trim");
+    let fast_probe = proc.probe(&fast_out).await.expect("probe fast_out");
+    assert!(!fast_probe.audio_tracks.is_empty());
+    // Stream copy aligns start to prior keyframe, so duration is >= 5000ms.
+    assert!(
+        fast_probe.duration_ms >= 4_900,
+        "fast trim duration too short: {}ms",
+        fast_probe.duration_ms
+    );
+
+    // Precise trim should be within +/-100ms of 5000ms and keep video/audio in sync.
+    let precise_req = TrimRequest {
+        source_path: long_src,
+        output_path: precise_out.clone(),
+        start_ms: 24_250,
+        end_ms: 29_250,
+        reencode: true,
+        video_codec: Some(clipforge_common::VideoCodec::H264),
+    };
+    proc.trim(&precise_req).await.expect("precise trim");
+    let precise_probe = proc.probe(&precise_out).await.expect("probe precise_out");
+    assert!(
+        (4_900..=5_100).contains(&precise_probe.duration_ms),
+        "precise trim duration out of range: {}ms",
+        precise_probe.duration_ms
+    );
+
+    // Verify video & audio stream durations match closely (A/V sync).
+    let v_dur = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(&precise_out)
+        .output()
+        .expect("ffprobe v_dur");
+    let a_dur = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(&precise_out)
+        .output()
+        .expect("ffprobe a_dur");
+    let v_s: f64 = String::from_utf8_lossy(&v_dur.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    let a_s: f64 = String::from_utf8_lossy(&a_dur.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        (v_s - a_s).abs() <= 0.1,
+        "A/V stream duration mismatch: video={v_s}s audio={a_s}s"
+    );
+}
+
+#[tokio::test]
+async fn trim_paths_with_spaces_and_drop_cleanup() {
+    let dir = TestDir::new("trim spaces");
+    let spaced_dir = dir.join("my game clips");
+    std::fs::create_dir_all(&spaced_dir).unwrap();
+    let src = spaced_dir.join("clip with spaces.mp4");
+    let out = spaced_dir.join("trimmed with spaces.mp4");
+    generate_synthetic_mp4(&src);
+
+    let proc = FfmpegMediaProcessor::new();
+    let req = TrimRequest {
+        source_path: src.clone(),
+        output_path: out.clone(),
+        start_ms: 500,
+        end_ms: 2_500,
+        reencode: false,
+        video_codec: None,
+    };
+    proc.trim(&req).await.expect("trim path with spaces");
+    assert!(out.exists());
+
+    // Dropping an in-flight trim future must clean up any .clipforge_tmp_* files.
+    let drop_out = spaced_dir.join("dropped output.mp4");
+    let drop_req = TrimRequest {
+        source_path: src,
+        output_path: drop_out.clone(),
+        start_ms: 0,
+        end_ms: 3_000,
+        reencode: true,
+        video_codec: None,
+    };
+    {
+        let fut = proc.trim_with_progress(&drop_req, None, |_| {});
+        tokio::pin!(fut);
+        // Poll briefly then drop.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut fut).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!drop_out.exists());
+    let leftovers: Vec<_> = std::fs::read_dir(&spaced_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".clipforge_tmp_"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "expected no leftover temp files, found {leftovers:?}"
+    );
+}
+
+#[tokio::test]
+async fn thumbnail_cancellation_and_player_rapid_seek_hygiene() {
+    use clipforge_media::{
+        ExportCancelToken, PlayerEvent, VideoPlayerHandle, extract_timeline_thumbnails_with_cancel,
+    };
+
+    let dir = TestDir::new("player_cancel");
+    let src = dir.join("clip.mp4");
+    generate_synthetic_mp4(&src);
+
+    // Pre-cancelled thumbnail extraction must fail cleanly without spawning work.
+    let tok = ExportCancelToken::new();
+    tok.cancel();
+    let err =
+        extract_timeline_thumbnails_with_cancel("ffmpeg", "ffprobe", &src, 8, 160, 90, Some(&tok))
+            .await
+            .unwrap_err();
+    assert!(err.to_string().contains("cancelled"));
+
+    // Rapid sequential seeks must coalesce/cancel obsolete decodes and settle at final seek.
+    let (player, mut rx) = VideoPlayerHandle::spawn();
+    player.open(src, None, Some(320));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    for ms in [200, 500, 900, 1400, 1800, 2200] {
+        player.seek(ms);
+    }
+
+    let mut settled_pos = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            match ev {
+                PlayerEvent::Position(pos) => {
+                    settled_pos = Some(pos);
+                    if pos == 2200 {
+                        break;
+                    }
+                }
+                PlayerEvent::Error(e) => panic!("unexpected player error on rapid seek: {e}"),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(settled_pos, Some(2200));
+    player.close();
+}

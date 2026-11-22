@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -43,11 +44,50 @@ impl ExportCancelToken {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         if self.is_cancelled() {
             return;
         }
         self.notify.notified().await;
+    }
+}
+
+/// Encoding quality/speed profile for precise (re-encoded) trims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrimQuality {
+    /// Constant Rate Factor (`0..=51` for H.264/HEVC, lower = higher quality; default `20`).
+    pub crf: u8,
+    /// Encoder speed preset (e.g. `"veryfast"`, `"faster"`, `"fast"`; default `"veryfast"`).
+    pub preset: &'static str,
+}
+
+impl Default for TrimQuality {
+    fn default() -> Self {
+        Self {
+            crf: 20,
+            preset: "veryfast",
+        }
+    }
+}
+
+/// Removes a temporary file on drop unless disarmed after atomic rename.
+struct TempFileGuard(Option<PathBuf>);
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -57,6 +97,7 @@ pub struct FfmpegMediaProcessor {
     ffmpeg_bin: PathBuf,
     ffprobe_bin: PathBuf,
     thumbnail_semaphore: Arc<Semaphore>,
+    trim_quality: TrimQuality,
 }
 
 impl Default for FfmpegMediaProcessor {
@@ -87,7 +128,14 @@ impl FfmpegMediaProcessor {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             thumbnail_semaphore: Arc::new(Semaphore::new(permits)),
+            trim_quality: TrimQuality::default(),
         }
+    }
+
+    /// Sets the default [`TrimQuality`] used for precise (re-encoded) trims.
+    pub fn with_trim_quality(mut self, quality: TrimQuality) -> Self {
+        self.trim_quality = quality;
+        self
     }
 
     /// Returns the number of currently available thumbnail concurrency permits.
@@ -100,6 +148,23 @@ impl FfmpegMediaProcessor {
     pub async fn trim_with_progress<F>(
         &self,
         req: &TrimRequest,
+        cancel: Option<&ExportCancelToken>,
+        on_progress: F,
+    ) -> Result<PathBuf>
+    where
+        F: FnMut(f32) + Send,
+    {
+        self.trim_with_quality(req, self.trim_quality, cancel, on_progress)
+            .await
+    }
+
+    /// Trims/exports a clip according to `req` using an explicit [`TrimQuality`] profile,
+    /// reporting progress (`0.0..=1.0`), supporting cancellation via `cancel`, and validating
+    /// the output file with `ffprobe`.
+    pub async fn trim_with_quality<F>(
+        &self,
+        req: &TrimRequest,
+        quality: TrimQuality,
         cancel: Option<&ExportCancelToken>,
         mut on_progress: F,
     ) -> Result<PathBuf>
@@ -115,10 +180,10 @@ impl FfmpegMediaProcessor {
         let ext = validate_video_extension(&req.output_path)?;
         let resolved_out = prepare_output_path(&req.output_path).await?;
         let temp_out = make_temp_sibling(&resolved_out, &ext);
+        let mut temp_guard = TempFileGuard::new(temp_out.clone());
 
-        let start_ts = format_timestamp_ms(req.start_ms);
-        let end_ts = format_timestamp_ms(req.end_ms);
         let total_us = req.end_ms.saturating_sub(req.start_ms).saturating_mul(1000);
+        let args = build_trim_args(&canonical_in, &temp_out, req, &ext, quality);
 
         debug!(
             source = %canonical_in.display(),
@@ -126,43 +191,13 @@ impl FfmpegMediaProcessor {
             start_ms = req.start_ms,
             end_ms = req.end_ms,
             reencode = req.reencode,
+            crf = quality.crf,
+            preset = quality.preset,
             "trimming media with progress"
         );
 
         let mut cmd = Command::new(&self.ffmpeg_bin);
-        cmd.arg("-y")
-            .arg("-v")
-            .arg("error")
-            .arg("-nostats")
-            .arg("-progress")
-            .arg("pipe:1")
-            .arg("-ss")
-            .arg(&start_ts)
-            .arg("-to")
-            .arg(&end_ts)
-            .arg("-i")
-            .arg(&canonical_in)
-            .arg("-map")
-            .arg("0:v:0?")
-            .arg("-map")
-            .arg("0:a?");
-
-        if req.reencode {
-            let vcodec = ffmpeg_video_codec(req.video_codec);
-            let acodec = ffmpeg_audio_codec(&ext);
-            cmd.arg("-c:v").arg(vcodec).arg("-c:a").arg(acodec);
-        } else {
-            cmd.arg("-c")
-                .arg("copy")
-                .arg("-avoid_negative_ts")
-                .arg("make_zero");
-        }
-
-        if ext == "mp4" || ext == "m4v" {
-            cmd.arg("-movflags").arg("+faststart");
-        }
-
-        cmd.arg(&temp_out)
+        cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -171,7 +206,6 @@ impl FfmpegMediaProcessor {
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
-                let _ = tokio::fs::remove_file(&temp_out).await;
                 return Err(ClipForgeError::MediaFailed(format!(
                     "failed to spawn ffmpeg ({}): {e}",
                     self.ffmpeg_bin.display()
@@ -202,7 +236,6 @@ impl FfmpegMediaProcessor {
                         let _ = child.kill().await;
                         let _ = child.wait().await;
                         stderr_task.abort();
-                        let _ = tokio::fs::remove_file(&temp_out).await;
                         return Err(ClipForgeError::MediaFailed("export cancelled".into()));
                     }
                     res = lines.next_line() => res,
@@ -235,7 +268,6 @@ impl FfmpegMediaProcessor {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     stderr_task.abort();
-                    let _ = tokio::fs::remove_file(&temp_out).await;
                     return Err(ClipForgeError::MediaFailed("export cancelled".into()));
                 }
                 res = child.wait() => res,
@@ -248,14 +280,12 @@ impl FfmpegMediaProcessor {
             Ok(s) => s,
             Err(e) => {
                 stderr_task.abort();
-                let _ = tokio::fs::remove_file(&temp_out).await;
                 return Err(ClipForgeError::Io(e));
             }
         };
 
         let stderr_bytes = stderr_task.await.unwrap_or_default();
         if !status.success() {
-            let _ = tokio::fs::remove_file(&temp_out).await;
             let stderr = String::from_utf8_lossy(&stderr_bytes);
             return Err(ClipForgeError::MediaFailed(format!(
                 "ffmpeg trim failed with status {}: {}",
@@ -270,23 +300,21 @@ impl FfmpegMediaProcessor {
             .map(|m| m.len())
             .unwrap_or(0);
         if file_len == 0 {
-            let _ = tokio::fs::remove_file(&temp_out).await;
             return Err(ClipForgeError::MediaFailed(
                 "ffmpeg trim produced an empty output file".into(),
             ));
         }
 
         if let Err(e) = self.probe(&temp_out).await {
-            let _ = tokio::fs::remove_file(&temp_out).await;
             return Err(ClipForgeError::MediaFailed(format!(
                 "exported output failed ffprobe validation: {e}"
             )));
         }
 
-        if let Err(e) = tokio::fs::rename(&temp_out, &resolved_out).await {
-            let _ = tokio::fs::remove_file(&temp_out).await;
-            return Err(ClipForgeError::Io(e));
-        }
+        tokio::fs::rename(&temp_out, &resolved_out)
+            .await
+            .map_err(ClipForgeError::Io)?;
+        temp_guard.disarm();
 
         on_progress(1.0);
         Ok(req.output_path.clone())
@@ -394,6 +422,114 @@ impl MediaProcessor for FfmpegMediaProcessor {
     async fn trim(&self, req: &TrimRequest) -> Result<PathBuf> {
         self.trim_with_progress(req, None, |_| {}).await
     }
+}
+
+/// Builds `ffmpeg` CLI arguments for fast (stream-copy) or precise (re-encoded) trimming.
+///
+/// Both modes place `-ss` before `-i` for fast input-side keyframe seeking, avoiding
+/// full-file decoding on multi-hour recordings, and use `-t <duration>` after `-i`.
+pub fn build_trim_args(
+    canonical_in: &Path,
+    temp_out: &Path,
+    req: &TrimRequest,
+    container_ext: &str,
+    quality: TrimQuality,
+) -> Vec<OsString> {
+    let start_ts = format_timestamp_ms(req.start_ms);
+    let dur_ts = format_timestamp_ms(req.end_ms.saturating_sub(req.start_ms));
+
+    let mut args: Vec<OsString> = vec![
+        "-y".into(),
+        "-v".into(),
+        "error".into(),
+        "-nostats".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+        "-ss".into(),
+        start_ts.into(),
+    ];
+
+    if req.reencode {
+        args.push("-accurate_seek".into());
+    }
+
+    args.extend([
+        "-i".into(),
+        canonical_in.as_os_str().to_os_string(),
+        "-t".into(),
+        dur_ts.into(),
+        "-map".into(),
+        "0:v?".into(),
+        "-map".into(),
+        "0:a?".into(),
+    ]);
+
+    if req.reencode {
+        let vcodec = ffmpeg_video_codec(req.video_codec);
+        let acodec = ffmpeg_audio_codec(container_ext);
+        args.extend(["-c:v".into(), vcodec.into()]);
+        match vcodec {
+            "libx264" | "libx265" => {
+                args.extend([
+                    "-preset".into(),
+                    quality.preset.into(),
+                    "-crf".into(),
+                    quality.crf.min(51).to_string().into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                ]);
+            }
+            "libsvtav1" => {
+                args.extend([
+                    "-preset".into(),
+                    "8".into(),
+                    "-crf".into(),
+                    quality.crf.min(63).to_string().into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                ]);
+            }
+            "libvpx-vp9" => {
+                args.extend([
+                    "-deadline".into(),
+                    "realtime".into(),
+                    "-cpu-used".into(),
+                    "4".into(),
+                    "-crf".into(),
+                    quality.crf.min(63).to_string().into(),
+                    "-b:v".into(),
+                    "0".into(),
+                ]);
+            }
+            "libvpx" => {
+                args.extend([
+                    "-deadline".into(),
+                    "realtime".into(),
+                    "-cpu-used".into(),
+                    "4".into(),
+                    "-b:v".into(),
+                    "2M".into(),
+                ]);
+            }
+            _ => {}
+        }
+        let abitrate = if acodec == "libopus" { "160k" } else { "192k" };
+        args.extend(["-c:a".into(), acodec.into(), "-b:a".into(), abitrate.into()]);
+    } else {
+        args.extend([
+            "-c".into(),
+            "copy".into(),
+            "-avoid_negative_ts".into(),
+            "make_zero".into(),
+        ]);
+    }
+
+    if container_ext == "mp4" || container_ext == "m4v" {
+        args.extend(["-movflags".into(), "+faststart".into()]);
+    }
+
+    args.push(temp_out.as_os_str().to_os_string());
+    args
 }
 
 fn parse_ffmpeg_progress_us(line: &str) -> Option<u64> {
@@ -803,5 +939,100 @@ mod tests {
         }"#;
         let err = parse_ffprobe_json(json, 0).unwrap_err();
         assert!(matches!(err, ClipForgeError::MediaFailed(_)));
+    }
+
+    #[test]
+    fn build_trim_args_fast_trim_places_ss_before_i_and_uses_copy() {
+        let req = TrimRequest {
+            source_path: PathBuf::from("/clips/source.mp4"),
+            output_path: PathBuf::from("/clips/out.mp4"),
+            start_ms: 5_400_000,
+            end_ms: 5_415_000,
+            reencode: false,
+            video_codec: None,
+        };
+        let args: Vec<String> = build_trim_args(
+            Path::new("/clips/source.mp4"),
+            Path::new("/clips/.tmp_out.mp4"),
+            &req,
+            "mp4",
+            TrimQuality::default(),
+        )
+        .into_iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+
+        let ss_pos = args.iter().position(|a| a == "-ss").unwrap();
+        let i_pos = args.iter().position(|a| a == "-i").unwrap();
+        let t_pos = args.iter().position(|a| a == "-t").unwrap();
+        assert!(ss_pos < i_pos, "-ss must be before -i: {args:?}");
+        assert!(i_pos < t_pos, "-t must be after -i: {args:?}");
+        assert_eq!(args[ss_pos + 1], "5400.000");
+        assert_eq!(args[t_pos + 1], "15.000");
+        assert!(args.windows(2).any(|w| w == ["-c", "copy"]));
+        assert!(args.windows(2).any(|w| w == ["-map", "0:v?"]));
+        assert!(args.windows(2).any(|w| w == ["-map", "0:a?"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-avoid_negative_ts", "make_zero"])
+        );
+        assert!(args.windows(2).any(|w| w == ["-movflags", "+faststart"]));
+    }
+
+    #[test]
+    fn build_trim_args_precise_trim_uses_veryfast_crf_and_accurate_seek() {
+        let req = TrimRequest {
+            source_path: PathBuf::from("/clips/source.mp4"),
+            output_path: PathBuf::from("/clips/out.mp4"),
+            start_ms: 5_401_250,
+            end_ms: 5_416_250,
+            reencode: true,
+            video_codec: Some(VideoCodec::H264),
+        };
+        let args: Vec<String> = build_trim_args(
+            Path::new("/clips/source.mp4"),
+            Path::new("/clips/.tmp_out.mp4"),
+            &req,
+            "mp4",
+            TrimQuality {
+                crf: 18,
+                preset: "veryfast",
+            },
+        )
+        .into_iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+
+        let ss_pos = args.iter().position(|a| a == "-ss").unwrap();
+        let acc_pos = args.iter().position(|a| a == "-accurate_seek").unwrap();
+        let i_pos = args.iter().position(|a| a == "-i").unwrap();
+        let t_pos = args.iter().position(|a| a == "-t").unwrap();
+        assert!(ss_pos < i_pos);
+        assert!(acc_pos < i_pos);
+        assert!(i_pos < t_pos);
+        assert_eq!(args[ss_pos + 1], "5401.250");
+        assert_eq!(args[t_pos + 1], "15.000");
+        assert!(args.windows(2).any(|w| w == ["-c:v", "libx264"]));
+        assert!(args.windows(2).any(|w| w == ["-preset", "veryfast"]));
+        assert!(args.windows(2).any(|w| w == ["-crf", "18"]));
+        assert!(args.windows(2).any(|w| w == ["-c:a", "aac"]));
+        assert!(!args.iter().any(|a| a == "-avoid_negative_ts"));
+    }
+
+    #[test]
+    fn build_trim_args_preserves_spaces_and_windows_paths() {
+        let win_in = Path::new(r"C:\Users\Player One\Videos\My Clip.mp4");
+        let win_out = Path::new(r"C:\Users\Player One\Videos\.tmp out.mp4");
+        let req = TrimRequest {
+            source_path: win_in.to_path_buf(),
+            output_path: PathBuf::from(r"C:\Users\Player One\Videos\My Clip (1).mp4"),
+            start_ms: 1000,
+            end_ms: 6000,
+            reencode: false,
+            video_codec: None,
+        };
+        let args = build_trim_args(win_in, win_out, &req, "mp4", TrimQuality::default());
+        assert!(args.iter().any(|a| a == win_in.as_os_str()));
+        assert_eq!(args.last().unwrap(), win_out.as_os_str());
     }
 }

@@ -13,5 +13,6 @@ pub use mic_test::{
 pub use player::{
     DEFAULT_MAX_DECODE_DIM, DecodedFrame, PlaybackState, PlayerEvent, VideoMetadata,
     VideoPlayerHandle, extract_timeline_thumbnails, extract_timeline_thumbnails_with_binaries,
+    extract_timeline_thumbnails_with_cancel,
 };
-pub use processor::{ExportCancelToken, FfmpegMediaProcessor};
+pub use processor::{ExportCancelToken, FfmpegMediaProcessor, TrimQuality, build_trim_args};
