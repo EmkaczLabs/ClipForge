@@ -121,4 +121,24 @@ jobs:
           path: |
             ${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip
             ${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip.sha256
+          retention-days: 7
           if-no-files-found: error
+      - name: Upload Windows portable artifact to RustFS
+        if: ${{ secrets.RUSTFS_ACCESS_KEY_ID != '' && secrets.RUSTFS_SECRET_ACCESS_KEY != '' }}
+        env:
+          RUSTFS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY_ID }}
+          RUSTFS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_ACCESS_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $python = if (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } elseif (Get-Command python -ErrorAction SilentlyContinue) { "python" } else { throw "Python 3 not found on PATH" }
+          $mode = if ("${{ github.ref }}".StartsWith("refs/tags/")) { "releases" } else { "ci" }
+          & $python scripts/ci/upload_rustfs.py `
+            --mode $mode `
+            --platform windows-x64 `
+            --version "${{ github.ref_name }}" `
+            --commit "${{ github.sha }}" `
+            --run-id "${{ github.run_id }}" `
+            --workflow "${{ github.workflow }}" `
+            "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip" `
+            "${{ runner.temp }}/dist/ClipForge-Windows-x64-portable.zip.sha256"
+          if ($LASTEXITCODE -ne 0) { throw "RustFS upload failed with exit code $LASTEXITCODE" }
