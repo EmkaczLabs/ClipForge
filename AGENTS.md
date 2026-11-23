@@ -11,7 +11,7 @@ This file defines repository conventions, build/test commands, and agent ownersh
   - `crates/media`: `ffmpeg`/`ffprobe` processing, `VideoPlayerHandle` (off-UI-thread RGBA8 pipe + `cpal` PipeWire/ALSA audio + `AutoMix` multi-track playback), `ExportCancelToken` + `trim_with_progress`, and `MicTestHandle` (`pactl`+`parec`+`cpal`).
   - `crates/library`: SQLite (`rusqlite` bundled) v3 schema (`ClipOrigin`, `trashed_at`, `original_path`, `.clipforge_trash`) + `DirectoryScanner`.
   - `crates/cloud-client`: `/api/v1` `HttpCloudClient` (resumable multipart uploads, shares, server info/quota, redacted `Debug`).
-  - `apps/server` & `apps/web`: Legacy in-repo Axum server/web player (superseded for standalone deployment by `ClipForge-Server`).
+  - `apps/site`: Official Next.js App Router product website (`https://clipforge.emkacz.dev`) with RustFS release manifest/download Route Handlers, MDX docs, and Vitest/Playwright tests.
 - **Standalone Server (`/home/emkacz/Projects/ClipForge-Server`):**
   - Modular 5-crate workspace (`clipforge-api` OpenAPI 3.1.0, `clipforge-db`, `clipforge-auth` Argon2id + SHA-256 tokens, `clipforge-storage` Local + RustFS S3 SigV4, `clipforge-server` Axum `/api/v1` + CLI) + `web/index.html` + `Dockerfile` + `compose.yaml`.
   - Zero local path dependencies to `/home/emkacz/Projects/ClipForge`.

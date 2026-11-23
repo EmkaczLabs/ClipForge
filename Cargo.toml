@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "apps/desktop",
-    "apps/server",
     "crates/common",
     "crates/capture",
     "crates/media",
@@ -17,7 +16,6 @@ license = "MIT"
 repository = "https://github.com/ClipForge/ClipForge"
 
 [workspace.dependencies]
-anyhow = "1.0"
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }

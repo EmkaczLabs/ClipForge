@@ -8,6 +8,7 @@ on:
       - '*.md'
       - 'design/**'
       - 'LICENSE'
+      - 'apps/site/**'
   pull_request:
     branches: [main]
     paths-ignore:
@@ -15,6 +16,7 @@ on:
       - '*.md'
       - 'design/**'
       - 'LICENSE'
+      - 'apps/site/**'
   workflow_dispatch:
 
 permissions:
@@ -147,4 +149,4 @@ jobs:
           ffprobe -version
           if ($LASTEXITCODE -ne 0) { throw "ffprobe -version failed with exit code $LASTEXITCODE" }
       - name: Run workspace tests
-        run: cargo test --workspace --exclude clipforge-server
+        run: cargo test --workspace

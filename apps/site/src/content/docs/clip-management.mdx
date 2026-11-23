@@ -1,0 +1,25 @@
+---
+title: "Clip Management"
+description: "Organize local clips with SQLite, soft-delete trash, and FFmpeg trimming."
+section: "Library & Editing"
+order: 5
+---
+
+## Local SQLite Library
+
+Every clip is indexed in a local SQLite database (`rusqlite` bundled). ClipForge tracks:
+- Clip origin (`Captured`, `Imported`, `Sample`)
+- Duration, resolution, codec, and file size
+- Tags, game/title metadata, and timestamps
+
+## Safe Deletion & `.clipforge_trash`
+
+Deleting a clip moves managed recordings into `.clipforge_trash` with `trashed_at` and `original_path` metadata so you can restore accidental deletions. Imported or sample files outside the managed root are protected from accidental disk deletion.
+
+## Fast vs. Precise Trim
+
+In the **Editor**, you can trim clips using two modes:
+- **Fast Trim**: Stream-copies (`-c copy`) near keyframes for near-instant exports without re-encoding.
+- **Precise Trim**: Re-encodes around exact frame boundaries for frame-accurate start and end points.
+
+All `ffmpeg` exports run off the UI thread with cancellation support (`ExportCancelToken`).

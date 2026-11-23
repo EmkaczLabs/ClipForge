@@ -1,0 +1,22 @@
+---
+title: "Recording"
+description: "Configure video sources, multi-track audio routing, and hardware encoding."
+section: "Capture"
+order: 3
+---
+
+## Capture Backends
+
+ClipForge uses platform-native capture pipelines rather than Electron or browser-based screen capture:
+
+- **Linux**: Supervises `gpu-screen-recorder` as an independent child process (`very_high` quality, `-bm auto`).
+- **Windows**: Uses Windows Graphics Capture (`WGC`) with D3D11/DXGI frame pooling and hardware encoders (`NVENC`, `AMF`, `QSV`, or `libx264` fallback).
+
+## Multi-Track Audio Routing
+
+ClipForge supports deterministic audio routing across `Auto` and `T1`–`T4` tracks:
+
+- **Auto**: Mixes system audio and microphone into the primary track (`0:a:0`) for universal player compatibility.
+- **Separate Tracks (`T2`–`T4`)**: Isolates desktop audio, microphone, or application streams into discrete MP4 audio tracks for post-processing.
+
+During preview in the **Editor**, ClipForge's `AutoMix` player blends all active tracks automatically.

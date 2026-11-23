@@ -1,0 +1,37 @@
+---
+title: "Development"
+description: "Build ClipForge from source and run the Rust workspace verification suite."
+section: "Developers"
+order: 8
+---
+
+## Prerequisites
+
+- Rust toolchain (`edition = "2024"`, `rustc 1.100+`)
+- `ffmpeg` and `ffprobe`
+- Linux: `gpu-screen-recorder`, `libxcb` / Wayland dev libraries, `pkg-config`, `libasound2-dev`
+
+## Building & Testing
+
+```bash
+# Format check
+cargo fmt --all -- --check
+
+# Lint with warnings as errors
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Run workspace tests
+cargo test --workspace
+
+# Render a headless UI snapshot via Rune
+cargo run -p clipforge-desktop -- --scene library --snap /tmp/clipforge-m1.png
+```
+
+## Architecture Overview
+
+- `apps/desktop`: Rune (`anomalyco/rune`) 5-screen Obsidian Forge UI
+- `crates/common`: Shared domain models, `AppConfig`, and traits
+- `crates/capture`: Linux GSR & Windows WGC/WASAPI capture backends
+- `crates/media`: `ffmpeg`/`ffprobe` media pipeline & `cpal` audio playback
+- `crates/library`: SQLite v3 clip catalog & directory scanner
+- `crates/cloud-client`: Optional `/api/v1` client for `ClipForge-Server`

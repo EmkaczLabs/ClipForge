@@ -1,0 +1,22 @@
+---
+title: "FAQ"
+description: "Answers to common questions about ClipForge, privacy, and self-hosting."
+section: "Support"
+order: 7
+---
+
+## Does ClipForge require an account or cloud server?
+
+No. ClipForge is 100% local-first. Recording, Instant Replay, Library indexing, and FFmpeg trimming all work offline with zero accounts or telemetry.
+
+## What is ClipForge-Server?
+
+[ClipForge-Server](/server) is an optional, separately deployed Rust server (`Axum` + `SQLite` + local or RustFS S3 storage) for users who want to upload clips and share links with friends.
+
+## Where are cloud tokens stored?
+
+On Linux, desktop tokens are stored exclusively in the system keyring via `secret-tool` (`org.freedesktop.secrets`). Plaintext tokens are never written to `config.json`.
+
+## What license does ClipForge use?
+
+ClipForge is open-source under the **MIT License**.

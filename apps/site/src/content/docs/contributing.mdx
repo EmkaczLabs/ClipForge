@@ -1,0 +1,19 @@
+---
+title: "Contributing"
+description: "Guidelines for contributing code, documentation, and bug reports to ClipForge."
+section: "Developers"
+order: 9
+---
+
+## How to Contribute
+
+1. Fork the repository at `https://github.com/ClipForge/ClipForge` (or `https://github.com/EmkaczLabs/ClipForge-Server` for the server).
+2. Create a focused feature or bugfix branch.
+3. Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` before opening a pull request.
+
+## Engineering & Security Standards
+
+- Never construct shell commands from user-controlled input; always pass argument arrays to `tokio::process::Command`.
+- Validate all file paths, storage keys, and subprocess arguments.
+- Never commit secrets, `.env` files, or API tokens.
+- Keep Rune UI threads non-blocking by offloading media and I/O work to async tasks.

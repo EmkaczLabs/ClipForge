@@ -310,7 +310,7 @@ fn disconnected_view(p: &Palette, s: &AppState) -> El {
             p,
             "guide-1",
             "1",
-            "Start clipforge-server on your LAN, NAS, or VPS (cargo run -p clipforge-server).",
+            "Start ClipForge-Server on your LAN, NAS, or VPS (see EmkaczLabs/ClipForge-Server).",
         ))
         .child(guide_step(
             p,

@@ -1,0 +1,20 @@
+---
+title: "Instant Replay"
+description: "Keep a rolling background buffer and save highlights with a single hotkey."
+section: "Capture"
+order: 4
+---
+
+## How Instant Replay Works
+
+Instant Replay maintains a bounded rolling buffer of recent gameplay or desktop activity without filling your disk with hours of unused footage.
+
+- **Linux**: `gpu-screen-recorder` runs in replay mode and flushes the buffer to disk when ClipForge sends `SIGUSR1` to the managed child PID.
+- **Windows**: A bounded segmented rolling ring (`-f segment -segment_time 2 -segment_wrap <slots>`) writes short segments and concatenates them into a clean MP4 on save.
+
+## Global Hotkeys
+
+- **Linux (Wayland)**: Uses the XDG Desktop Portal `GlobalShortcuts` interface via `zbus`.
+- **Linux (X11)**: Falls back to X11 key grabbing when the portal is unavailable.
+- **Windows**: Uses Win32 `RegisterHotKey`.
+- **In-App Shortcuts**: `F9`, `F10`, and `F11` remain available whenever the ClipForge window is focused.

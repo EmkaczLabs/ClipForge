@@ -1,0 +1,22 @@
+---
+title: "Troubleshooting"
+description: "Resolve common issues with Wayland shortcuts, GSR, audio tracks, and Windows builds."
+section: "Support"
+order: 6
+---
+
+## Global Hotkeys on Wayland
+
+If global hotkeys do not trigger on Wayland, verify that your desktop environment provides `org.freedesktop.portal.GlobalShortcuts` (supported in KDE Plasma 6 and GNOME 46+). When unavailable, ClipForge still supports `F9`/`F10`/`F11` while the app is focused.
+
+## `gpu-screen-recorder` Not Found
+
+Ensure `gpu-screen-recorder` is installed in `$PATH` or available via Flatpak (`com.dec05eba.gpu_screen_recorder`). ClipForge checks both automatically.
+
+## Missing Audio in External Players
+
+If you recorded with separate tracks (`T2`–`T4`), some basic media players only play Track 1. Use **Auto** mode to mix system + mic into `0:a:0`, or use ClipForge's built-in **Editor** which uses `AutoMix`.
+
+## No Console Window on Windows
+
+Release builds of `ClipForge.exe` run with `windows_subsystem = "windows"` and suppress child console windows (`CREATE_NO_WINDOW`). Diagnostic logs are written to the local ClipForge log file in your app data directory.

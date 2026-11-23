@@ -1,0 +1,37 @@
+---
+title: "Installation"
+description: "Install ClipForge on Linux or Windows and verify runtime dependencies."
+section: "Getting Started"
+order: 1
+---
+
+## Supported Platforms
+
+ClipForge targets **Linux (x64)** and **Windows (x64)** with native hardware-accelerated capture on each platform.
+
+### Linux (x64)
+
+On Linux, ClipForge supervises `gpu-screen-recorder` for low-overhead capture and uses `ffmpeg` / `ffprobe` for media processing.
+
+Required runtime packages:
+- `gpu-screen-recorder` (6.x recommended)
+- `ffmpeg` and `ffprobe`
+- `libsecret` / `secret-tool` (for optional cloud server token storage via `org.freedesktop.secrets`)
+- PipeWire or PulseAudio (`pactl` / `parec`) for audio routing and mic testing
+
+### Windows (x64)
+
+Windows builds are distributed as a portable ZIP archive containing:
+- `ClipForge.exe`
+- Bundled `ffmpeg.exe` and `ffprobe.exe`
+- `THIRD-PARTY-NOTICES.txt`
+
+Capture uses native Windows Graphics Capture (WGC) and WASAPI loopback/microphone capture with hardware encoding (`h264_nvenc`, `h264_amf`, `h264_qsv`) or `libx264` fallback.
+
+## Verifying Downloads
+
+Every official release includes a 64-character SHA-256 digest on the [Download](/download) page.
+
+```bash
+sha256sum -c ClipForge-Linux-x64.tar.gz.sha256
+```
